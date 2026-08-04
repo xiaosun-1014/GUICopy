@@ -1,0 +1,182 @@
+[
+  {
+    "tag": "(0010, 0010)",
+    "keyword": "PatientName",
+    "description": "Patient Name",
+    "value": "测试患者",
+    "source": "text_dump",
+    "raw_label": "Patient Name",
+    "confidence": null,
+    "tile_id": null
+  },
+  {
+    "tag": "(0010, 0020)",
+    "keyword": "PatientID",
+    "description": "Patient ID",
+    "value": "P-2024-002",
+    "source": "text_dump",
+    "raw_label": "Patient ID",
+    "confidence": null,
+    "tile_id": null
+  },
+  {
+    "tag": "(0020, 000D)",
+    "keyword": "StudyInstanceUID",
+    "description": "Study Instance UID",
+    "value": "1.2.840.113619.2.55.3.604688119.971.1734567890.010",
+    "source": "text_dump",
+    "raw_label": "Study Instance UID",
+    "confidence": null,
+    "tile_id": null
+  },
+  {
+    "tag": "(0020, 000E)",
+    "keyword": "SeriesInstanceUID",
+    "description": "Series Instance UID",
+    "value": "1.2.840.113619.2.55.3.604688119.971.1734567890.011",
+    "source": "text_dump",
+    "raw_label": "Series Instance UID",
+    "confidence": null,
+    "tile_id": null
+  },
+  {
+    "tag": "(0008, 0060)",
+    "keyword": "Modality",
+    "description": "Modality",
+    "value": "MR",
+    "source": "text_dump",
+    "raw_label": "Modality",
+    "confidence": null,
+    "tile_id": null
+  },
+  {
+    "tag": "(0028, 0010)",
+    "keyword": "Rows",
+    "description": "Rows",
+    "value": "256",
+    "source": "text_dump",
+    "raw_label": "Rows",
+    "confidence": null,
+    "tile_id": null
+  },
+  {
+    "tag": "(0028, 0011)",
+    "keyword": "Columns",
+    "description": "Columns",
+    "value": "256",
+    "source": "text_dump",
+    "raw_label": "Columns",
+    "confidence": null,
+    "tile_id": null
+  },
+  {
+    "tag": "(0028, 1053)",
+    "keyword": "RescaleSlope",
+    "description": "Rescale Slope",
+    "value": "1",
+    "source": "text_dump",
+    "raw_label": "Rescale Slope",
+    "confidence": null,
+    "tile_id": null
+  },
+  {
+    "tag": "(0028, 1052)",
+    "keyword": "RescaleIntercept",
+    "description": "Rescale Intercept",
+    "value": "0",
+    "source": "text_dump",
+    "raw_label": "Rescale Intercept",
+    "confidence": null,
+    "tile_id": null
+  },
+  {
+    "tag": "(0020, 0032)",
+    "keyword": "ImagePositionPatient",
+    "description": "Image Position Patient",
+    "value": "-100.5, -200.7, 50.3",
+    "source": "text_dump",
+    "raw_label": "Image Position (Patient)",
+    "confidence": null,
+    "tile_id": null
+  },
+  {
+    "tag": "(0020, 0037)",
+    "keyword": "ImageOrientationPatient",
+    "description": "Image Orientation Patient",
+    "value": "1,0,0,0,1,0",
+    "source": "text_dump",
+    "raw_label": "Image Orientation (Patient)",
+    "confidence": null,
+    "tile_id": null
+  },
+  {
+    "tag": "(0028, 0030)",
+    "keyword": "PixelSpacing",
+    "description": "Pixel Spacing",
+    "value": "1.0, 1.0",
+    "source": "text_dump",
+    "raw_label": "Pixel Spacing",
+    "confidence": null,
+    "tile_id": null
+  },
+  {
+    "tag": "(0020, 0013)",
+    "keyword": "InstanceNumber",
+    "description": "Instance Number",
+    "value": "3",
+    "source": "text_dump",
+    "raw_label": "Instance Number",
+    "confidence": null,
+    "tile_id": null
+  },
+  {
+    "tag": "(0008, 0018)",
+    "keyword": "SOPInstanceUID",
+    "description": "SOP Instance UID",
+    "value": "1.2.840.113619.2.55.3.604688119.971.1734567890.300",
+    "source": "text_dump",
+    "raw_label": "SOP Instance UID",
+    "confidence": null,
+    "tile_id": null
+  },
+  {
+    "tag": "(0010, 1010)",
+    "keyword": "PatientAge",
+    "description": "Patient Age",
+    "value": "052Y",
+    "source": "text_dump",
+    "raw_label": "Patient Age",
+    "confidence": null,
+    "tile_id": null
+  },
+  {
+    "tag": "(0010, 0040)",
+    "keyword": "PatientSex",
+    "description": "Patient Sex",
+    "value": "F",
+    "source": "text_dump",
+    "raw_label": "Patient Sex",
+    "confidence": null,
+    "tile_id": null
+  },
+  {
+    "tag": "(0018, 5100)",
+    "keyword": "Patient Position",
+    "description": "Patient Position",
+    "value": "HFS",
+    "source": "text_dump",
+    "raw_label": "Patient Position",
+    "confidence": null,
+    "tile_id": null
+  },
+  {
+    "tag": "(0008, 103E)",
+    "keyword": "SeriesDescription",
+    "description": "Series Description",
+    "value": "Sagittal T1",
+    "source": "text_dump",
+    "raw_label": "Series Description",
+    "confidence": null,
+    "tile_id": null
+  }
+]

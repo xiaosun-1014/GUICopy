@@ -1,0 +1,11 @@
+<!doctype html>
+<html><body>
+  <section id="series" class="series-list" role="listbox">
+    <button id="series-thin" role="option" aria-selected="true" onclick="document.querySelectorAll('[role=option]').forEach(x=>x.setAttribute('aria-selected', x===this?'true':'false')); document.body.dataset.series='thin'">Thin 1.0 400幅</button>
+    <button id="series-thick" role="option" aria-selected="false" onclick="document.querySelectorAll('[role=option]').forEach(x=>x.setAttribute('aria-selected', x===this?'true':'false')); document.body.dataset.series='thick'">Thick 5.0 80幅</button>
+  </section>
+  <button id="metadata" onclick="document.querySelector('#dicom').hidden=false">Metadata</button>
+  <section id="dicom" class="metadata" hidden><div>PatientName: Demo</div><div>StudyDate: 20260101</div></section>
+  <section id="wlww" class="window-level-dialog"><input id="ww" role="spinbutton" value="400"><input id="wl" role="spinbutton" value="40"><button id="confirm" onclick="document.body.dataset.wlww='confirmed'">确定</button></section>
+  <canvas id="overlaycanvas-0_0" width="100" height="80"></canvas>
+</body></html>

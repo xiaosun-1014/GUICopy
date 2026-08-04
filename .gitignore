@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# 虚拟环境
+.env
+.venv
+env/
+venv/
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude 工具配置
+.claude/
+
+# Node（曾经用过）
+node_modules/
+
+# 输出目录（产出物，不进版本控制）
+out/
+snapshots/
+replicas/
+annotations/
+
+# 运行时产物（带时间戳）
+canvas_frames/*
+dicom_meta_*.json
+report_*.png
+.playwright-mcp/
+
+# 被录制进程持续覆盖的文件，不要纳入版本控制
+recorded_script.py
+
+# 废弃的临时文件
+*.tmp.*
+*.tmp
+
+# .reasonix：仅跟踪 viewers.yaml 和 skills/，其余（会话状态 JSON、attachments/ 临时剪贴板）忽略
+.reasonix/*
+!.reasonix/viewers.yaml
+!.reasonix/skills/

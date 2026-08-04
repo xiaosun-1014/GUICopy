@@ -1,0 +1,159 @@
+[
+  {
+    "tag": "(0010,0010)",
+    "description": "PatientName",
+    "value": "张三",
+    "confidence": 0.95,
+    "tile_id": "tile_0"
+  },
+  {
+    "tag": "(0010,0020)",
+    "description": "PatientID",
+    "value": "P-2024-001",
+    "confidence": 0.98,
+    "tile_id": "tile_0"
+  },
+  {
+    "tag": "(0020,000D)",
+    "description": "StudyInstanceUID",
+    "value": "1.2.840.113619.2.55.3.604688119.971.1734567890.001",
+    "confidence": 1.0,
+    "tile_id": "tile_0"
+  },
+  {
+    "tag": "(0020,000E)",
+    "description": "SeriesInstanceUID",
+    "value": "1.2.840.113619.2.55.3.604688119.971.1734567890.002",
+    "confidence": 1.0,
+    "tile_id": "tile_0"
+  },
+  {
+    "tag": "(0008,0060)",
+    "description": "Modality",
+    "value": "CT",
+    "confidence": 0.99,
+    "tile_id": "tile_0"
+  },
+  {
+    "tag": "(0028,0010)",
+    "description": "Rows",
+    "value": "512",
+    "confidence": 0.95,
+    "tile_id": "tile_1"
+  },
+  {
+    "tag": "(0028,0011)",
+    "description": "Columns",
+    "value": "512",
+    "confidence": 0.95,
+    "tile_id": "tile_1"
+  },
+  {
+    "tag": "(0028,1053)",
+    "description": "RescaleSlope",
+    "value": "1",
+    "confidence": 0.92,
+    "tile_id": "tile_1"
+  },
+  {
+    "tag": "(0028,1052)",
+    "description": "RescaleIntercept",
+    "value": "-1024",
+    "confidence": 0.92,
+    "tile_id": "tile_1"
+  },
+  {
+    "tag": "(0018,0050)",
+    "description": "SliceThickness",
+    "value": "5",
+    "confidence": 0.90,
+    "tile_id": "tile_1"
+  },
+  {
+    "tag": "(0020,0032)",
+    "description": "ImagePositionPatient",
+    "value": "-156.277, -151.703, 81.892",
+    "confidence": 0.88,
+    "tile_id": "tile_2"
+  },
+  {
+    "tag": "(0020,0037)",
+    "description": "ImageOrientationPatient",
+    "value": "1,0,0,0,1,0",
+    "confidence": 0.88,
+    "tile_id": "tile_2"
+  },
+  {
+    "tag": "(0028,0030)",
+    "description": "PixelSpacing",
+    "value": "0.59375, 0.59375",
+    "confidence": 0.92,
+    "tile_id": "tile_2"
+  },
+  {
+    "tag": "(0020,0013)",
+    "description": "InstanceNumber",
+    "value": "1",
+    "confidence": 0.95,
+    "tile_id": "tile_2",
+    "partial": true,
+    "partial_side": "right",
+    "needs_merge_next": true
+  },
+  {
+    "tag": "(0020,0013)",
+    "description": "InstanceNumber",
+    "value": "5",
+    "confidence": 0.91,
+    "tile_id": "tile_3"
+  },
+  {
+    "tag": "(0008,0018)",
+    "description": "SOPInstanceUID",
+    "value": "1.2.840.113619.2.55.3.604688119.971.1734567890.100",
+    "confidence": 0.96,
+    "tile_id": "tile_3"
+  },
+  {
+    "tag": "(0010,0040)",
+    "description": "PatientSex",
+    "value": "M",
+    "confidence": 0.93,
+    "tile_id": "tile_3"
+  },
+  {
+    "tag": "(0010,1010)",
+    "description": "PatientAge",
+    "value": "045Y",
+    "confidence": 0.85,
+    "tile_id": "tile_3"
+  },
+  {
+    "tag": "(0008,103E)",
+    "description": "SeriesDescription",
+    "value": "Axial",
+    "confidence": 0.87,
+    "tile_id": "tile_3"
+  },
+  {
+    "tag": "(0018,5100)",
+    "description": "PatientPosition",
+    "value": "hfs",
+    "confidence": 0.94,
+    "tile_id": "tile_3"
+  },
+  {
+    "tag": "(0002,0010)",
+    "description": "TransferSyntaxUID",
+    "value": "1.2.840.10008.1.2.1",
+    "confidence": 0.99,
+    "tile_id": "tile_0"
+  },
+  {
+    "tag": "(0020,1002)",
+    "description": "ImagesInAcquisition",
+    "value": "120",
+    "confidence": 0.99,
+    "tile_id": "tile_1"
+  }
+]

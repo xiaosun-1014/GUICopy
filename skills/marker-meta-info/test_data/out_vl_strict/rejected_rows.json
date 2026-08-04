@@ -1,0 +1,12 @@
+[
+  {
+    "tag": "(0002, 0010)",
+    "keyword": "TransferSyntaxUID",
+    "description": "TransferSyntaxUID",
+    "value": "1.2.840.10008.1.2.1",
+    "source": "vl",
+    "raw_label": "TransferSyntaxUID",
+    "confidence": 0.99,
+    "tile_id": "tile_0"
+  }
+]

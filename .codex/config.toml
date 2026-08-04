@@ -1,0 +1,3 @@
+[mcp_servers.playwright]
+command = "node"
+args = ["C:/Users/yuchun.liu01/AppData/Roaming/npm/node_modules/@playwright/mcp/cli.js"]

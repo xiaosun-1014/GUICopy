@@ -1,0 +1,16 @@
+{
+  "PatientName": "李四",
+  "PatientID": "P-2024-003",
+  "StudyInstanceUID": "1.2.840.113619.2.55.3.604688119.971.1734567890.020",
+  "SeriesInstanceUID": "1.2.840.113619.2.55.3.604688119.971.1734567890.021",
+  "Modality": "CT",
+  "Rows": "1024",
+  "Columns": "1024",
+  "RescaleSlope": "2",
+  "RescaleIntercept": "-2048",
+  "SliceThickness": "1.5",
+  "ImagePositionPatient": "0, 0, 0",
+  "ImageOrientationPatient": "1,0,0,0,1,0",
+  "PixelSpacing": "0.5, 0.5",
+  "InstanceNumber": "10"
+}

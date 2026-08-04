@@ -1,0 +1,57 @@
+[
+  {
+    "row": {
+      "tag": "(0018, 5100)",
+      "keyword": "PatientPosition",
+      "description": "PatientPosition",
+      "value": "hfs",
+      "source": "vl",
+      "raw_label": "PatientPosition",
+      "confidence": 0.94,
+      "tile_id": "tile_3"
+    },
+    "status": "fixed",
+    "issues": [
+      {
+        "code": "auto_fixed",
+        "severity": "warning",
+        "message": "tag (0018, 5100) 的值已自动修正: 'hfs' → 'HFS'",
+        "tag": "(0018, 5100)",
+        "field": "PatientPosition"
+      }
+    ],
+    "fixed": {
+      "tag": "(0018, 5100)",
+      "keyword": "PatientPosition",
+      "description": "PatientPosition",
+      "value": "HFS",
+      "source": "vl",
+      "raw_label": "PatientPosition",
+      "confidence": 0.94,
+      "tile_id": "tile_3"
+    }
+  },
+  {
+    "row": {
+      "tag": "(0002, 0010)",
+      "keyword": "TransferSyntaxUID",
+      "description": "TransferSyntaxUID",
+      "value": "1.2.840.10008.1.2.1",
+      "source": "vl",
+      "raw_label": "TransferSyntaxUID",
+      "confidence": 0.99,
+      "tile_id": "tile_0"
+    },
+    "status": "rejected",
+    "issues": [
+      {
+        "code": "group_0002",
+        "severity": "error",
+        "message": "tag (0002, 0010) 属于 0002 组 (File Meta Information)，应剔除",
+        "tag": "(0002, 0010)",
+        "field": "TransferSyntaxUID"
+      }
+    ],
+    "fixed": null
+  }
+]

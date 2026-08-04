@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "source_script_sha256": "27d3e5924f61cfae7fa4c169f6a0cc0f6b568d666992743a274069d453056f43",
+  "markers": [
+    {
+      "marker_id": "aaff5f38-1876-4a83-81f8-e66c2e7b6a66",
+      "line": 10,
+      "label": "报告截图"
+    },
+    {
+      "marker_id": "397765d7-16db-4af3-95e0-8a5924a95a36",
+      "line": 12,
+      "label": "序列选择"
+    },
+    {
+      "marker_id": "af8562ea-f11b-4920-a265-8c0375fedd37",
+      "line": 16,
+      "label": "Meta 信息工具"
+    },
+    {
+      "marker_id": "f7a781a2-6de6-4f0c-8b3d-87c458869209",
+      "line": 21,
+      "label": "窗宽窗位 WL/WW"
+    }
+  ]
+}

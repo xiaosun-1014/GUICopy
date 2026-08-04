@@ -1,0 +1,122 @@
+# ============================================================================
+# Viewer 注册表 — DICOM viewer 适配配置
+# ============================================================================
+# 各 marker-* skill 通过本注册表选择正确的 iframe/按钮/面板选择器，
+# 不再把具体云胶片的 DOM 选择器硬编码在 skill 文档里。
+#
+# 匹配顺序：
+#   1) 录制脚本的 page.goto URL → 匹配 url_patterns → 用对应 viewer 配置
+#   2) 未命中 → generic 兜底（从录制脚本已有的 locator() 反推 iframe/按钮）
+#
+# 新增 viewer：
+#   - 复制 generic 模板，填入 url_patterns + iframe_selectors +
+#     open_button_names + tag_row_format
+#   - 在真实 viewer 上实测一遍，确认 DOM 提取能拿到 ≥10 个 tag 行
+# ============================================================================
+
+viewers:
+
+  # --------------------------------------------------------------------------
+  # uicloud (uicloud.com/film) — 已知 viewer
+  # --------------------------------------------------------------------------
+  uicloud:
+    url_patterns:
+      - "uicloud.com"
+
+    # iframe 容器选择器（Playwright locator 字符串，可直接传入 locator()）
+    iframe_selectors:
+      - '[id="2d-iframe"]'
+
+    # ---- Meta 信息面板（marker-meta-extract 用） ----
+    meta_panel:
+      # 按钮的 accessible name（依次尝试，命中即停）
+      open_button_names:
+        - "DICOM信息 F2"     # uicloud 按钮带快捷键标签
+        - "DICOM信息"
+      # 面板容器选择器（依次尝试，限定 DOM 扫描范围）
+      panel_container_selectors:
+        - "table"
+      # tag 行解析策略
+      #   table_tr_td : <table><tr><td>...</td></tr></table>（每行 3 列：tag/desc/value）
+      #   flex_div    : <div> flex 布局，每行一个 row 容器，内含 tag/desc/value 子节点
+      #   tree_node   : 树形结构（递归提取叶子节点）
+      tag_row_format: "table_tr_td"
+      # tag 号匹配正则（JavaScript 字符串）
+      tag_pattern: '^\(?\d{4}[,\)\s]\s*\d{4}\)?$'
+      # 关闭按钮选择器（可选；用于不污染录制时优雅关闭面板）
+      close_button_selectors: []
+
+    # ---- 序列选择（marker-sequence-select 用） ----
+    sequence_select:
+      # 影像画布选择器（用于坐标点击）
+      canvas_selectors:
+        - "#overlaycanvas-0_0"
+      # 序列文本匹配正则（DOM 扫描定位序列项时使用，也用于文本块解析的帧数行识别）
+      text_pattern: '\d+\s*(?:幅|images|frames|张)'
+      # 序列项容器选择器（依次尝试）
+      item_container_selectors:
+        - ".series-item"
+        - "[class*='series']"
+        - "[class*='sequence']"
+
+  # --------------------------------------------------------------------------
+  # cxhospital (cxss.zjcxph.com) — 长兴县人民医院 PACS
+  #
+  # ⚠ 注意：本 viewer 使用嵌套 iframe（#iframe → iframe[name="imageFrame"]），
+  #   而当前 iframe_selectors 仅支持单层。自动脚本（extract_dicom_meta.py）
+  #   暂时从录制脚本已有 locator() 反推完整嵌套路径。
+  # ⚠ 注意：DICOM 信息按钮是图标按钮（CSS class），没有 text-based accessible name，
+  #   open_button_names 仅作备用，实际需用 CSS selector fallback。
+  # ⚠ 注意：画布选择器是 .cornerstone-canvas（非 #overlaycanvas-0_0），
+  #   序列选择/画布截图需相应调整。
+  # --------------------------------------------------------------------------
+  cxhospital:
+    url_patterns:
+      - "cxss.zjcxph.com"
+    iframe_selectors:
+      - "#iframe"
+    meta_panel:
+      open_button_names:
+        - "Dicom"
+        - "DICOM"
+        - "DICOM信息"
+        - "影像信息"
+      panel_container_selectors: []
+      tag_row_format: "flex_div"
+      tag_pattern: '\(?\d{4}[,\)\s-]\s*\d{4}\)?'
+      close_button_selectors: []
+    sequence_select:
+      canvas_selectors:
+        - ".cornerstone-canvas"
+      text_pattern: '\d+\s*(?:幅|images|frames|张)'
+      item_container_selectors: []
+
+  # --------------------------------------------------------------------------
+  # 通用兜底 — 未匹配任何已知 viewer 时使用
+  # 配置尽量宽松，让脚本能从录制脚本反推 + VL 兜底
+  # --------------------------------------------------------------------------
+  generic:
+    url_patterns: []          # 不匹配任何 URL
+    iframe_selectors: []      # 从录制脚本中已出现的 locator(...) 反推
+    meta_panel:
+      open_button_names:
+        - "DICOM信息"
+        - "DICOM 信息"
+        - "DICOM Tag"
+        - "DICOM Tags"
+        - "DICOM 元数据"
+        - "Meta"
+        - "Metadata"
+        - "元数据"
+        - "属性"
+        - "影像信息"
+        - "病人信息"
+        - "Patient Info"
+      panel_container_selectors: []   # 全文档扫描
+      tag_row_format: "flex_div"
+      tag_pattern: '\(?\d{4}[,\)\s-]\s*\d{4}\)?'
+      close_button_selectors: []
+    sequence_select:
+      canvas_selectors: []    # 从录制脚本反推
+      text_pattern: '\d{3,}'
+      item_container_selectors: []
