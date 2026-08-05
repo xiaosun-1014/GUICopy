@@ -1,7 +1,7 @@
 # 一次录制生成 Adapter 与离线复刻网页：产品化闭环设计
 
 日期：2026-08-04  
-状态：已批准；2026-08-04 根据代码审阅补强复用、身份、解释器和能力边界  
+状态：已批准；2026-08-05 根据二次审阅补强成功标准与能力边界的自洽  
 范围：`D:\00-Project\04-codegencopy`
 
 ## 1. 背景
@@ -132,6 +132,21 @@ Pipeline Orchestrator
 
 每个高风险执行步骤使用独立子进程。GUI 不直接导入或执行用户录制脚本。
 
+进程部署形态：orchestrator 本身是一个可独立运行的 CLI 脚本
+（`pipeline.py`，含 `--input script --annotations ... --output dir` 等入参）。
+GUI 用 `QProcess` 启动它（沿用现有 `batch_capture_replicate.py` 的
+`readyRead`/`finished` 外壳模式），orchestrator 再按阶段通过子进程分别
+调用 `agent.py`、live capture、offline validation；子进程的 JSONL 事件
+由 orchestrator 汇总后，以统一事件流转发到 stdout，GUI 解析并在界面呈现，
+因此多了一层子进程也能保持 GUI 线程响应与复数登录/取消命令下发不变。
+
+GUI ↔ orchestrator 的事件与命令链路、`fatal`/`completed` 终态规则、
+marker 计数的 upsert+summary 覆盖语义，已在配套事件协议规格中定义：
+`docs/superpowers/specs/2026-08-05-gui-orchestrator-event-protocol.md`；
+其中 adapter 生成阶段的 agent 子协议见
+`2026-08-05-gui-orchestrator-agent-protocol.md`。处理这些协议的一致性
+问题（D1–D4）后再进入实现。
+
 ## 6. Pipeline 阶段
 
 ### 6.1 Stage 1：Preflight
@@ -167,8 +182,13 @@ Preflight 失败时禁止启动浏览器。
 - 没有残留未实现注释或占位代码；
 - 生成 patch 没有越过 marker 边界；
 - `ast.parse` 和 `py_compile` 通过；
-- 保存模型、prompt hash、skill 版本和有限的脱敏诊断信息；
+- 保存模型、prompt hash、skill bundle 的内容 sha256 指纹和有限的脱敏诊断信息；
 - 生成失败时不发布伪成功 completed 文件。
+
+关于「skill 版本」：本项目不是 git 仓库，`skills/` 下 SKILL.md 也没有
+version 字段，因此用「该 marker 对应 skill bundle 全部文件的拼接
+sha256」作为版本指纹（与 source hash / prompt hash 同源），记录到
+报告里；不依赖任何版本管理工具。
 
 ### 6.3 Stage 3：Live Capture
 
@@ -190,6 +210,11 @@ Marker 身份必须显式映射：GUI annotations 中的 UUID 是跨保存稳定
 label”一一匹配 marker group，并把 UUID 写回 group、ActionTarget、
 snapshot 路径、manifest 和报告。缺失、重复或 label 不一致属于 preflight
 失败，禁止仅校验 source hash 后忽略 annotations 内容。
+
+`annotations.line` 的语义必须钉死为「指向 marker 注释行本身」（而非其
+后的首个 action 行），写入 annotations schema 注释并保持与
+`parse_action_plan` 的 marker group 行号基准一致，避免出现 1 行的
+行列偏移；按“行号 + 规范化 label”双键匹配以消除歧义。
 
 ### 6.4 Stage 4：Replica Build
 
@@ -246,6 +271,17 @@ context.route("**/*", route_handler)
 `data:`、`blob:`、`about:blank`。其他请求先记录脱敏 URL，再 `route.abort()`；
 存在任何记录时最终结果为 `offline_external_request`。
 
+**离线隔离覆盖到进程级 egress**：浏览器 route 只拦页面/子进程发起的请求，
+不拦 executed adapter 自身进程的 Python 级出站（`requests`/`urllib`/原始
+`socket`/`http.client` 等）。因此 offline runner 子进程还必须：
+
+- 以独立子进程执行 adapter，并对该进程施加进程级 egress 阻断或检测（如
+  设置受限网络环境、代理/路由层拦截、或 hook 出站调用并记录）；
+- 任何非 localhost 的 Python 级出口连接同样先记录脱敏 URL/目标，再阻断，
+  与浏览器 route 一并计入 `offline_external_request`；
+- 使「外部请求为零」（§10.3）同时涵盖浏览器与进程两条通道，而非只覆盖
+  浏览器 route。
+
 Replica 不运行原站 viewer JavaScript，因此报告必须输出能力声明矩阵：
 
 | Adapter 能力 | Replica 验证等级 |
@@ -263,6 +299,21 @@ Offline adapter 遇到明确为 unsupported 的 viewer JS API 时必须记录降
 证据；不能把 replica 能力边界误报为 adapter 线上失败。需要动态 canvas
 帧变化的 marker 最高为 `partial`，除非未来 replica 明确实现并验证对应
 动态状态。
+
+Offline runner 按 marker 顺序执行完整 marker 序列（而非只跑单个
+marker），前序 marker 正常建立 `seq_frames` / `seq_name` 等运行时局部
+变量，后序 canvas / Meta marker 通过 `locals()` 读取，保证与真实运行的
+上下文依赖一致。
+
+### 6.6.1 关键能力收缩（critical capability contraction）
+
+`critical marker` 的定义基于 replica 的能力边界收缩：一个 marker 只有当
+其承担的关键能力在 replica 中被声明为 `supported` 时才能被计入 critical
+集；能力为 `degraded` 或 `unsupported` 的 marker 不进 critical 集，其离线
+验证以 `partial` 为上限。成功标准的“所有 critical marker 通过”依据
+**收缩后的 critical 集**判定，从而避免“带有 canvas 动态帧的医院永远无法
+达到 success”的矛盾（见 §10.1 / §16）。是否计入 critical 与 locator 风险
+（§11）独立判定，二者取较低者作为该 marker 的离线结果上限。
 
 ### 6.7 Stage 7：Verification Report
 
@@ -312,6 +363,16 @@ cancelled
 - replica build；
 - replica validation；
 - offline adapter validation。
+
+**rerun 的 run_id 语义**：每次重新执行（无论从哪个产物继续）都**新建一个
+`run_id`**，通过**引用**复用前一次稳定产物（`capture/manifest.json`、
+`adapter/`、`replica/`、`annotations` 等），而不是覆盖历史 run。因此状态机
+**不需要**从终态（success/partial/failed/cancelled）出重入边回到活动态——
+每次重跑都是独立 run 的生命周期；`pipeline_state.json` 每次只描述当前 run。
+「预检 run_id 冲突」（§6.1）据此语义判断：复用产物前先校验其存在性与 hash，
+不与历史 run_id 竞争。每个可重跑阶段的产物前置条件（如 offline adapter
+validation 需要 `adapter/completed_*_offline.py` 与 `replica/`）在预检时按
+run 声明。
 
 ## 8. 错误分类和恢复
 
@@ -370,6 +431,21 @@ cancelled
 
 ## 10. 成功标准
 
+### 10.0 run 级终态裁决（completed.status 的聚合规则）
+
+`completed.status` 由以下**优先级阶梯**计算，不是对 §10.1/§10.2/§10.3 的
+无优先级 AND/OR 判定：
+
+1. **任一 §10.3 Failed 条件触发 ⇒ `failed`**（失败优先，不得被警告或 partial 掩盖）；
+2. 否则，若**没有任何 marker 达到 success 级**（即收缩后 critical 集为空，
+   或所有被验证 marker 均为 partial/失败）⇒ `partial`；
+3. 否则，若任一 marker 为 `partial` ⇒ `partial`；
+4. 仅当全部 critical marker 均为 success 且无任何 partial ⇒ `success`。
+
+此规则与 §6.6.1 收缩一致：**空 critical 集 → `partial`**（不判 success，避免
+“没有关键能力被验证为成功却算成功”的空洞）。`completed.status` 由 orchestrator
+据此聚合各阶段与 marker 结果得出，不得凭过程推断或 exit code 得出。
+
 ### 10.1 Success
 
 必须同时满足：
@@ -382,7 +458,9 @@ cancelled
 - manifest schema 和引用有效；
 - replica 构建并启动成功；
 - popup/frame 拓扑恢复；
-- offline adapter 成功执行所有 critical marker；
+- offline adapter 成功执行所有 critical marker，其中 critical marker 按
+  §6.6.1 基于 replica 能力声明收缩（能力为 degraded/unsupported 的 marker
+  不进 critical 集，以 partial 为上限）；
 - critical locator 唯一且可见；
 - 所需产物存在且有效；
 - 外部请求为零；
@@ -412,7 +490,7 @@ cancelled
 - popup/frame 拓扑丢失；
 - replica 不能启动；
 - offline adapter 无法命中关键 locator；
-- offline 验证产生外部请求；
+- offline 验证产生任何外部请求——浏览器 route 或 adapter 进程自身 egress（见 §6.6）；
 - 泄漏密码、token、cookie 或 storage state；
 - required artifact 为空或不可解析；
 - 超时或无法清理进程。
@@ -442,7 +520,11 @@ critical action 只依赖 ordinal/structural/absolute-coordinate locator，
 - URL query value、患者姓名、检查号和 accession 在日志中脱敏；
 -截图、Metadata 和 canvas 标记为敏感本地产物；
 - run 输出默认被 `.gitignore` 排除；
-- sanitizer 在数据进入内存模型和落盘前执行；
+- sanitizer 在不含敏感内容的**持久化模型与落盘产物**上执行；澄清：原始 DOM
+  快照是由 Playwright 在浏览器侧读入本进程内存后才可净化，因此「净化发生在
+  进入内存前」不可能实现。实际时序是「读取原始快照 → sanitize_html 净化 →
+  构造持久化模型/落盘」。与下文一致，sanitizer 保证的是**已知凭据模式**与
+  可落盘内容不含已识别的敏感值，不承诺任意未知文本零泄漏；
 - offline validation 拒绝所有非 localhost 请求；
 - 报告只展示脱敏指标和本地路径。
 
@@ -559,8 +641,8 @@ GUI 不把子进程 exit code 直接映射成业务成功。最终状态来自 o
 
 1. 单元测试全部通过；
 2. 本地完整 fixture pipeline 通过；
-3. 断网 offline adapter E2E 通过且外部请求为零；
-4. popup、嵌套 iframe 和 ftimage 三类真实 smoke test 至少各通过一次，或对未通过项明确记录为发布 blocker；
+3. 断网 offline adapter E2E 通过且外部请求为零，判定依据 §6.6.1 收缩后的 critical 集；
+4. popup、嵌套 iframe 和 ftimage 三类真实 smoke test 至少各通过一次；其中 ftimage 因 canvas 动态帧为 unsupported 能力，只要其收缩后 critical 集（不含动态帧）全部通过即记为通过，未通过项明确记录为发布 blocker；此处「记为通过」指**发布门槛通过**，ftimage 的 `run.status` 仍按 §10.0 为 `partial`（收缩后 critical 空或仅 supported 能力），二者不冲突；
 5. 取消、超时和失败不会残留浏览器/server；
 6. 报告不泄漏凭据、token、cookie、storage state 和患者标识；
 7. GUI 在所有阶段保持响应；
@@ -573,7 +655,10 @@ GUI 不把子进程 exit code 直接映射成业务成功。最终状态来自 o
 - replica 捕获使用 processed script；
 - offline adapter 验证 completed adapter；
 - 保持真实 adapter、replica 和 offline bootstrap 三者边界；
-- critical action 使用严格成功门槛；
+- critical 使用严格成功门槛，但判定基于 replica 能力收缩后的 critical 集（§6.6.1），unsupported 能力不计入成功标准；
 - 真实站点 smoke test 是发布门槛，不用本地 fixture 冒充真实验收；
 - 第一版允许从稳定产物重新执行阶段，不恢复浏览器会话；
+- run 级终态按 §10.0 优先级裁决（Failed→Partial→Success），空 critical 集判 partial；
+- rerun 一律新建 run_id、引用复用产物，不从终态回退活动态；
+- 离线隔离强化为进程级 egress 阻断，不只浏览器 route（§6.6）；
 - 隐私、安全和外网隔离属于硬性门槛。
