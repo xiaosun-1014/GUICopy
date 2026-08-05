@@ -20,7 +20,7 @@ from pathlib import Path
 from build_replica import build_replica
 from capture_snapshot import capture_interaction_region, capture_locator_snapshot, capture_marker_interaction_region, capture_page_topology, capture_selector_closure, compute_image_diff, decide_state, marker_region_type
 from replay_helpers import read_manifest, sha256_file, write_manifest
-from rewrite_script import parse_action_plan
+from rewrite_script import ActionPlan, parse_action_plan
 from replica_models import CaptureTimingProfile, DomNodeSnapshot, Rect, ReplicaDocument, ReplicaFlow, ReplicaPage, ReplicaState, ReplicaTransition, StateDiffProfile, StateEvidence
 
 
@@ -434,11 +434,20 @@ def _has_snapshot_pair(capture_root: Path, action_id: str) -> bool:
     return all((snapshots / phase / "topology.json").is_file() for phase in ("before", "after"))
 
 
-def build_flow_from_snapshots(script_path: str | Path, capture_root: str | Path) -> ReplicaFlow:
-    """Build a sequential ReplicaFlow from marked-action snapshot pairs."""
+def build_flow_from_snapshots(script_path: str | Path, capture_root: str | Path, annotations_payload: dict[str, object] | None = None) -> ReplicaFlow:
+    """Build a sequential ReplicaFlow from marked-action snapshot pairs.
+
+    When ``annotations_payload`` (the validated GUI annotations dict) is supplied,
+    the GUI UUIDs are matched onto marker groups/actions by source line + normalized
+    label before building, so ``ActionTarget.marker_id`` in the manifest carries the
+    stable GUI UUID instead of the regenerated ``m_{index}`` id. Without a payload
+    (the hash-only/no-annotations path) behavior is unchanged.
+    """
     script_path = Path(script_path)
     capture_root = Path(capture_root)
     plan = parse_action_plan(script_path.read_text(encoding="utf-8"))
+    if annotations_payload is not None:
+        merge_annotation_uuids(plan, annotations_payload)
     all_actions = [action for group in plan.marker_groups for action in group.actions]
     marker_labels = {group.marker_id: group.marker_label for group in plan.marker_groups}
     popup_targets = {action_id: expectation.result_page_var for expectation in plan.popup_expectations for action_id in expectation.body_action_ids}
@@ -482,6 +491,7 @@ def capture_and_build(
     emit: Callable[[dict[str, str]], None] | None = None,
     storage_state: str | Path | None = None,
     interactive_auth: bool = False,
+    annotations_payload: dict[str, object] | None = None,
 ) -> Path:
     """Run one live capture replay, persist its manifest, and build the offline entrypoint."""
     notify = emit or (lambda event: None)
@@ -493,7 +503,7 @@ def capture_and_build(
         notify({"event": "failed", "stage": "capture"})
         raise RuntimeError(f"instrumented replay failed with exit {result.returncode}: {result.stderr[-1000:]}")
     notify({"event": "capture_finished"})
-    flow = build_flow_from_snapshots(script_path, capture_root)
+    flow = build_flow_from_snapshots(script_path, capture_root, annotations_payload)
     write_manifest(capture_root / "manifest.json", flow)
     notify({"event": "build_started"})
     entrypoint = build_replica(flow, capture_root, output_root / "replica")
@@ -509,6 +519,70 @@ def validate_annotations(script_path: str | Path, annotations_path: str | Path) 
     if payload.get("source_script_sha256") != sha256_file(script_path):
         raise ValueError("replica annotations do not match the processed script")
     return payload
+
+
+def normalize_label(label: str) -> str:
+    """Normalize a marker label for matching: collapse all whitespace and casefold.
+
+    This is the single normalization rule applied to BOTH annotation labels and
+    script marker_labels so the two sides compare equal. Whitespace runs collapse
+    to a single space (leading/trailing stripped) and ASCII letters are lowercased;
+    CJK characters are unaffected by casefold.
+    """
+    return " ".join(str(label).split()).casefold()
+
+
+def merge_annotation_uuids(plan: ActionPlan, annotations_payload: dict[str, object]) -> dict[str, str]:
+    """Match GUI annotation UUIDs onto marker groups/actions by source line + normalized label.
+
+    This is the preflight merge step the brief requires after ``validate_annotations``.
+    It builds ``{"line": {"normalized_label": uuid}}`` from the annotations payload and
+    aligns each ``MarkerGroup`` by ``source_line`` + ``normalize_label(marker_label)``.
+
+    Failure modes (all raise ``ValueError`` — preflight failure):
+      - duplicate:      same source line + normalized label appears more than once
+                        in the annotations payload
+      - label mismatch: a marker group's source line has annotations, but the
+                        normalized label differs from the script's marker_label
+      - missing:        an annotation UUID has no matching marker group, OR a
+                        marker group has no matching annotation
+
+    On success it rewrites every group's ``marker_id`` and its action targets'
+    ``marker_id`` to the GUI UUID, and returns ``{original_regenerated_id: uuid}``.
+    The no-annotations path is untouched: callers simply omit this step.
+    """
+    by_line: dict[int, dict[str, str]] = {}
+    for marker in annotations_payload.get("markers", []):
+        line = marker["line"]
+        norm = normalize_label(marker["label"])
+        uuid = marker["marker_id"]
+        if norm in by_line.setdefault(line, {}):
+            raise ValueError(f"duplicate annotation for line {line}, label {marker['label']!r}")
+        by_line[line][norm] = uuid
+
+    result: dict[str, str] = {}
+    for group in plan.marker_groups:
+        original_id = group.marker_id
+        line_labels = by_line.get(group.source_line)
+        if line_labels is None:
+            raise ValueError(f"missing annotation for marker at source line {group.source_line}")
+        norm = normalize_label(group.marker_label)
+        if norm not in line_labels:
+            raise ValueError(
+                f"label mismatch for marker at source line {group.source_line}: "
+                f"script label {group.marker_label!r} does not match annotation labels {list(line_labels)}"
+            )
+        uuid = line_labels.pop(norm)
+        result[original_id] = uuid
+        group.marker_id = uuid
+        for action in group.actions:
+            action.marker_id = uuid
+
+    remaining = [line for line, labels in by_line.items() for _label in labels]
+    if remaining:
+        raise ValueError(f"missing marker group for annotation line(s): {remaining}")
+    return result
+
 
 
 def await_interactive_auth(stream: object, emit: Callable[[dict[str, str]], None], timeout_s: float = 300) -> None:
@@ -582,8 +656,9 @@ def main() -> None:
             parser.error("storage-state auth mode requires --storage-state")
         if args.auth_mode == "storage-state" and not Path(args.storage_state).is_file():
             parser.error("storage-state path does not exist")
+        annotations_payload = None
         if args.annotations:
-            validate_annotations(args.script, args.annotations)
+            annotations_payload = validate_annotations(args.script, args.annotations)
         emit = lambda event: print(json.dumps(event, ensure_ascii=False), flush=True)
         try:
             entrypoint = capture_and_build(
@@ -592,6 +667,7 @@ def main() -> None:
                 emit,
                 args.storage_state if args.auth_mode == "storage-state" else None,
                 args.auth_mode == "interactive",
+                annotations_payload,
             )
         except Exception as error:
             emit({"event": "failed", "category": classify_capture_error(error)})

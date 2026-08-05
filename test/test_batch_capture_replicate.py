@@ -2,15 +2,18 @@ import tempfile
 import unittest
 from pathlib import Path
 import ast
+import hashlib
 import io
+import json
 import time
 
 import batch_capture_replicate as replica_batch
-from batch_capture_replicate import LiveCaptureSession, await_interactive_auth, build_flow_from_snapshots, build_from_manifest, capture_and_build, classify_capture_error, instrument_marked_actions, run_live_capture, validate_annotations
+from batch_capture_replicate import LiveCaptureSession, await_interactive_auth, build_flow_from_snapshots, build_from_manifest, capture_and_build, classify_capture_error, instrument_marked_actions, merge_annotation_uuids, run_live_capture, validate_annotations
 from playwright.sync_api import sync_playwright
 from replay_helpers import write_manifest
 from replica_models import BootstrapPlan, CaptureTimingProfile, ReplicaFlow, ReplicaState, StateEvidence
 from replay_helpers import read_manifest
+from rewrite_script import parse_action_plan
 
 
 class BatchCaptureReplicateTests(unittest.TestCase):
@@ -408,6 +411,131 @@ run()
         self.assertEqual(classify_capture_error(RuntimeError("authentication_cancelled")), "authentication")
         self.assertEqual(classify_capture_error(RuntimeError("locator strict mode violation")), "selector_failure")
         self.assertEqual(classify_capture_error(RuntimeError("net::ERR_CONNECTION_REFUSED")), "network")
+
+    # --- Task 5: batch_capture annotations UUID writeback ---
+
+    @staticmethod
+    def _annotated_plan(source):
+        marker_line = next(i for i, line in enumerate(source.splitlines(), 1) if "MARKER:" in line)
+        return parse_action_plan(source), marker_line
+
+    def test_merge_uuids_writes_gui_uuid_into_groups_and_action_targets(self):
+        source = '''from playwright.sync_api import sync_playwright\n\ndef run(page):\n    # [MARKER: 序列选择]\n    page.locator("#series").click()\n'''
+        plan, marker_line = self._annotated_plan(source)
+        payload = {"schema_version": 1, "source_script_sha256": "x", "markers": [{"marker_id": "uuid-sel", "line": marker_line, "label": "序列选择"}]}
+
+        mapping = merge_annotation_uuids(plan, payload)
+
+        self.assertEqual(mapping, {"m_000": "uuid-sel"})
+        self.assertEqual(plan.marker_groups[0].marker_id, "uuid-sel")
+        self.assertEqual(plan.marker_groups[0].actions[0].marker_id, "uuid-sel")
+
+    def test_merge_uuids_normalizes_whitespace_and_case_of_labels(self):
+        source = '''from playwright.sync_api import sync_playwright\n\ndef run(page):\n    # [MARKER: Meta 信息工具]\n    page.locator("#go").click()\n'''
+        plan, marker_line = self._annotated_plan(source)
+        payload = {"markers": [{"marker_id": "uuid-meta", "line": marker_line, "label": "  meta 信息工具  "}]}
+
+        mapping = merge_annotation_uuids(plan, payload)
+
+        self.assertEqual(mapping, {"m_000": "uuid-meta"})
+
+    def test_merge_uuids_rejects_duplicate_same_line_and_label(self):
+        source = '''from playwright.sync_api import sync_playwright\n\ndef run(page):\n    # [MARKER: 序列选择]\n    page.locator("#series").click()\n'''
+        plan, marker_line = self._annotated_plan(source)
+        payload = {"markers": [
+            {"marker_id": "uuid-a", "line": marker_line, "label": "序列选择"},
+            {"marker_id": "uuid-b", "line": marker_line, "label": " 序列选择 "},
+        ]}
+
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            merge_annotation_uuids(plan, payload)
+
+    def test_merge_uuids_rejects_annotation_with_no_matching_group(self):
+        source = '''from playwright.sync_api import sync_playwright\n\ndef run(page):\n    # [MARKER: 序列选择]\n    page.locator("#series").click()\n'''
+        plan, marker_line = self._annotated_plan(source)
+        payload = {"markers": [
+            {"marker_id": "uuid-sel", "line": marker_line, "label": "序列选择"},
+            {"marker_id": "uuid-orphan", "line": 999, "label": "报告截图"},
+        ]}
+
+        with self.assertRaisesRegex(ValueError, "missing marker group"):
+            merge_annotation_uuids(plan, payload)
+
+    def test_merge_uuids_rejects_group_with_no_matching_annotation(self):
+        source = '''from playwright.sync_api import sync_playwright\n\ndef run(page):\n    # [MARKER: 序列选择]\n    page.locator("#series").click()\n'''
+        plan, _marker_line = self._annotated_plan(source)
+        payload = {"markers": []}
+
+        with self.assertRaisesRegex(ValueError, "missing annotation"):
+            merge_annotation_uuids(plan, payload)
+
+    def test_merge_uuids_rejects_label_mismatch_on_aligned_line(self):
+        source = '''from playwright.sync_api import sync_playwright\n\ndef run(page):\n    # [MARKER: 序列选择]\n    page.locator("#series").click()\n'''
+        plan, marker_line = self._annotated_plan(source)
+        payload = {"markers": [{"marker_id": "uuid-wrong", "line": marker_line, "label": "报告截图"}]}
+
+        with self.assertRaisesRegex(ValueError, "label mismatch"):
+            merge_annotation_uuids(plan, payload)
+
+    def test_validate_annotations_returns_payload_when_hash_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / "recorded.py"
+            annotations = root / "replica_annotations.json"
+            script.write_text("print('recorded')\n", encoding="utf-8")
+            payload = {
+                "schema_version": 1,
+                "source_script_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
+                "markers": [{"marker_id": "uuid-ok", "line": 1, "label": "序列选择"}],
+            }
+            annotations.write_text(json.dumps(payload), encoding="utf-8")
+
+            result = validate_annotations(script, annotations)
+
+            self.assertEqual(result, payload)
+
+    def test_annotation_uuid_is_written_into_built_flow_action_target(self):
+        source = '''from playwright.sync_api import sync_playwright\n\ndef run(page):\n    # [MARKER: 序列选择]\n    page.locator("#series").click()\n'''
+        marker_line = next(i for i, line in enumerate(source.splitlines(), 1) if "MARKER:" in line)
+        with tempfile.TemporaryDirectory() as tmp, sync_playwright() as playwright:
+            root = Path(tmp)
+            script = root / "recorded.py"
+            script.write_text(source, encoding="utf-8")
+            session = LiveCaptureSession(root / "capture")
+            browser = playwright.chromium.launch()
+            page = browser.new_page()
+            page.set_content('<button id="series">Series</button>')
+            target = lambda: page.locator("#series")
+            session.before("a_000_001", page, target, "序列选择")
+            target().click()
+            session.after("a_000_001", page, target, "序列选择")
+            payload = {"schema_version": 1, "source_script_sha256": "x", "markers": [{"marker_id": "uuid-built", "line": marker_line, "label": "序列选择"}]}
+
+            flow = build_flow_from_snapshots(script, root / "capture", payload)
+
+            self.assertEqual(flow.states[0].documents[0].targets[0].marker_id, "uuid-built")
+            browser.close()
+
+    def test_build_flow_without_annotations_keeps_regenerated_marker_id(self):
+        source = '''from playwright.sync_api import sync_playwright\n\ndef run(page):\n    # [MARKER: 序列选择]\n    page.locator("#series").click()\n'''
+        with tempfile.TemporaryDirectory() as tmp, sync_playwright() as playwright:
+            root = Path(tmp)
+            script = root / "recorded.py"
+            script.write_text(source, encoding="utf-8")
+            session = LiveCaptureSession(root / "capture")
+            browser = playwright.chromium.launch()
+            page = browser.new_page()
+            page.set_content('<button id="series">Series</button>')
+            target = lambda: page.locator("#series")
+            session.before("a_000_001", page, target, "序列选择")
+            target().click()
+            session.after("a_000_001", page, target, "序列选择")
+
+            flow = build_flow_from_snapshots(script, root / "capture")
+
+            self.assertEqual(flow.states[0].documents[0].targets[0].marker_id, "m_000")
+            self.assertEqual(flow.states[0].documents[0].targets[0].action_id, "a_000_001")
+            browser.close()
 
 
 if __name__ == "__main__":
