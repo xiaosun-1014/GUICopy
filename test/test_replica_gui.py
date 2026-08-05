@@ -112,11 +112,14 @@ page.get_by_role("link").filter(has_text=re.compile(r"^$")).click()
 
     def test_gui_defaults_to_ftimage_recording_inputs(self):
         expected_output = Path(__file__).resolve().parents[1] / "out" / "ftimage" / "processed_script_ftimage.py"
+        from urllib.parse import urlsplit
 
-        self.assertEqual(
-            self.window.url_input.text(),
-            "https://yyx.ftimage.cn/dimage/index.html?stm=V01A94C5E51229D7469B429E6341A8CF03A09AB54FA188D63625B4DF4ACFA2FB2E5729127FE60C3937F225769D48FB1E7D00E8BF5C8A4D708B5FA058D89CB763AC1",
-        )
+        url = urlsplit(self.window.url_input.text())
+        # assert scheme/host/path only — never embed a token in the query
+        self.assertEqual(url.scheme, "https")
+        self.assertEqual(url.netloc, "yyx.ftimage.cn")
+        self.assertEqual(url.path, "/dimage/index.html")
+        self.assertNotIn("stm=", self.window.url_input.text())
         self.assertEqual(Path(self.window.output_input.text()), expected_output)
 
     def test_export_preflight_allows_a_standalone_report_marker(self):

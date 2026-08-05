@@ -21,7 +21,7 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import QObject, QProcess, Qt, pyqtSignal, QPoint
+from PyQt6.QtCore import QObject, QProcess, Qt, QTimer, pyqtSignal, QPoint
 from PyQt6.QtGui import (
     QAction,
     QColor,
@@ -49,31 +49,31 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from agent import parse_markers
 from codegen_manager import CodegenManager
 from markers import DEFAULT_MARKERS, Marker, render
 from rewrite_script import parse_action_plan
+from runtime_python import codegen_python_executable
 
 
-CODEGEN_MARKER_PYTHON = Path("D:/Anaconda/envs/codegen-marker/python.exe")
-FTIMAGE_URL = (
-    "https://yyx.ftimage.cn/dimage/index.html?"
-    "stm=V01A94C5E51229D7469B429E6341A8CF03A09AB54FA188D63625B4DF4ACFA2FB2E5729127FE60C3937F225769D48FB1E7D00E8BF5C8A4D708B5FA058D89CB763AC1"
+PROJECT_ROOT = Path(__file__).resolve().parent
+# Storage state is kept out of the GUI until a file picker + explicit warning are
+# implemented (scripted / interactive auth modes remain available).
+FTIMAGE_URL = os.environ.get(
+    "FTIMAGE_RECORDING_URL",
+    "https://yyx.ftimage.cn/dimage/index.html",
 )
-FTIMAGE_OUTPUT = Path(__file__).resolve().parent / "out" / "ftimage" / "processed_script_ftimage.py"
+FTIMAGE_OUTPUT = PROJECT_ROOT / "out" / "ftimage" / "processed_script_ftimage.py"
 
 
 def replica_python_executable() -> str:
     """Return the documented replica interpreter, or raise if it is missing.
 
-    Never silently falls back to sys.executable: system Python (3.7) lacks the
-    PyQt6/playwright wheels and is forbidden for subprocesses.
+    Wraps runtime_python.codegen_python_executable(). Never silently falls back
+    to sys.executable: system Python (3.7) lacks the PyQt6/playwright wheels and
+    is forbidden for subprocesses.
     """
-    if not CODEGEN_MARKER_PYTHON.is_file():
-        raise RuntimeError(
-            f"缺少复制子进程解释器：{CODEGEN_MARKER_PYTHON}。"
-            "导出离线复刻需要 codegen-marker 环境，请按 CLAUDE.md 用 conda 创建后再试。"
-        )
-    return str(CODEGEN_MARKER_PYTHON)
+    return codegen_python_executable()
 
 
 def write_source_text(path: str | Path, source: str) -> None:
@@ -227,6 +227,53 @@ def _resolve_anchor_idx(
     return min(matches, key=lambda i: abs(i - idx))
 
 
+def build_annotations_from_source(
+    source_code: str, anchors: List[Dict]
+) -> Dict[str, object]:
+    """Derive marker annotations from the ACTUAL editor source, not _display_items.
+
+    Runs ``agent.parse_markers`` over the live editor text to get authoritative
+    1-based line numbers, then reuses each known anchor's ``marker_id`` where the
+    marker header line fingerprint still matches. Markers that cannot retain a
+    known id (manually retyped / relabeled) receive a fresh UUID. This keeps
+    annotations correct even after the user edits text above a marker after
+    recording, when ``_display_items`` line numbers are stale.
+    """
+    lines = source_code.split("\n")
+
+    # index known ids by the fingerprint of each known marker item line
+    id_by_fp: Dict[str, str] = {}
+    for anchor in anchors:
+        marker_id = anchor.get("marker_id")
+        for item in anchor.get("items") or []:
+            if item.get("type") != "marker":
+                continue
+            fp = _fingerprint(item.get("text") or "")
+            if fp and marker_id:
+                id_by_fp[fp] = marker_id
+
+    markers = []
+    for parsed in parse_markers(source_code):
+        line_number = parsed.get("line_start", 0)
+        header = (
+            lines[line_number - 1] if 1 <= line_number <= len(lines) else ""
+        )
+        fp = _fingerprint(header)
+        marker_id = id_by_fp.get(fp)
+        if marker_id is None:
+            marker_id = str(uuid.uuid4())
+        label = (parsed.get("name") or "").split("@", 1)[0].strip()
+        markers.append(
+            {"marker_id": marker_id, "line": line_number, "label": label}
+        )
+
+    return {
+        "schema_version": 1,
+        "source_script_sha256": hashlib.sha256(source_code.encode("utf-8")).hexdigest(),
+        "markers": markers,
+    }
+
+
 # ---- 代码面板：行号栏 + marker 行背景 ----
 
 MARKER_LINE_COLOR = "#FFF8DC"  # cornsilk，marker 行整行淡黄背景
@@ -331,6 +378,17 @@ class MainWindow(QMainWindow):
         self._latest_code = ""
         self._saved_source_hash: str | None = None
 
+        # ---- pipeline orchestrator state (per-stream JSONL buffering) ----
+        self._pipeline_buffers: Dict[str, str] = {"stdout": "", "stderr": ""}
+        self._last_pipeline_event: Optional[Dict[str, object]] = None
+        self._final_pipeline_report: Optional[Path] = None
+        self._final_pipeline_status: Optional[str] = None
+        self._hospital: str = ""
+        self._output_root: Optional[Path] = None
+        self._pipeline_cancel_requested = False
+        self._cancel_timer: Optional[QTimer] = None
+        self._kill_timer: Optional[QTimer] = None
+
         # ---- 数据模型：有序行列表 ----
         # 每项: {"type": "codegen"|"marker", "text": str}
         self._display_items: List[Dict[str, str]] = []
@@ -380,7 +438,7 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.save_btn = QPushButton("💾 保存处理后代码")
         self.save_btn.clicked.connect(self._on_save)
-        self.export_replica_btn = QPushButton("🌐 导出离线复刻")
+        self.export_replica_btn = QPushButton("⚙️ 生成 Adapter + 离线复刻")
         self.export_replica_btn.clicked.connect(self._on_export_replica)
         self.export_replica_btn.setEnabled(False)
         self.cancel_export_btn = QPushButton("取消导出")
@@ -540,91 +598,236 @@ class MainWindow(QMainWindow):
             return
         path = self.output_input.text().strip() or self.DEFAULT_OUTPUT
         write_source_text(path, self._latest_code)
-        annotations_path = Path(path).with_name("replica_annotations.json")
-        annotations_path.write_text(
-            json.dumps(build_replica_annotations(self._display_items, self._latest_code), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        self._write_annotations(path)
         self._saved_source_hash = hashlib.sha256(self._latest_code.encode("utf-8")).hexdigest()
         self._update_export_enabled()
         self._show_status(f"已保存 → {path}", 5000)
 
+    def _annotations_for_export(self) -> Dict[str, object]:
+        """Build replica annotations from the live editor source (post-edit).
+
+        Marker line numbers come from ``agent.parse_markers``; ids are reused
+        where fingerprints match the anchors, else freshly minted. See
+        build_annotations_from_source.
+        """
+        return build_annotations_from_source(self._latest_code, self._marker_anchors)
+
+    def _write_annotations(self, source_path: str | Path) -> Path:
+        annotations_path = Path(source_path).with_name("replica_annotations.json")
+        annotations_path.write_text(
+            json.dumps(self._annotations_for_export(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return annotations_path
+
     def _on_export_replica(self) -> None:
-        """Run live capture/build in a dedicated process so Qt stays responsive."""
+        """Launch the product pipeline orchestrator as a child QProcess.
+
+        The GUI only drives the event protocol: it streams JSONL events to the
+        status bar and forwards cancel/continue commands through stdin. Storage
+        state stays out of the GUI (scripted / interactive auth only).
+        """
         if not self.export_replica_btn.isEnabled():
             return
         try:
             interpreter = replica_python_executable()
         except RuntimeError as error:
-            QMessageBox.critical(self, "无法导出离线复刻", str(error))
-            self._show_status("导出已中止：缺少复制子进程解释器", 5000)
+            QMessageBox.critical(self, "无法生成 Adapter + 离线复刻", str(error))
+            self._show_status("已中止：缺少复制子进程解释器", 5000)
             return
         errors = export_preflight_errors(self._latest_code)
         if errors:
-            QMessageBox.warning(self, "无法导出离线复刻", "\n".join(errors))
+            QMessageBox.warning(self, "无法生成 Adapter + 离线复刻", "\n".join(errors))
             return
         recording_path = Path(self.output_input.text().strip() or self.DEFAULT_OUTPUT).resolve()
-        export_root = recording_path.parent / f"{recording_path.stem}_replica"
-        export_root.mkdir(parents=True, exist_ok=True)
-        source_path = export_root / "processed_script.py"
-        write_source_text(source_path, self._latest_code)
-        annotations_path = export_root / "replica_annotations.json"
-        annotations_path.write_text(
-            json.dumps(build_replica_annotations(self._display_items, self._latest_code), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        # persist the source + annotations (run copies are made by the orchestrator)
+        write_source_text(recording_path, self._latest_code)
+        annotations_path = self._write_annotations(recording_path)
+        hospital = recording_path.parent.name
+        output_root = recording_path.parent.parent
+
+        # reset per-run stream buffer / terminal state
+        self._pipeline_buffers = {"stdout": "", "stderr": ""}
+        self._last_pipeline_event = None
+        self._final_pipeline_report = None
+        self._final_pipeline_status = None
+        self._hospital = hospital
+        self._output_root = output_root
+        self._pipeline_cancel_requested = False
+
         process = QProcess(self)
         process.setProgram(interpreter)
         process.setArguments([
-            str(Path(__file__).resolve().parent / "batch_capture_replicate.py"),
-            "--mode", "live", "--auth-mode", str(self.replica_auth_mode.currentData()), "--script", str(source_path),
-            "--annotations", str(annotations_path), "--output", str(export_root),
+            str(PROJECT_ROOT / "pipeline_orchestrator.py"),
+            "--script", str(recording_path),
+            "--annotations", str(annotations_path),
+            "--hospital", hospital,
+            "--output-root", str(output_root),
+            "--auth-mode", str(self.replica_auth_mode.currentData()),
         ])
-        process.readyReadStandardOutput.connect(self._on_export_output)
-        process.readyReadStandardError.connect(self._on_export_output)
+        process.readyReadStandardOutput.connect(lambda: self._on_export_output("stdout"))
+        process.readyReadStandardError.connect(lambda: self._on_export_output("stderr"))
         process.finished.connect(self._on_export_finished)
         self._export_process = process
         self.export_replica_btn.setEnabled(False)
         self.cancel_export_btn.setEnabled(True)
         self.replica_auth_mode.setEnabled(False)
         process.start()
-        self._show_status("正在后台导出离线复刻…", 0)
+        self._show_status("正在生成 Adapter + 离线复刻…", 0)
 
-    def _on_export_output(self) -> None:
+    def _on_export_output(self, stream: str) -> None:
         if self._export_process is None:
             return
-        output = bytes(self._export_process.readAllStandardOutput()).decode("utf-8", errors="replace")
-        errors = bytes(self._export_process.readAllStandardError()).decode("utf-8", errors="replace")
-        for line in [*output.splitlines(), *errors.splitlines()]:
-            last_line = line.strip()
-            if not last_line:
+        if stream == "stdout":
+            chunk = bytes(self._export_process.readAllStandardOutput())
+        else:
+            chunk = bytes(self._export_process.readAllStandardError())
+        self._consume_pipeline_chunk(stream, chunk)
+
+    def _consume_pipeline_chunk(self, stream: str, chunk: bytes) -> None:
+        """Decode a stream chunk, buffer incomplete JSONL lines, and update GUI.
+
+        stdout carries the JSON event protocol; stderr is redacted diagnostics
+        surfaced only as status text. The GUI is updated only from complete,
+        parseable stdout lines.
+        """
+        self._pipeline_buffers[stream] += chunk.decode("utf-8", errors="replace")
+        data = self._pipeline_buffers[stream]
+        lines = data.split("\n")
+        self._pipeline_buffers[stream] = lines.pop()  # retain incomplete fragment
+        for line in lines:
+            line = line.strip()
+            if not line:
                 continue
-            try:
-                event = json.loads(last_line)
-                stage = event.get("event", "export")
-                detail = event.get("entrypoint", "")
-                if stage == "auth_required":
-                    self.continue_auth_btn.setEnabled(True)
-                elif stage in {"auth_completed", "failed", "completed"}:
-                    self.continue_auth_btn.setEnabled(False)
-                self._show_status(f"离线复刻：{stage}{' → ' + detail if detail else ''}", 5000)
-            except json.JSONDecodeError:
-                self._show_status(last_line, 5000)
+            if stream == "stdout":
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict):
+                    self._handle_pipeline_event(event)
+            else:
+                self._show_status(f"离线复刻诊断：{line}", 5000)
+
+    def _handle_pipeline_event(self, event: dict) -> None:
+        self._last_pipeline_event = event
+        kind = event.get("event")
+
+        if kind == "completed" or kind == "pipeline_finished":
+            run_id = str(event.get("run_id") or "")
+            status = event.get("status")
+            self._final_pipeline_status = status if isinstance(status, str) else None
+            if self._output_root is not None and run_id:
+                self._final_pipeline_report = (
+                    self._output_root / self._hospital / "runs" / run_id / "pipeline_report.json"
+                )
+            label = self._final_pipeline_status or "unknown"
+            self._show_status(f"离线复刻完成：{label}", 5000)
+            return
+
+        if kind == "fatal":
+            detail = event.get("error_category") or event.get("stage") or "未知错误"
+            self._show_status(f"离线复刻失败：{detail}", 5000)
+            return
+
+        if kind == "stage_started":
+            self._show_status(f"阶段：{event.get('stage')}", 5000)
+            return
+
+        if kind == "stage_finished":
+            return
+
+        if kind == "marker_result":
+            return
+
+        if kind == "summary":
+            return
+
+        if kind == "progress":
+            # current-item / item-total overlay
+            stage = event.get("stage", "")
+            self._show_status(f"离线复刻 {stage}…", 5000)
+            return
+
+        # fall back for any other event kinds
+        self._show_status(f"离线复刻：{kind}", 5000)
 
     def _on_export_finished(self, exit_code: int, _exit_status) -> None:
+        terminal_ok = False
+        terminal_status = None
+        if self._final_pipeline_report is not None:
+            try:
+                report = json.loads(
+                    self._final_pipeline_report.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError):
+                report = None
+            if isinstance(report, dict):
+                terminal_status = report.get("status")
+                terminal_ok = terminal_status in ("success", "partial")
+
         self._export_process = None
         self.cancel_export_btn.setEnabled(False)
         self.continue_auth_btn.setEnabled(False)
         self.replica_auth_mode.setEnabled(True)
         self._update_export_enabled()
-        self._show_status("离线复刻导出完成" if exit_code == 0 else f"离线复刻导出失败（{exit_code}）", 5000)
+
+        if exit_code == 0 and terminal_ok:
+            self._show_status(
+                f"离线复刻完成（{terminal_status or self._final_pipeline_status or 'success'}）", 5000
+            )
+        elif self._final_pipeline_report is None:
+            # exit 0 but no final validation report produced → not a success
+            self._show_status("未产生最终验证报告", 5000)
+        elif not terminal_ok:
+            self._show_status(
+                f"离线复刻报告状态异常（{terminal_status or 'unknown'}）", 5000
+            )
+        else:
+            self._show_status(f"离线复刻失败（{exit_code}）", 5000)
 
     def _on_cancel_export(self) -> None:
-        """Terminate only the isolated capture subprocess; the Qt UI stays responsive."""
+        """Gracefully cancel an in-flight pipeline run.
+
+        Sends a ``cancel`` JSONL command over stdin, then starts a 5s timer to
+        ``terminate()`` and another 2s later ``kill()``. Keeps Qt responsive.
+        """
+        self._pipeline_cancel_requested = True
         if self._export_process is None:
             return
-        self._export_process.kill()
-        self._show_status("正在取消离线复刻导出…", 0)
+        try:
+            self._export_process.write(b'{"command":"cancel"}\n')
+        except Exception:  # noqa: BLE001 - best-effort command delivery
+            pass
+        self._show_status("正在取消离线复刻…", 0)
+        if self._cancel_timer is None:
+            self._cancel_timer = QTimer(self)
+            self._cancel_timer.setSingleShot(True)
+            self._cancel_timer.timeout.connect(self._terminate_export)
+            self._kill_timer = QTimer(self)
+            self._kill_timer.setSingleShot(True)
+            self._kill_timer.timeout.connect(self._kill_export)
+        self._cancel_timer.start(5000)
+        self._kill_timer.start(7000)
+
+    def _terminate_export(self) -> None:
+        process = self._export_process
+        if process is None:
+            return
+        try:
+            if process.state() == QProcess.ProcessState.Running:
+                process.terminate()
+        except Exception:  # noqa: BLE001 - best-effort terminate
+            pass
+
+    def _kill_export(self) -> None:
+        process = self._export_process
+        if process is None:
+            return
+        try:
+            process.kill()
+        except Exception:  # noqa: BLE001 - best-effort kill
+            pass
 
     def _on_continue_auth(self) -> None:
         """Release an interactive live capture only after the user finishes login."""
@@ -819,6 +1022,9 @@ class MainWindow(QMainWindow):
 
     # ---------- 关闭 ----------
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._pipeline_cancel_requested = True
+        if self._export_process is not None:
+            self._on_cancel_export()
         if self._manager is not None:
             try:
                 self._manager.stop()
