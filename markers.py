@@ -25,7 +25,8 @@ class Marker:
 # 末尾留一个空字符串用于插入后换行，让连续插入连续成段。
 MARKER_REPORT_SCREENSHOT = (
     "# [MARKER: 报告截图 @ {ts}]\n"
-    "# page.screenshot(path='report_{ts}.png', full_page=True)\n"
+    "# page.screenshot(path=str(SCRIPT_DIR / \"report.jpeg\"), "
+    "type=\"jpeg\", quality=95, full_page=True)\n"
     ""
 )
 
