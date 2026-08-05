@@ -120,6 +120,52 @@ class OfflineAdapterExecutionTests(unittest.TestCase):
             )
             self.assertEqual(external_requests, [])
 
+    def test_python_egress_guard_records_and_rejects_non_loopback_call(self):
+        """A marker block doing a raw Python outbound call must be recorded into
+        the shared ``external_requests`` and fail the run as
+        ``offline_external_request`` (F1) — it must NOT silently pass with an
+        empty external_requests the way only the browser route would allow."""
+        completed = COMPLETED.replace(
+            '    page.locator("#metadata").click()',
+            '    import urllib.request\n'
+            '    _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))\n'
+            '    _opener.open("http://192.0.2.1/")',
+        )
+        # sanity: the injected call actually lands in a marker block
+        self.assertIn("# [MARKER: Meta 信息工具]", completed)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "index.html").write_text(
+                """<!doctype html><html><body>
+<button id="open-viewer">Open</button>
+<button id="metadata">Meta</button>
+</body></html>""",
+                encoding="utf-8",
+            )
+            (root / "serve_replica.py").write_text(
+                generate_serve_script(), encoding="utf-8"
+            )
+            generated = generate_offline_adapter_script(completed, ".", "validation")
+            script = root / "completed_egress_offline.py"
+            script.write_text(generated, encoding="utf-8")
+            try:
+                result = subprocess.run(
+                    [codegen_python_executable(), str(script)],
+                    cwd=root,
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                self.fail("generated offline runner timed out (30s)")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("offline_external_request", result.stderr)
+            external_requests = json.loads(
+                (root / "validation" / "external_requests.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(external_requests)
+            self.assertTrue(any("192.0.2.1" in str(entry) for entry in external_requests))
+
 
 if __name__ == "__main__":
     unittest.main()

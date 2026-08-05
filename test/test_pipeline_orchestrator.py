@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from pipeline_models import PipelineConfig, PipelineStatus, PipelineStage, StageResult
+from orchestrator_events import normalize_child_event
 from pipeline_orchestrator import (
     PipelineController,
     execute_pipeline_stages,
@@ -162,6 +163,104 @@ class CancelTests(unittest.TestCase):
                 result = controller.run()
             self.assertEqual(result.status, CANCELLED)
             self.assertTrue(result.layout.report_json.exists())
+
+    def test_cancel_immediately_after_ready_reports_cancelled_not_success(self):
+        """F2: cancel before any stage result must make pipeline_report.json.status
+        ``cancelled`` (matching the run's terminal ``cancelled``), not ``success``
+        from aggregate_status([])."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(tmp)
+            events: list[dict] = []
+            controller = PipelineController(config, emit=events.append)
+            controller.cancel()  # cancel after ready/server, before any stage result
+            with _patches_for(config, config.output_root / "fixture" / "runs"):
+                result = controller.run()
+            self.assertEqual(result.status, CANCELLED)
+            report = json.loads(result.layout.report_json.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "cancelled")
+            # completed.status agrees with the report
+            completed = [e for e in events if e["event"] == "completed"]
+            self.assertEqual(completed[0]["status"], "cancelled")
+
+
+class MarkerOutcomeAggregationTests(unittest.TestCase):
+    """F3: child marker outcomes are upserted into the orchestrator tracker and
+    emitted as top-level marker_result, so summary/completed counts reflect real
+    outcomes rather than the preflight ``skipped`` seed."""
+
+    def _new_controller(self, tmp: str, events):
+        config = make_config(tmp)
+        controller = PipelineController(config, emit=events.append)
+        return config, controller
+
+    def _envelope(self, child: dict, run_id: str) -> dict:
+        from orchestrator_events import normalize_child_event
+        return normalize_child_event(child, "validating_adapter", run_id)
+
+    def test_adapter_marker_finished_upserts_and_emits_marker_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            events: list[dict] = []
+            config, controller = self._new_controller(tmp, events)
+            controller._track_markers(["报告截图", "影像画布交互"])  # seeded skipped
+            controller._issue(
+                self._envelope(
+                    {"event": "marker_finished", "marker": "报告截图", "status": "supported"},
+                    controller.run_id,
+                )
+            )
+            counts = controller._summary_counts()
+            self.assertEqual(counts["success"], 1)
+            self.assertEqual(counts["skipped"], 1)  # the other marker stays skipped
+            released = [e for e in events if e["event"] == "marker_result"]
+            self.assertEqual(len(released), 1)
+            self.assertEqual(released[0]["marker_id"], "报告截图")
+            self.assertEqual(released[0]["status"], "success")
+
+    def test_degraded_marker_counts_as_partial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            events: list[dict] = []
+            _, controller = self._new_controller(tmp, events)
+            for child in (
+                {"event": "marker_degraded", "marker": "影像画布交互"},
+                {"event": "marker_finished", "marker": "影像画布交互", "status": "degraded"},
+            ):
+                controller._issue(self._envelope(child, controller.run_id))
+            counts = controller._summary_counts()
+            self.assertEqual(counts["partial"], 1)
+            self.assertEqual(counts["success"], 0)
+
+    def test_full_pipeline_reports_real_counts_not_all_skipped(self):
+        """End-to-end: the adapter stage emits a child marker_finished through the
+        child event path; the final completed.summary carries success=1, not the
+        preflight all-skipped seed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(tmp)
+            events: list[dict] = []
+
+            def adapter_fn(config, layout, controller, marker_names=()):
+                controller._track_markers(list(marker_names))
+                controller._issue(
+                    normalize_child_event(
+                        {"event": "marker_finished", "marker": "报告截图", "status": "supported"},
+                        "validating_adapter",
+                        controller.run_id,
+                    )
+                )
+                return StageResult(
+                    PipelineStage.ADAPTER_VALIDATION, SUCCESS,
+                    artifacts={"offline_adapter": str(layout.adapter_dir / "completed_fixture_offline.py")},
+                    metrics={"driver": "adapter/completed_fixture_offline.py"},
+                )
+
+            from unittest.mock import patch
+            with _patches_for(config, config.output_root / "fixture" / "runs"):
+                with patch("pipeline_orchestrator.run_adapter_validation", adapter_fn):
+                    result = run_pipeline(config, emit=events.append)
+            self.assertEqual(result.status, SUCCESS)
+            completed = [e for e in events if e["event"] == "completed"][0]
+            summary = completed["summary"]
+            self.assertEqual(summary["success"], 1)
+            self.assertEqual(summary["skipped"], 0)
 
 
 class ResumeTests(unittest.TestCase):

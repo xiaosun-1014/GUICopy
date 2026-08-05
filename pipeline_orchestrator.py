@@ -593,8 +593,60 @@ class PipelineController:
         kind = event.get("event")
         if kind in ("fatal", "completed", "summary"):
             self._guard.note(str(kind))
+        # Aggregate real per-marker outcomes arriving from child stages into the
+        # controller-held tracker (D3 / F3) so summary/completed counts are
+        # authoritative rather than the preflight ``skipped`` seed.
+        payload = event.get("payload")
+        if isinstance(payload, dict):
+            self._route_child_marker(payload)
         self.emit(event)
         self.store.emit(event)
+
+    def _marker_outcome(self, child: dict) -> Optional[dict]:
+        """Map a child marker-family event to a tracker ``marker_id``/``status``.
+
+        Only terminal outcomes move the counts; ``marker_started`` is
+        informational and changes nothing. Identity is the child's
+        ``marker_id`` if present, else its ``marker``/``label``, so the
+        adapter (label-keyed) and live-capture (id-keyed) channels both land on
+        a stable key.
+        """
+        name = child.get("event")
+        if name == "marker_started":
+            return None
+        identity = child.get("marker_id") or child.get("marker") or child.get("label")
+        if not identity:
+            return None
+        if name in ("marker_finished", "marker_degraded"):
+            status = str(child.get("status") or "").lower()
+            if name == "marker_degraded" or status in ("degraded", "partial"):
+                outcome = "partial"
+            else:
+                outcome = "success"
+            return {"marker_id": str(identity), "status": outcome}
+        if name == "marker_result":
+            status = str(child.get("status") or "").lower()
+            if status not in ("success", "partial", "failed", "skipped"):
+                return None
+            return {"marker_id": str(identity), "status": status}
+        return None
+
+    def _route_child_marker(self, child: dict) -> None:
+        """Upsert a child marker outcome into the tracker and emit a top-level
+        ``marker_result`` event when a marker's status becomes known."""
+        outcome = self._marker_outcome(child)
+        if outcome is None:
+            return
+        marker_id = outcome["marker_id"]
+        self._markers.upsert({"marker_id": marker_id, "status": outcome["status"]})
+        released = {
+            "event": "marker_result",
+            "run_id": self.run_id,
+            "marker_id": marker_id,
+            "status": outcome["status"],
+        }
+        self.emit(released)
+        self.store.emit(released)
 
     def _track_markers(self, marker_names: Iterable[str]) -> None:
         """Record the known marker names so ``summary`` counts are meaningful."""
@@ -774,6 +826,12 @@ def execute_pipeline_stages(c: PipelineController) -> PipelineRunResult:
             c._issue(_stage_summary_event(c, stage.value, "cancelled"))
             c.last_error_category = "cancelled"
             c.last_error_stage = stage.value
+            # Represent the cancellation as a stage result so the report status
+            # (computed from ``c.results``) matches the run's terminal status
+            # even when cancel lands before/between the first stage.
+            c.results.append(
+                StageResult(stage, PipelineStatus.CANCELLED, "cancelled")
+            )
             break
         cont, _ = _run_stage(c, stage, error_category, fn)
         if not cont:

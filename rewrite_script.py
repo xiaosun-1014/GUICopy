@@ -397,6 +397,58 @@ def _reindent_lines(lines: list[str], new_indent: str) -> list[str]:
     return [new_indent + line[base:] if line.strip() else "" for line in lines]
 
 
+def _egress_guard_lines(indent: str) -> list[str]:
+    """Render the Python-side outbound egress guard for the offline runner.
+
+    The browser ``context.route`` only intercepts Playwright traffic; a marker
+    block issuing a raw Python outbound call (``socket``, ``urllib.request``,
+    ``requests``, ``http.client``) bypasses the route entirely. This guard
+    patches ``socket.socket.connect``/``connect_ex`` — the funnel every Python
+    network stack reaches — so any non-loopback TCP/UDP connection is recorded
+    into the shared ``external_requests`` list and refused. Loopback
+    (``127.0.0.1`` / ``localhost`` / ``::1`` / any loopback IP) and non-tuple
+    (Unix-domain / local pipe) addresses — e.g. Playwright's own in-process
+    driver socket — are always permitted so the local replica and the browser
+    bridge keep working. The guard covers anything that resolves to a real
+    ``(host, port)`` socket connect; it does not cover DNS lookups (resolved by
+    the C resolver in-process before ``connect``) which by themselves open no
+    network socket.
+    """
+    body = indent + "    "
+    deep = indent + "        "
+    return [
+        f"{indent}def _is_loopback_egress(address):",
+        f"{body}import ipaddress as _ip",
+        # A non-tuple ``address`` is a Unix-domain / local pipe socket path
+        # (Playwright's own in-process driver connection), which is inherently
+        # local — always permit it. Only ``(host, port)`` tuples represent
+        # network egress.
+        f"{body}if not isinstance(address, tuple) or not address:",
+        f"{deep}return True",
+        f"{body}host = address[0]",
+        f"{body}if host in (\"localhost\", \"127.0.0.1\", \"::1\"):",
+        f"{deep}return True",
+        f"{body}try:",
+        f"{deep}return _ip.ip_address(host).is_loopback",
+        f"{body}except ValueError:",
+        f"{deep}return False",
+        f"{indent}def _install_egress_guard(record):",
+        f"{body}import socket as _sock",
+        f"{body}def _wrap(method):",
+        f"{deep}original = getattr(_sock.socket, method)",
+        f"{deep}def guarded(self, address, *args, **kwargs):",
+        f"{deep + indent}if not _is_loopback_egress(address):",
+        f"{deep + body}record(address)",
+        f'{deep + body}raise RuntimeError("offline_egress_blocked: non-loopback '
+        f"Python outbound connection attempted: %r\" % (address,))",
+        f"{deep + indent}return original(self, address, *args, **kwargs)",
+        f"{deep}setattr(_sock.socket, method, guarded)",
+        f"{body}_wrap(\"connect\")",
+        f"{body}_wrap(\"connect_ex\")",
+        f"{indent}_install_egress_guard(external_requests.append)",
+    ]
+
+
 def generate_offline_adapter_script(
     completed_source: str,
     replica_directory: str,
@@ -505,12 +557,13 @@ def generate_offline_adapter_script(
         f"{indent}validation_root.mkdir(parents=True, exist_ok=True)",
         f"{indent}external_requests: list = []",
         f"{indent}offline_stages: list = []",
+        *_egress_guard_lines(indent),
         f"{indent}with ReplicaServer(replica_root) as server, sync_playwright() as playwright:",
         *_local_page_bootstrap_lines(inner, include_goto=False),
         f'{inner}allowed_origin = "/".join(server.url.split("/")[:3])',
         f"{inner}def _route(route):",
         f"{inner + indent}url = route.request.url",
-        f"{inner + indent}parsed = urllib.parse.urlsplit(url)",
+        f"{inner + indent}parsed = _urlsplit(url)",
         f"{inner + indent}if parsed.scheme in (\"data\", \"blob\", \"about\") or url.startswith(allowed_origin):",
         f"{inner + indent + indent}route.continue_()",
         f"{inner + indent}else:",
@@ -525,6 +578,18 @@ def generate_offline_adapter_script(
     body_lines.append(marker_body)
     body_lines.extend(
         [
+            f"{inner}except BaseException:",
+            # A marker that raised may have tripped the Python egress guard
+            # (``offline_egress_blocked``), which records into
+            # ``external_requests`` but does not itself write the file. Flush
+            # the record and fail the run as ``offline_external_request`` so
+            # the zero-external-request gate covers the Python channel too;
+            # any other marker failure (external_requests empty) re-raises.
+            f"{block_indent}if external_requests:",
+            f"{block_indent + indent}validation_root.joinpath(\"external_requests.json\").write_text("
+            f"json.dumps(external_requests, ensure_ascii=False), encoding=\"utf-8\")",
+            f'{block_indent + indent}raise RuntimeError("offline_external_request")',
+            f"{block_indent}raise",
             f"{inner}finally:",
             f"{block_indent}browser.close()",
             f'{indent}validation_root.joinpath("external_requests.json").write_text('
@@ -542,6 +607,11 @@ def generate_offline_adapter_script(
             "import json",
             "import sys as _sys_path",
             "import urllib.parse",
+            # Marker blocks may shadow ``urllib`` (e.g. ``import
+            # urllib.request``) as a function-local, which would break the
+            # route handler's ``urllib.parse`` lookup (same shadowing hazard as
+            # the ``Path`` case). Bind a stable module-level alias up front.
+            "_urlsplit = urllib.parse.urlsplit",
             "from playwright.sync_api import sync_playwright",
             # The offline runner lives in the adapter dir, but its two runtime
             # dependencies do not: ``serve_replica`` ships with the built replica

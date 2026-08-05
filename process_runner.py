@@ -58,7 +58,10 @@ class ManagedProcess:
     env:
         Environment for the child (defaults to the parent's environment).
     timeout_s:
-        Maximum seconds to wait for the child. ``0`` disables the deadline.
+        Maximum seconds to wait for the child. ``0`` means an immediate timeout
+        (the deadline is ``now`` and the first wait yields nothing); a positive
+        value sets the real deadline. There is no "disabled" sentinel — pass a
+        large positive value if only a nominal bound is desired.
     on_event:
         Optional callback invoked for each parsed JSON dict on stdout that
         contains an ``"event"`` key.
