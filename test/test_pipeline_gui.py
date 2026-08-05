@@ -156,6 +156,72 @@ class PipelineGuiTests(unittest.TestCase):
         self.assertEqual(annotations["markers"][0]["marker_id"], "anchor-1")
         self.assertEqual(annotations["markers"][0]["line"], 2)
 
+    # ---- D3 marker_result / summary consumption ----
+
+    def test_marker_result_upsert_updates_counts(self):
+        self.assertEqual(
+            self.window._marker_counts(), {"success": 0, "partial": 0, "failed": 0, "skipped": 0}
+        )
+        self.window._consume_pipeline_chunk(
+            "stdout", b'{"event":"marker_result","marker_id":"m1","status":"success"}\n'
+        )
+        self.assertEqual(self.window._marker_counts()["success"], 1)
+        # same marker transitions success -> partial : counts 1,0 -> 0,1
+        self.window._consume_pipeline_chunk(
+            "stdout", b'{"event":"marker_result","marker_id":"m1","status":"partial"}\n'
+        )
+        counts = self.window._marker_counts()
+        self.assertEqual((counts["success"], counts["partial"]), (0, 1))
+
+    def test_summary_overlay_overrides_counts_authoritatively(self):
+        self.window._consume_pipeline_chunk(
+            "stdout", b'{"event":"marker_result","marker_id":"m1","status":"success"}\n'
+        )
+        self.window._consume_pipeline_chunk(
+            "stdout",
+            b'{"event":"summary","scope":"markers","status":"success",'
+            b'"success":2,"partial":1,"failed":0,"skipped":3}\n',
+        )
+        counts = self.window._marker_counts()
+        # overlay wins over the recomputed 1-success
+        self.assertEqual((counts["success"], counts["partial"], counts["skipped"]), (2, 1, 3))
+
+    # ---- interactive-auth continue button (regression) ----
+
+    def test_auth_required_enables_continue_then_completed_disables(self):
+        self.assertFalse(self.window.continue_auth_btn.isEnabled())
+        self.window._consume_pipeline_chunk(
+            "stdout", b'{"event":"auth_required"}\n'
+        )
+        self.assertTrue(self.window.continue_auth_btn.isEnabled())
+        self.window._consume_pipeline_chunk(
+            "stdout", b'{"event":"auth_completed"}\n'
+        )
+        self.assertFalse(self.window.continue_auth_btn.isEnabled())
+
+    def test_continue_click_after_auth_required_writes_command(self):
+        class FakeProcess:
+            def __init__(self):
+                self.messages = []
+
+            def write(self, value):
+                self.messages.append(value)
+
+        self.window._export_process = FakeProcess()
+        self.window._consume_pipeline_chunk("stdout", b'{"event":"auth_required"}\n')
+        self.assertTrue(self.window.continue_auth_btn.isEnabled())
+        self.window._on_continue_auth()
+        self.assertEqual(
+            self.window._export_process.messages, [b'{"command":"continue_after_auth"}\n']
+        )
+        self.assertFalse(self.window.continue_auth_btn.isEnabled())
+        self.window._export_process = None
+
+    def test_ready_handled_as_protocol_handshake(self):
+        self.window._consume_pipeline_chunk("stdout", b'{"event":"ready","run_id":"r1"}\n')
+        self.assertEqual(self.window._last_pipeline_event["event"], "ready")
+        self.assertIsNone(self.window._final_pipeline_report)
+
 
 if __name__ == "__main__":
     unittest.main()

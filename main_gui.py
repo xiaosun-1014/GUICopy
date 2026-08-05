@@ -52,6 +52,7 @@ from PyQt6.QtWidgets import (
 from agent import parse_markers
 from codegen_manager import CodegenManager
 from markers import DEFAULT_MARKERS, Marker, render
+from orchestrator_events import MarkerTracker, MARKER_STATUSES
 from rewrite_script import parse_action_plan
 from runtime_python import codegen_python_executable
 
@@ -388,6 +389,8 @@ class MainWindow(QMainWindow):
         self._pipeline_cancel_requested = False
         self._cancel_timer: Optional[QTimer] = None
         self._kill_timer: Optional[QTimer] = None
+        # D3 marker_result upsert + summary overlay (counts semantic)
+        self._marker_tracker = MarkerTracker()
 
         # ---- 数据模型：有序行列表 ----
         # 每项: {"type": "codegen"|"marker", "text": str}
@@ -654,6 +657,7 @@ class MainWindow(QMainWindow):
         self._hospital = hospital
         self._output_root = output_root
         self._pipeline_cancel_requested = False
+        self._marker_tracker = MarkerTracker()
 
         process = QProcess(self)
         process.setProgram(interpreter)
@@ -713,6 +717,21 @@ class MainWindow(QMainWindow):
         self._last_pipeline_event = event
         kind = event.get("event")
 
+        if kind == "ready":
+            # protocol handshake — pipeline is live and accepting commands
+            self._show_status("已连接离线复刻管线（ready）", 5000)
+            return
+
+        if kind == "auth_required":
+            self.continue_auth_btn.setEnabled(True)
+            self._show_status("需要手动登录：完成后点「登录完成，继续」", 0)
+            return
+
+        if kind == "auth_completed":
+            self.continue_auth_btn.setEnabled(False)
+            self._show_status("登录完成，继续捕获…", 5000)
+            return
+
         if kind == "completed" or kind == "pipeline_finished":
             run_id = str(event.get("run_id") or "")
             status = event.get("status")
@@ -721,8 +740,8 @@ class MainWindow(QMainWindow):
                 self._final_pipeline_report = (
                     self._output_root / self._hospital / "runs" / run_id / "pipeline_report.json"
                 )
-            label = self._final_pipeline_status or "unknown"
-            self._show_status(f"离线复刻完成：{label}", 5000)
+            # NOT final: _on_export_finished is the authoritative terminal message.
+            self._show_status("离线复刻处理完成，正在校验最终报告…", 5000)
             return
 
         if kind == "fatal":
@@ -738,9 +757,17 @@ class MainWindow(QMainWindow):
             return
 
         if kind == "marker_result":
+            # D3: upsert per-marker outcome (latest status wins; clears summary overlay)
+            try:
+                self._marker_tracker.upsert(event)
+            except ValueError:
+                pass  # malformed marker_result — ignore rather than break the stream
             return
 
         if kind == "summary":
+            # D3: authoritative counts overlay (scope=markers)
+            if event.get("scope") == "markers":
+                self._marker_tracker.overwrite(event)
             return
 
         if kind == "progress":
@@ -751,6 +778,10 @@ class MainWindow(QMainWindow):
 
         # fall back for any other event kinds
         self._show_status(f"离线复刻：{kind}", 5000)
+
+    def _marker_counts(self) -> Dict[str, int]:
+        """Current D3 marker counts: from the summary overlay or latest upserts."""
+        return self._marker_tracker.counts()
 
     def _on_export_finished(self, exit_code: int, _exit_status) -> None:
         terminal_ok = False
