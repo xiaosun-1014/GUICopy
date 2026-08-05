@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import re
 import tokenize
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from io import StringIO
 from typing import Any
@@ -123,11 +124,74 @@ def _marker_comments(source: str) -> list[tuple[int, str]]:
     return found
 
 
-def parse_action_plan(source: str) -> ActionPlan:
-    """Return a static plan; source is parsed but never imported or executed."""
+def _normalize_label(label: object) -> str:
+    """Normalize a marker label for matching.
+
+    Mirrors agent.MARKER_RE whitespace rules (collapse runs to a single space,
+    strip leading/trailing) plus ASCII casefold, so annotation labels compare
+    equal to script marker labels. Consistent with batch_capture's normalize_label.
+    """
+    return " ".join(str(label).split()).casefold()
+
+
+def _build_groups_with_annotations(
+    marker_comments: list[tuple[int, str]],
+    annotations: Sequence[Mapping[str, object]],
+) -> list[MarkerGroup]:
+    """Build marker groups using GUI annotation UUIDs as the stable marker_id.
+
+    Annotations are indexed by (source line, normalized label). Rules:
+      - reject duplicate (line, label) keys and duplicate marker IDs;
+      - every parsed marker comment must have exactly one matching annotation;
+      - any annotation that matches no marker comment is rejected (unused).
+    """
+    by_key: dict[tuple[int, str], str] = {}
+    seen_ids: set[str] = set()
+    for annotation in annotations:
+        marker_id = annotation["marker_id"]
+        line = annotation["line"]
+        key = (line, _normalize_label(annotation["label"]))
+        if key in by_key:
+            raise ValueError(f"duplicate annotation for source line {line}")
+        if marker_id in seen_ids:
+            raise ValueError(f"duplicate annotation marker_id {marker_id!r}")
+        by_key[key] = marker_id
+        seen_ids.add(marker_id)
+
+    matched: set[tuple[int, str]] = set()
+    groups: list[MarkerGroup] = []
+    for line, label in marker_comments:
+        key = (line, _normalize_label(label))
+        if key not in by_key:
+            raise ValueError(f"missing annotation for marker at source line {line}")
+        matched.add(key)
+        groups.append(MarkerGroup(by_key[key], label, line))
+
+    unused = set(by_key) - matched
+    if unused:
+        raise ValueError(
+            "unused annotations: "
+            + ", ".join(f"L{line} {label!r}" for line, label in sorted(unused))
+        )
+    return groups
+
+
+def parse_action_plan(
+    source: str,
+    marker_annotations: Sequence[Mapping[str, object]] | None = None,
+) -> ActionPlan:
+    """Return a static plan; source is parsed but never imported or executed.
+
+    When ``marker_annotations`` is supplied (GUI replica annotations), each marker
+    comment's stable GUI UUID is used as the group/action ``marker_id``. Without
+    annotations, the historic ``m_{index:03d}`` IDs are preserved.
+    """
     tree = ast.parse(source)
     marker_comments = _marker_comments(source)
-    groups = [MarkerGroup(f"m_{index:03d}", label, line) for index, (line, label) in enumerate(marker_comments)]
+    if marker_annotations is not None:
+        groups = _build_groups_with_annotations(marker_comments, marker_annotations)
+    else:
+        groups = [MarkerGroup(f"m_{index:03d}", label, line) for index, (line, label) in enumerate(marker_comments)]
     first_marker_line = marker_comments[0][0] if marker_comments else len(source.splitlines()) + 1
     bootstrap = BootstrapPlan(1, max(0, first_marker_line - 1), True, {"page": "main"})
 

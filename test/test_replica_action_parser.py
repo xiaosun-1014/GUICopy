@@ -79,6 +79,25 @@ page.locator("canvas").click(position={"x": 422, "y": 419})
 
         self.assertEqual(action.action_args["position"], {"x": 422, "y": 419})
 
+    def test_gui_marker_uuid_is_preserved_in_groups_and_actions(self):
+        source = '# [MARKER: 报告截图]\npage.locator("#report").click()\n'
+        annotations = {
+            "markers": [{
+                "marker_id": "4f0df6de-71e9-4e3e-a186-f64be41d12fd",
+                "line": 1,
+                "label": "报告截图",
+            }]
+        }
+        plan = parse_action_plan(source, annotations["markers"])
+        self.assertEqual(
+            plan.marker_groups[0].marker_id,
+            "4f0df6de-71e9-4e3e-a186-f64be41d12fd",
+        )
+        self.assertEqual(
+            plan.marker_groups[0].actions[0].marker_id,
+            "4f0df6de-71e9-4e3e-a186-f64be41d12fd",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
