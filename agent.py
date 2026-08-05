@@ -620,7 +620,7 @@ def process_script(script: str, dry_run: bool = False,
                         "event": "agent_failed",
                         "label": marker["name"],
                         "line": marker["line_start"],
-                        "status": "sequence_wrapper_syntax_error",
+                        "status": "generated_code_syntax_invalid",
                     })
                     raise RuntimeError(
                         f"生成 [{marker['name']}] 失败：状态等待包装语法错误: "

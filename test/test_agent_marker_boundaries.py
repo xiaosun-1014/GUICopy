@@ -387,6 +387,40 @@ seq_name, seq_frames = select_series(page)
         self.assertIn("prompt_sha256", marker_events[-1])
         self.assertGreater(marker_events[-1]["output_line_count"], 0)
 
+    def test_sequence_wrap_second_validation_failure_emits_agent_failed_enum_reason(self):
+        """序列选择 wrap 二次验证失败 → agent_failed reason ∈ 枚举集，且无 marker_finished。"""
+        script = """def run(page):
+    # [MARKER: 序列选择]
+    # TODO: 动态选择序列
+    page.get_by_text("固定序列").click()
+"""
+        # 首轮返回合法代码（通过初次语法检查），wrap 后产出非法语法触发二次验证失败
+        generated_block = """```python
+# [MARKER: 序列选择]
+seq_name, seq_frames = select_series(page)
+```"""
+        all_allowed_reasons = {
+            "llm_call_failed",
+            "generated_code_syntax_invalid",
+            "exceeded_retries",
+            "deterministic_syntax_error",
+        }
+        events = []
+        with patch.object(agent, "call_llm", return_value=generated_block), \
+             patch.object(agent, "_wrap_sequence_state_waits", return_value='broken = r"'):
+            with self.assertRaisesRegex(RuntimeError, "状态等待包装语法错误"):
+                agent.process_script(script, event_sink=events.append)
+
+        marker_events = [ev for ev in events if ev.get("label") == "序列选择"]
+        failed = [ev for ev in marker_events if ev["event"] == "agent_failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[-1]["status"], "generated_code_syntax_invalid")
+        self.assertIn(failed[-1]["status"], all_allowed_reasons)
+        self.assertNotIn(
+            "marker_finished",
+            [ev["event"] for ev in marker_events],
+        )
+
     def test_cli_emit_jsonl_requires_output(self):
         """--emit-jsonl 不带 --output → parser.error (SystemExit 码 2)。"""
         with patch("sys.argv", ["agent.py", "foo.py", "--emit-jsonl"]):
