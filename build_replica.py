@@ -140,17 +140,66 @@ def _replay_steps(flow: ReplicaFlow) -> list[dict[str, object]]:
     return steps
 
 
+def _locator_risk(target) -> str:
+    """Classify the offline replay risk of a single ActionTarget by its locator."""
+    locator = target.locator
+    if locator is None:
+        return "non_locator"
+    if locator.ordinal_op:
+        return "ordinal"
+    if locator.locator_kind in {"role", "text", "test_id", "label", "title"}:
+        return "aria"
+    args = locator.locator_args.get("args", [""])
+    if any(token in str(args[0]) for token in (">", ":nth-", "[")):
+        return "structural"
+    return "simple"
+
+
+def _locator_risk_metadata(flow: ReplicaFlow) -> dict[str, dict[str, object]]:
+    """Derive locator risk metadata from the flow's ActionTargets (never empty [])."""
+    metadata: dict[str, dict[str, object]] = {}
+    for state in flow.states:
+        for document in state.documents:
+            for target in document.targets:
+                metadata[target.action_id] = {
+                    "marker_id": target.marker_id,
+                    "locator_risk": _locator_risk(target),
+                    "locator_kind": target.locator.locator_kind if target.locator else None,
+                    "required_ancestor_count": target.selector_closure.required_ancestor_count if target.selector_closure else 0,
+                    "required_sibling_count": target.selector_closure.required_sibling_count if target.selector_closure else 0,
+                }
+    return metadata
+
+
 def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Path:
     """Write screenshots, DOM overlays, iframe trees, and declared state transitions."""
     source_root = Path(source_root)
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
+    # Provenance gate: every declared screenshot asset must resolve to a file.
+    for state in flow.states:
+        for document in state.documents:
+            if not document.screenshot_asset_relpath:
+                continue
+            source_asset = source_root / document.screenshot_asset_relpath
+            candidate = None
+            if source_asset.exists():
+                candidate = source_asset
+            else:
+                jpeg = source_asset.with_suffix(".jpeg")
+                if jpeg.exists():
+                    candidate = jpeg
+            if candidate is None:
+                raise FileNotFoundError(
+                    f"required screenshot asset missing: {document.screenshot_asset_relpath}"
+                )
     (output_root / "replica_runtime.js").write_text(RUNTIME, encoding="utf-8")
     (output_root / "serve_replica.py").write_text(generate_serve_script(), encoding="utf-8")
     (output_root / "replay_replica.py").write_text(
         generate_replay_script(".", flow.bootstrap.entry_page_bindings, _replay_steps(flow)), encoding="utf-8"
     )
-    (output_root / "locator_mapping.json").write_text("[]\n", encoding="utf-8")
+    locator_risk_metadata = _locator_risk_metadata(flow)
+    (output_root / "locator_mapping.json").write_text(json.dumps(locator_risk_metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     states = {state.state_id: state for state in flow.states}
     asset_paths: dict[tuple[str, str], Path] = {}
     copied_hashes: set[Path] = set()
@@ -170,10 +219,12 @@ def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Pa
                 shutil.copy2(visual_source, destination_asset)
                 total_asset_bytes += destination_asset.stat().st_size
             copied_hashes.add(destination_asset)
+    build_warnings: list[str] = []
     if total_asset_bytes >= ASSET_CONFIRM_BYTES:
-        flow.warnings.append(f"asset_size_confirmation_required:{total_asset_bytes}")
+        build_warnings.append(f"asset_size_confirmation_required:{total_asset_bytes}")
     elif total_asset_bytes >= ASSET_WARNING_BYTES:
-        flow.warnings.append(f"asset_size_warning:{total_asset_bytes}")
+        build_warnings.append(f"asset_size_warning:{total_asset_bytes}")
+    build_warnings.extend(flow.warnings)
     for state in flow.states:
         state_root = _state_root(flow, state, output_root)
         main_page = next((page for page in state.pages if page.page_var == "page"), state.pages[0] if state.pages else None)
@@ -211,4 +262,18 @@ def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Pa
     entrypoint = output_root / "index.html"
     if not entrypoint.exists():
         entrypoint.write_text("<!doctype html><meta charset=\"utf-8\"><title>Empty replica</title>", encoding="utf-8")
+    (output_root / "replica_build_report.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "flow_id": flow.flow_id,
+                "entrypoint": str(entrypoint.relative_to(output_root)).replace("\\", "/"),
+                "locator_risks": locator_risk_metadata,
+                "build_warnings": build_warnings,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     return entrypoint

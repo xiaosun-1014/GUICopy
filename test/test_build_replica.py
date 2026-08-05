@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -45,7 +46,11 @@ class BuildReplicaTests(unittest.TestCase):
             self.assertTrue(child_document.exists())
             self.assertIn(f'src="../../assets/by-hash/{sha256_file(assets / "child.png")}.png"', child_document.read_text(encoding="utf-8"))
             self.assertEqual(len(list((output / "assets" / "by-hash").glob("*.png"))), 1)
-            self.assertEqual((output / "locator_mapping.json").read_text(encoding="utf-8"), "[]\n")
+            locator_mapping = json.loads((output / "locator_mapping.json").read_text(encoding="utf-8"))
+            self.assertEqual(locator_mapping["a_000_001"]["locator_risk"], "simple")
+            self.assertEqual(locator_mapping["a_000_001"]["marker_id"], "m_000")
+            report = json.loads((output / "replica_build_report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["schema_version"], 1)
             with ReplicaServer(output) as server, sync_playwright() as playwright:
                 browser = playwright.chromium.launch()
                 page = browser.new_page()
@@ -74,6 +79,23 @@ class BuildReplicaTests(unittest.TestCase):
 
             self.assertIn(f"assets/by-hash/{sha256_file(root / 'assets' / 'first.png')}.png", (output / "index.html").read_text(encoding="utf-8"))
             self.assertIn(f"assets/by-hash/{sha256_file(root / 'assets' / 'second.png')}.png", (output / "states" / "s_001" / "index.html").read_text(encoding="utf-8"))
+
+
+    def test_builder_fails_when_required_screenshot_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assets = root / "assets"
+            assets.mkdir()
+            # NOTE: only child.png exists; main.png is deliberately absent.
+            (assets / "child.png").write_bytes(b"png")
+            main = ReplicaDocument("d_main", "p_main", "page", "main", None, None, None, None, {"width": 1, "height": 1}, 1, "css", 0, 0, "assets/main.png", "main", 3)
+            child = ReplicaDocument("d_child", "p_main", "page", "main", "d_main", "#viewer", "viewer", "viewer", {"width": 1, "height": 1}, 1, "css", 0, 0, "assets/child.png", "child", 3)
+            evidence = StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry")
+            flow = ReplicaFlow(1, "missing", "recorded.py", "hash", "now", {"width": 1, "height": 1}, BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000", [ReplicaState("s_000", 0, "", "page", [ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)], [main, child], [], evidence)], [])
+            output = root / "replica"
+
+            with self.assertRaisesRegex(FileNotFoundError, "screenshot"):
+                build_replica(flow, root, output)
 
 
 if __name__ == "__main__":

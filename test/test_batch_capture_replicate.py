@@ -5,12 +5,14 @@ import ast
 import hashlib
 import io
 import json
+import subprocess
 import time
+from unittest.mock import patch
 
 import batch_capture_replicate as replica_batch
-from batch_capture_replicate import LiveCaptureSession, await_interactive_auth, build_flow_from_snapshots, build_from_manifest, capture_and_build, classify_capture_error, instrument_marked_actions, merge_annotation_uuids, run_live_capture, validate_annotations
+from batch_capture_replicate import LiveCaptureSession, await_interactive_auth, build_flow_from_snapshots, build_from_manifest, capture_and_build, capture_to_manifest, classify_capture_error, instrument_marked_actions, merge_annotation_uuids, run_live_capture, validate_annotations
 from playwright.sync_api import sync_playwright
-from replay_helpers import write_manifest
+from replay_helpers import sha256_file, write_manifest
 from replica_models import BootstrapPlan, CaptureTimingProfile, ReplicaFlow, ReplicaState, StateEvidence
 from replay_helpers import read_manifest
 from rewrite_script import parse_action_plan
@@ -536,6 +538,107 @@ run()
             self.assertEqual(flow.states[0].documents[0].targets[0].marker_id, "m_000")
             self.assertEqual(flow.states[0].documents[0].targets[0].action_id, "a_000_001")
             browser.close()
+
+
+    # --- Task 5: capture quality/timeout outcomes explicit ---
+
+    @staticmethod
+    def _annotated_source():
+        source = '''from playwright.sync_api import sync_playwright
+
+def run():
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        page.set_content('<button id="go">Go</button>')
+        # [MARKER: 序列选择]
+        page.locator("#go").click()
+        browser.close()
+
+run()
+'''
+        marker_line = next(i for i, line in enumerate(source.splitlines(), 1) if "MARKER:" in line)
+        return source, marker_line
+
+    def test_capture_to_manifest_does_not_build_replica(self):
+        source, marker_line = self._annotated_source()
+        flow = ReplicaFlow(
+            1, "empty", "recorded.py", "hash", "now", {"width": 1, "height": 1},
+            BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000", [], [],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / "recorded.py"
+            script.write_text(source, encoding="utf-8")
+            annotations = root / "replica_annotations.json"
+            payload = {
+                "schema_version": 1,
+                "source_script_sha256": sha256_file(script),
+                "markers": [{"marker_id": "gui-uuid-sel", "line": marker_line, "label": "序列选择"}],
+            }
+            annotations.write_text(json.dumps(payload), encoding="utf-8")
+            output = root / "capture"
+            with patch(
+                "batch_capture_replicate.run_live_capture",
+                return_value=subprocess.CompletedProcess(["replay"], 0, "out", ""),
+            ) as runner:
+                with patch("batch_capture_replicate.build_flow_from_snapshots", return_value=flow):
+                    manifest = capture_to_manifest(script, annotations, output, capture_timeout_s=7)
+
+            self.assertTrue(manifest.exists())
+            self.assertFalse((output / "replica" / "index.html").exists())
+            self.assertEqual(runner.call_args.kwargs["timeout_s"], 7)
+
+    def test_capture_manifest_preserves_gui_marker_uuid(self):
+        source, marker_line = self._annotated_source()
+        gui_marker_uuid = "gui-uuid-sel"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / "recorded.py"
+            script.write_text(source, encoding="utf-8")
+            annotations = root / "replica_annotations.json"
+            payload = {
+                "schema_version": 1,
+                "source_script_sha256": sha256_file(script),
+                "markers": [{"marker_id": gui_marker_uuid, "line": marker_line, "label": "序列选择"}],
+            }
+            annotations.write_text(json.dumps(payload), encoding="utf-8")
+            output = root / "capture"
+
+            manifest = capture_to_manifest(script, annotations, output)
+            flow = read_manifest(manifest, output)
+
+            self.assertEqual(flow.states[0].documents[0].targets[0].marker_id, gui_marker_uuid)
+
+    def test_capture_and_build_forwards_timeout_to_live_capture(self):
+        with patch(
+            "batch_capture_replicate.run_live_capture",
+            side_effect=subprocess.TimeoutExpired(["fixture"], 7),
+        ) as runner:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                capture_and_build("recorded.py", "out", capture_timeout_s=7)
+        self.assertEqual(runner.call_args.kwargs["timeout_s"], 7)
+
+    def test_build_from_manifest_verifies_explicit_source_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            flow_root = root / "capture"
+            flow_root.mkdir()
+            source = flow_root / "recorded.py"
+            source.write_text("print('original')\n", encoding="utf-8")
+            flow = ReplicaFlow(
+                1, "fixture", "recorded.py", sha256_file(source), "now", {"width": 1, "height": 1},
+                BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000",
+                [ReplicaState("s_000", 0, "", "page", [], [], [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry"))], [],
+            )
+            manifest = flow_root / "manifest.json"
+            write_manifest(manifest, flow)
+            # Mutate the source the manifest points to so its hash diverges.
+            source.write_text("print('changed!')\n", encoding="utf-8")
+            output = root / "replica"
+
+            with self.assertRaisesRegex(ValueError, "hash"):
+                build_from_manifest(manifest, flow_root, output, source_path=source)
 
 
 if __name__ == "__main__":

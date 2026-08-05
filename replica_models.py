@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import types
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from typing import Any, Union, get_args, get_origin, get_type_hints
@@ -109,6 +110,7 @@ class CaptureTimingProfile:
     dom_retry_interval_ms: int = 150
     action_budget_ms: int = 12000
     marker_budget_ms: int = 60000
+    capture_timeout_s: int = 900
     flow_budget_ms: int = 900000
     virtual_scroll_max_steps: int = 40
     virtual_scroll_budget_ms: int = 10000
@@ -264,7 +266,13 @@ def _decode(value: Any, annotation: Any) -> Any:
 
 def _decode_dataclass(value: dict[str, Any], model: type[Any]) -> Any:
     hints = get_type_hints(model)
-    return model(**{item.name: _decode(value[item.name], hints[item.name]) for item in fields(model)})
+    decoded: dict[str, Any] = {}
+    for item in fields(model):
+        if item.name in value:
+            decoded[item.name] = _decode(value[item.name], hints[item.name])
+        elif item.default is not dataclasses.MISSING:
+            decoded[item.name] = item.default
+    return model(**decoded)
 
 
 @dataclass

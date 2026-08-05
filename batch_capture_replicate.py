@@ -218,9 +218,9 @@ def _session_from_environment() -> LiveCaptureSession | None:
     return _LIVE_SESSION
 
 
-def instrument_marked_actions(source: str, use_storage_state: bool = False, interactive_auth: bool = False) -> str:
+def instrument_marked_actions(source: str, use_storage_state: bool = False, interactive_auth: bool = False, marker_annotations: object | None = None) -> str:
     """Insert capture hooks around marked Playwright action statements without executing source."""
-    plan = parse_action_plan(source)
+    plan = parse_action_plan(source, _coerce_marker_annotations(marker_annotations))
     actions = {}
     for group in plan.marker_groups:
         for action in group.actions:
@@ -264,6 +264,7 @@ def run_live_capture(
     storage_state: str | Path | None = None,
     interactive_auth: bool = False,
     emit: Callable[[dict[str, str]], None] | None = None,
+    marker_annotations: object | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Execute one instrumented recording script in a fresh process with capture hooks enabled."""
     script_path = Path(script_path)
@@ -274,7 +275,7 @@ def run_live_capture(
         shutil.rmtree(snapshot_root)
     instrumented_path = output_root / "instrumented_replay.py"
     instrumented_path.write_text(
-        instrument_marked_actions(script_path.read_text(encoding="utf-8"), storage_state is not None, interactive_auth),
+        instrument_marked_actions(script_path.read_text(encoding="utf-8"), storage_state is not None, interactive_auth, marker_annotations),
         encoding="utf-8",
     )
     environment = os.environ.copy()
@@ -402,20 +403,20 @@ def _has_snapshot_pair(capture_root: Path, action_id: str) -> bool:
     return all((snapshots / phase / "topology.json").is_file() for phase in ("before", "after"))
 
 
-def build_flow_from_snapshots(script_path: str | Path, capture_root: str | Path, annotations_payload: dict[str, object] | None = None) -> ReplicaFlow:
+def build_flow_from_snapshots(script_path: str | Path, capture_root: str | Path, marker_annotations: object | None = None) -> ReplicaFlow:
     """Build a sequential ReplicaFlow from marked-action snapshot pairs.
 
-    When ``annotations_payload`` (the validated GUI annotations dict) is supplied,
-    the GUI UUIDs are matched onto marker groups/actions by source line + normalized
-    label before building, so ``ActionTarget.marker_id`` in the manifest carries the
-    stable GUI UUID instead of the regenerated ``m_{index}`` id. Without a payload
-    (the hash-only/no-annotations path) behavior is unchanged.
+    ``marker_annotations`` is the list of validated GUI marker records (each
+    ``{"marker_id", "line", "label"}``); when supplied it is threaded into
+    ``parse_action_plan`` (the Task 2 annotation extension) so group/action
+    ``marker_id`` carries the stable GUI UUID instead of the regenerated
+    ``m_{index}`` id. For backward compatibility a full annotations payload dict
+    (containing a ``markers`` list) is also accepted and its list is extracted.
+    Without annotations behavior is unchanged.
     """
     script_path = Path(script_path)
     capture_root = Path(capture_root)
-    plan = parse_action_plan(script_path.read_text(encoding="utf-8"))
-    if annotations_payload is not None:
-        merge_annotation_uuids(plan, annotations_payload)
+    plan = parse_action_plan(script_path.read_text(encoding="utf-8"), _coerce_marker_annotations(marker_annotations))
     all_actions = [action for group in plan.marker_groups for action in group.actions]
     marker_labels = {group.marker_id: group.marker_label for group in plan.marker_groups}
     popup_targets = {action_id: expectation.result_page_var for expectation in plan.popup_expectations for action_id in expectation.body_action_ids}
@@ -453,29 +454,127 @@ def build_flow_from_snapshots(script_path: str | Path, capture_root: str | Path,
     return ReplicaFlow(1, script_path.stem, script_path.name, sha256_file(script_path), datetime.now(timezone.utc).isoformat(), viewport, plan.bootstrap, plan.popup_expectations, CaptureTimingProfile(), "s_000", states, warnings)
 
 
+def _capture_to_manifest_core(
+    script_path: str | Path,
+    capture_root: str | Path,
+    marker_annotations: object | None,
+    notify: Callable[[dict[str, str]], None],
+    storage_state: str | Path | None,
+    interactive_auth: bool,
+    capture_timeout_s: int,
+) -> Path:
+    """Shared capture-only body: run one instrumented replay and persist its manifest.
+
+    This is the single capture implementation. Both the public ``capture_to_manifest``
+    (annotation-backed) and the backward-compatible no-annotations branch of
+    ``capture_and_build`` route through here so the capture path is not duplicated.
+    """
+    notify({"event": "capture_started", "stage": "live_capture"})
+    capture_root = Path(capture_root)
+    capture_root.mkdir(parents=True, exist_ok=True)
+    result = run_live_capture(
+        script_path,
+        capture_root,
+        timeout_s=capture_timeout_s,
+        storage_state=storage_state,
+        interactive_auth=interactive_auth,
+        emit=notify,
+        marker_annotations=marker_annotations,
+    )
+    if result.returncode:
+        notify({"event": "failed", "stage": "capture"})
+        raise RuntimeError(
+            f"instrumented replay failed with exit {result.returncode}: "
+            f"{result.stderr[-1000:]}"
+        )
+    notify({"event": "capture_finished", "stage": "live_capture"})
+    flow = build_flow_from_snapshots(script_path, capture_root, marker_annotations=marker_annotations)
+    flow.timing_profile.capture_timeout_s = capture_timeout_s
+    manifest_path = Path(capture_root) / "manifest.json"
+    write_manifest(manifest_path, flow)
+    return manifest_path
+
+
+def capture_to_manifest(
+    script_path: str | Path,
+    annotations_path: str | Path,
+    capture_root: str | Path,
+    emit: Callable[[dict[str, str]], None] | None = None,
+    storage_state: str | Path | None = None,
+    interactive_auth: bool = False,
+    capture_timeout_s: int = 900,
+) -> Path:
+    """Public capture-only boundary: validate annotations, replay, and persist a manifest.
+
+    Does not build any replica. GUI UUIDs from the annotations are threaded through
+    the instrumented replay and the resulting manifest so ``ActionTarget.marker_id``
+    carries the stable GUI UUID.
+    """
+    notify = emit or (lambda event: None)
+    annotation_payload = validate_annotations(script_path, annotations_path)
+    marker_annotations = annotation_payload["markers"]
+    return _capture_to_manifest_core(
+        script_path, capture_root, marker_annotations, notify,
+        storage_state, interactive_auth, capture_timeout_s,
+    )
+
+
+def _build_emitter(notify: Callable[[dict[str, str]], None]) -> Callable[[dict[str, str]], None]:
+    """Adapt ``build_from_manifest`` progress events to the capture-and-build contract.
+
+    Translates the build stage terminal ``completed`` into ``build_finished`` while
+    preserving the ``build_started`` boundary. This keeps ``capture_and_build``'s
+    event stream (capture_started/capture_finished/build_started/build_finished)
+    compatible with its established callers.
+    """
+
+    def wrapped(event: dict[str, str]) -> None:
+        name = event.get("event")
+        if name == "completed":
+            notify({"event": "build_finished", "stage": "replica_build", "entrypoint": event.get("entrypoint")})
+        elif name == "build_started":
+            notify({"event": "build_started", "stage": "replica_build"})
+        else:
+            notify(event)
+
+    return wrapped
+
+
 def capture_and_build(
     script_path: str | Path,
     output_root: str | Path,
     emit: Callable[[dict[str, str]], None] | None = None,
     storage_state: str | Path | None = None,
     interactive_auth: bool = False,
-    annotations_payload: dict[str, object] | None = None,
+    capture_timeout_s: int = 900,
+    annotations_path: str | Path | None = None,
 ) -> Path:
-    """Run one live capture replay, persist its manifest, and build the offline entrypoint."""
+    """Backward-compatible wrapper: capture to a manifest, then build the replica.
+
+    When ``annotations_path`` is supplied, capture runs through the annotation-aware
+    ``capture_to_manifest`` boundary. When ``annotations_path=None`` (compat), the
+    same capture core runs with temporary ``m_{index:03d}`` marker IDs. The build
+    always delegates to ``build_from_manifest`` with an explicit source-path hash
+    gate. The capture implementation is never duplicated here.
+    """
     notify = emit or (lambda event: None)
     output_root = Path(output_root)
     capture_root = output_root / "capture"
-    notify({"event": "capture_started"})
-    result = run_live_capture(script_path, capture_root, storage_state=storage_state, interactive_auth=interactive_auth, emit=notify)
-    if result.returncode:
-        notify({"event": "failed", "stage": "capture"})
-        raise RuntimeError(f"instrumented replay failed with exit {result.returncode}: {result.stderr[-1000:]}")
-    notify({"event": "capture_finished"})
-    flow = build_flow_from_snapshots(script_path, capture_root, annotations_payload)
-    write_manifest(capture_root / "manifest.json", flow)
-    notify({"event": "build_started"})
-    entrypoint = build_replica(flow, capture_root, output_root / "replica")
-    notify({"event": "build_finished", "entrypoint": str(entrypoint)})
+    if annotations_path is not None:
+        manifest_path = capture_to_manifest(
+            script_path, annotations_path, capture_root, emit=notify,
+            storage_state=storage_state, interactive_auth=interactive_auth,
+            capture_timeout_s=capture_timeout_s,
+        )
+    else:
+        manifest_path = _capture_to_manifest_core(
+            script_path, capture_root, None, notify,
+            storage_state, interactive_auth, capture_timeout_s,
+        )
+    entrypoint = build_from_manifest(
+        manifest_path, capture_root, output_root / "replica",
+        emit=_build_emitter(notify), source_path=script_path,
+    )
     return entrypoint
 
 
@@ -487,6 +586,25 @@ def validate_annotations(script_path: str | Path, annotations_path: str | Path) 
     if payload.get("source_script_sha256") != sha256_file(script_path):
         raise ValueError("replica annotations do not match the processed script")
     return payload
+
+
+def _coerce_marker_annotations(value: object | None) -> list[dict[str, object]] | None:
+    """Accept either a GUI markers list or a full annotations payload dict for compat.
+
+    The public functions accept both shapes because the 08-05 plumbing used a full
+    payload dict while Task 5 threads the validated ``markers`` list. Both reduce to
+    the same ``[{"marker_id", "line", "label"}]`` list before ``parse_action_plan``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        markers = value.get("markers")
+        if markers is None:
+            raise ValueError("annotations payload missing 'markers' list")
+        return markers
+    if isinstance(value, list):
+        return value
+    raise TypeError(f"unexpected marker_annotations type: {type(value).__name__}")
 
 
 def normalize_label(label: str) -> str:
@@ -611,11 +729,20 @@ def build_from_manifest(
     flow_root: str | Path,
     output_root: str | Path,
     emit: Callable[[dict[str, str]], None] | None = None,
+    source_path: str | Path | None = None,
 ) -> Path:
-    """Build local assets from an already-captured flow without live network access."""
+    """Build local assets from an already-captured flow without live network access.
+
+    When ``source_path`` is supplied, the run's source script is hash-verified
+    against ``flow.source_script_sha256`` before rendering (a provenance gate). The
+    orchestrator must always supply the run's source script; do not copy a
+    credential-bearing processed script into the asset directory merely to pass it.
+    """
     notify = emit or (lambda event: print(json.dumps(event, ensure_ascii=False), flush=True))
-    notify({"event": "build_started"})
+    notify({"event": "build_started", "stage": "replica_build"})
     flow = read_manifest(manifest_path, flow_root)
+    if source_path is not None and sha256_file(source_path) != flow.source_script_sha256:
+        raise ValueError("source script hash does not match manifest")
     entrypoint = build_replica(flow, Path(flow_root), Path(output_root))
     notify({"event": "completed", "entrypoint": str(entrypoint)})
     return entrypoint
@@ -623,43 +750,64 @@ def build_from_manifest(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Capture/build a local interactive replica")
-    parser.add_argument("--mode", choices=["offline-build", "live"], required=True)
+    parser.add_argument("--mode", choices=["capture-only", "offline-build", "live"], required=True)
     parser.add_argument("--manifest")
     parser.add_argument("--flow-root")
     parser.add_argument("--script")
     parser.add_argument("--annotations")
     parser.add_argument("--auth-mode", choices=["scripted", "interactive", "storage-state"], default="scripted")
     parser.add_argument("--storage-state")
+    parser.add_argument("--capture-timeout", type=int, default=900)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
+    emit = lambda event: print(json.dumps(event, ensure_ascii=False), flush=True)
+    storage_state = args.storage_state if args.auth_mode == "storage-state" else None
+    interactive_auth = args.auth_mode == "interactive"
     if args.mode == "offline-build":
         if not args.manifest or not args.flow_root:
             parser.error("offline-build requires --manifest and --flow-root")
-        build_from_manifest(args.manifest, args.flow_root, args.output)
-    else:
-        if not args.script:
-            parser.error("live requires --script")
-        if args.auth_mode == "storage-state" and not args.storage_state:
-            parser.error("storage-state auth mode requires --storage-state")
-        if args.auth_mode == "storage-state" and not Path(args.storage_state).is_file():
-            parser.error("storage-state path does not exist")
-        annotations_payload = None
-        if args.annotations:
-            annotations_payload = validate_annotations(args.script, args.annotations)
-        emit = lambda event: print(json.dumps(event, ensure_ascii=False), flush=True)
+        entrypoint = build_from_manifest(
+            args.manifest, args.flow_root, args.output, emit=emit,
+            source_path=args.script,
+        )
+        print(json.dumps({"event": "completed", "entrypoint": str(entrypoint)}, ensure_ascii=False), flush=True)
+        return
+    if args.mode == "capture-only":
+        if not args.script or not args.annotations:
+            parser.error("capture-only requires --script and --annotations")
         try:
-            entrypoint = capture_and_build(
-                args.script,
-                args.output,
-                emit,
-                args.storage_state if args.auth_mode == "storage-state" else None,
-                args.auth_mode == "interactive",
-                annotations_payload,
+            manifest_path = capture_to_manifest(
+                args.script, args.annotations, Path(args.output) / "capture",
+                emit=emit, storage_state=storage_state,
+                interactive_auth=interactive_auth,
+                capture_timeout_s=args.capture_timeout,
             )
         except Exception as error:
             emit({"event": "failed", "category": classify_capture_error(error)})
             raise
-        print(json.dumps({"event": "completed", "entrypoint": str(entrypoint)}, ensure_ascii=False), flush=True)
+        print(json.dumps({"event": "completed", "entrypoint": str(manifest_path)}, ensure_ascii=False), flush=True)
+        return
+    # live mode
+    if not args.script:
+        parser.error("live requires --script")
+    if args.auth_mode == "storage-state" and not args.storage_state:
+        parser.error("storage-state auth mode requires --storage-state")
+    if args.auth_mode == "storage-state" and not Path(args.storage_state).is_file():
+        parser.error("storage-state path does not exist")
+    try:
+        entrypoint = capture_and_build(
+            args.script,
+            args.output,
+            emit=emit,
+            storage_state=storage_state,
+            interactive_auth=interactive_auth,
+            capture_timeout_s=args.capture_timeout,
+            annotations_path=args.annotations,
+        )
+    except Exception as error:
+        emit({"event": "failed", "category": classify_capture_error(error)})
+        raise
+    print(json.dumps({"event": "completed", "entrypoint": str(entrypoint)}, ensure_ascii=False), flush=True)
 
 
 if __name__ == "__main__":
