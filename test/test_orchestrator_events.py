@@ -201,6 +201,14 @@ class TestTerminalGuard(unittest.TestCase):
                 guard.note(kind)
             self.assertTrue(guard.certify(), status_seq)
 
+    def test_regular_event_after_completed_rejected(self):
+        # D4：completed 是唯一业务终态且必为最末事件，其后不允许再发任何业务事件
+        for kind in ("stage_finished", "progress", "marker_result", "summary"):
+            guard = TerminalGuard()
+            guard.note("completed")
+            with self.assertRaises(ValueError):
+                guard.note(kind)
+
     def test_certify_requires_exactly_one_completed(self):
         # 完全没 completed → 违规
         guard = TerminalGuard()

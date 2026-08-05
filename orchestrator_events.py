@@ -188,7 +188,8 @@ class TerminalGuard:
 
     - `note(event_kind)`：顺序递增校验，违规抛 `ValueError`。
       最多一条 `fatal`；不允许先 `completed` 再 `fatal`；不允许两个 `completed`；
-      `fatal` 之后只允许 `summary` / `completed`。
+      `fatal` 之后只允许 `summary` / `completed`；`completed` 之后不再允许任何业务事件
+      （completed 必为最末业务终态）。
     - `certify()`：最终状态校验——必须恰好一条 `completed`（即 fatal 之后必须
       且仅一次 completed），否则抛 `ValueError`。
     """
@@ -219,7 +220,13 @@ class TerminalGuard:
                 raise ValueError("D4 violation: at most one 'completed' allowed")
             self._completed_count += 1
             return
-        # 其它业务事件
+        # 其它业务事件（正常路径上的 step/progress/marker_result/stage_* 等）
+        if self._completed_count >= 1:
+            # D4：completed 是唯一业务终态且必为最末事件，其后不允许再发任何业务事件。
+            raise ValueError(
+                f"D4 violation: '{event_kind}' not allowed after 'completed' "
+                "(completed must be the last business event)"
+            )
         if self._fatal_count >= 1 and event_kind not in _AFTER_FATAL_ALLOWED:
             raise ValueError(
                 f"D4 violation: '{event_kind}' not allowed after 'fatal' "
