@@ -5,7 +5,7 @@
     <button id="series-thick" role="option" aria-selected="false" onclick="document.querySelectorAll('[role=option]').forEach(x=>x.setAttribute('aria-selected', x===this?'true':'false')); document.body.dataset.series='thick'">Thick 5.0 80幅</button>
   </section>
   <button id="metadata" onclick="document.querySelector('#dicom').hidden=false">Metadata</button>
-  <section id="dicom" class="metadata" hidden><div>PatientName: Demo</div><div>StudyDate: 20260101</div></section>
+  <section id="dicom" class="metadata" hidden><div>PatientName: Demo</div><div>(0008,0020) 20260101</div><div>(0010,0010) Demo</div><div>(0008,0060) CT</div><div>(0020,0011) 1</div><div>(0018,1030) AnonProtocol</div><div>StudyDate: 20260101</div></section>
   <section id="wlww" class="window-level-dialog"><input id="ww" role="spinbutton" value="400"><input id="wl" role="spinbutton" value="40"><button id="confirm" onclick="document.body.dataset.wlww='confirmed'">确定</button></section>
   <canvas id="overlaycanvas-0_0" width="100" height="80"></canvas>
 </body></html>

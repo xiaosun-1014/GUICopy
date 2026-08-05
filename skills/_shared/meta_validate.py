@@ -29,8 +29,13 @@ def validate_and_save(rows: list[dict], output_dir: Path,
         return {}
 
     # ── 定位 marker-meta-info 脚本 ──
-    if project_root is None:
-        project_root = output_dir.parent.parent
+    # Re-derive the project root reliably from this module's own location
+    # (``repo/skills/_shared/meta_validate.py``), rather than trusting a caller
+    # that may run from a relocated run tree where ``parent.parent`` is wrong.
+    _own = Path(__file__).resolve()
+    _root = _own.parents[2] if _own.parents[2].joinpath("skills", "_shared").is_dir() else None
+    if project_root is None or not project_root.joinpath("skills", "marker-meta-info").exists():
+        project_root = _root
     meta_scripts = project_root / "skills" / "marker-meta-info" / "scripts"
     sys.path.insert(0, str(meta_scripts))
 

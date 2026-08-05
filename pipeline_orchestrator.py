@@ -497,7 +497,7 @@ def run_adapter_validation(
         )
 
     capabilities_result = evaluate_adapter_capabilities(
-        tuple(marker_names), ()
+        tuple(marker_names), (), validation_root=layout.validation_dir
     )
     artifacts_result = validate_artifacts(
         layout.validation_dir,

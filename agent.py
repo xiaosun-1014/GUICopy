@@ -286,8 +286,15 @@ def _generate_deterministic_meta(marker: Dict) -> str:
     context_text = "\n".join(
         marker["context_before"] + action_lines + marker["context_after"]
     )
-    page_match = re.search(r"\b(page\d*)\.", context_text)
-    page_var = page_match.group(1) if page_match else "page"
+    # Prefer the page variable from the marker's OWN recorded actions (e.g.
+    # ``page1.locator(...)``) over incidental ``page`` / ``pageN`` tokens that
+    # may appear earlier in a large shared context (sequence/state-wait blocks).
+    page_var = "page"
+    for candidate in ("\n".join(action_lines), context_text):
+        m = re.search(r"\b(page\d*)\.", candidate)
+        if m:
+            page_var = m.group(1)
+            break
 
     iframe_selectors: List[str] = []
     for match in re.finditer(r"\.locator\(([^)]+)\)\.content_frame", context_text):
@@ -304,9 +311,21 @@ def _generate_deterministic_meta(marker: Dict) -> str:
         f"# [MARKER: Meta 信息工具"
         f"{' @ ' + marker['ts'] if marker['ts'] else ''}]",
         "import sys",
+        "import json",
         "from pathlib import Path",
         "SCRIPT_DIR = Path(__file__).resolve().parent",
-        "_PROJECT = SCRIPT_DIR.parent.parent",
+        # Discover the project root by walking up to the repo (``skills/_shared``
+        # lives at the root). Works whether this script runs at the project root,
+        # a hospital workspace, or the pipeline's relocated run tree.
+        "_CUR = SCRIPT_DIR",
+        "while True:",
+        "    if (_CUR / \"skills\" / \"_shared\").is_dir():",
+        "        _PROJECT = _CUR",
+        "        break",
+        "    if _CUR.parent == _CUR:",
+        "        _PROJECT = SCRIPT_DIR.parent.parent",
+        "        break",
+        "    _CUR = _CUR.parent",
         "if str(_PROJECT) not in sys.path:",
         "    sys.path.insert(0, str(_PROJECT))",
         "from skills._shared.meta_extract import extract_meta_from_frame",
@@ -325,6 +344,17 @@ def _generate_deterministic_meta(marker: Dict) -> str:
         "        type=\"jpeg\", quality=95, full_page=True,",
         "    )",
         "validate_and_save(rows, output_dir=SCRIPT_DIR, project_root=_PROJECT)",
+        # Ensure the two canonical artifacts the offline validator requires land
+        # in the run's validation directory (``validation_root`` is defined by
+        # the offline runner; fall back to a sibling ``validation`` folder).
+        "_META_OUT = locals().get(\"validation_root\") or (SCRIPT_DIR.parent / \"validation\")",
+        "_META_OUT.mkdir(parents=True, exist_ok=True)",
+        "(_META_OUT / \"dicom_meta.json\").write_text(",
+        "    json.dumps(rows, ensure_ascii=False, indent=2), encoding=\"utf-8\")",
+        "(_META_OUT / \"patient_info.json\").write_text(",
+        "    json.dumps([{\"tag\": r.get(\"tag\"), \"desc\": r.get(\"desc\", \"\"), "
+        "\"value\": r.get(\"value\", \"\")} for r in rows], ensure_ascii=False, indent=2), "
+        "encoding=\"utf-8\")",
         *close_actions,
     ]
     indent = marker["indent"]
@@ -341,8 +371,13 @@ def _generate_deterministic_canvas(marker: Dict) -> str:
         + marker["raw"].splitlines()
         + marker["context_after"]
     )
-    page_match = re.search(r"\b(page\d*)\.", context_text)
-    page_var = page_match.group(1) if page_match else "page"
+    # Prefer the page variable from the marker's own recorded actions.
+    page_var = "page"
+    for candidate in (marker["raw"], context_text):
+        m = re.search(r"\b(page\d*)\.", candidate)
+        if m:
+            page_var = m.group(1)
+            break
 
     position_match = re.search(
         r"position\s*=\s*\{\s*['\"]x['\"]\s*:\s*"
@@ -359,16 +394,25 @@ def _generate_deterministic_canvas(marker: Dict) -> str:
         "import sys",
         "from pathlib import Path",
         "SCRIPT_DIR = Path(__file__).resolve().parent",
-        "_PROJECT = SCRIPT_DIR.parent.parent",
+        "_CUR_C = SCRIPT_DIR",
+        "while True:",
+        "    if (_CUR_C / \"skills\" / \"_shared\").is_dir():",
+        "        _PROJECT = _CUR_C",
+        "        break",
+        "    if _CUR_C.parent == _CUR_C:",
+        "        _PROJECT = SCRIPT_DIR.parent.parent",
+        "        break",
+        "    _CUR_C = _CUR_C.parent",
         "if str(_PROJECT) not in sys.path:",
         "    sys.path.insert(0, str(_PROJECT))",
         "from skills._shared.canvas_capture import capture_canvas_interaction",
+        "_CANVAS_OUT = locals().get(\"validation_root\") or (SCRIPT_DIR.parent / \"validation\")",
         "frame_paths = capture_canvas_interaction(",
         f"    {page_var},",
         f"    click_x={click_x}, click_y={click_y},",
         '    total_frames=locals().get("seq_frames"),',
         '    series_name=locals().get("seq_name"),',
-        '    output_root=SCRIPT_DIR / "canvas_frames",',
+        '    output_root=_CANVAS_OUT / "canvas_frames",',
         ")",
         'print(f"[画布] 已保存 {len(frame_paths)} 帧")',
     ]
@@ -580,6 +624,18 @@ def process_script(script: str, dry_run: bool = False,
                 (marker["indent"] + ln) if ln.strip() and not ln.startswith(marker["indent"]) else ln
                 for ln in code.split("\n")
             )
+
+            # Preserve the marker comment as the first line of the completion so
+            # downstream re-parsing (the offline rewrite re-detects markers by
+            # their comment) always finds the marker, regardless of whether the
+            # LLM echoed it back. Mirrors the documented "marker 注释行本身保留"
+            # contract that deterministic generators already honor.
+            _marker_comment = (
+                f"# [MARKER: {marker['name']}"
+                f"{' @ ' + marker['ts'] if marker['ts'] else ''}]"
+            )
+            if not indented.lstrip().startswith("# [MARKER:"):
+                indented = _marker_comment + ("\n" + indented if indented else "")
 
             # 语法检查
             # 把补全代码嵌入完整脚本做语法检查

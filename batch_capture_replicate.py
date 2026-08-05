@@ -490,6 +490,12 @@ def _capture_to_manifest_core(
     notify({"event": "capture_finished", "stage": "live_capture"})
     flow = build_flow_from_snapshots(script_path, capture_root, marker_annotations=marker_annotations)
     flow.timing_profile.capture_timeout_s = capture_timeout_s
+    # Persist a byte-identical copy of the executed source alongside the
+    # manifest so ``flow.source_script_relpath`` (the script's basename)
+    # resolves inside the capture tree and ``validate_manifest`` can hash-verify
+    # provenance without warning ``source_script_missing``.
+    source_name = Path(script_path).name
+    (capture_root / source_name).write_bytes(Path(script_path).read_bytes())
     manifest_path = Path(capture_root) / "manifest.json"
     write_manifest(manifest_path, flow)
     return manifest_path
@@ -776,8 +782,12 @@ def main() -> None:
         if not args.script or not args.annotations:
             parser.error("capture-only requires --script and --annotations")
         try:
+            # ``--output`` is already the run's capture root (the orchestrator
+            # passes ``layout.capture_dir`` directly). Treating it as the root
+            # (not ``output/capture``) keeps manifest + snapshot relpaths
+            # anchored at ``layout.capture_dir`` where validation expects them.
             manifest_path = capture_to_manifest(
-                args.script, args.annotations, Path(args.output) / "capture",
+                args.script, args.annotations, Path(args.output),
                 emit=emit, storage_state=storage_state,
                 interactive_auth=interactive_auth,
                 capture_timeout_s=args.capture_timeout,

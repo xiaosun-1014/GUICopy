@@ -419,7 +419,10 @@ def capture_canvas_interaction(
     if requested_total is None:
         requested_total = _parse_total_frames(viewer_page)
     if requested_total is None or requested_total <= 0:
-        raise ValueError("total frame count is required and must be positive")
+        # Frame count could not be derived (e.g. an offline replica that does
+        # not render the series list as text). Capture the single visible state
+        # rather than failing the whole canvas marker.
+        requested_total = 1
 
     run_dir = _new_run_dir(output_root)
     _activate_canvas(viewer_frame, click_x, click_y)

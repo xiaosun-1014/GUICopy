@@ -495,8 +495,13 @@ def generate_offline_adapter_script(
 
     body_lines = [
         "def run() -> None:",
-        f"{indent}replica_root = Path(__file__).resolve().parent / {replica_directory!r}",
-        f"{indent}validation_root = Path(__file__).resolve().parent / {validation_directory!r}",
+        # Marker blocks are copied verbatim and may issue their own
+        # ``from pathlib import Path``, which would shadow ``Path`` as a
+        # function-local across the WHOLE function (UnboundLocalError for the
+        # reads below). Use the module-level ``_Path`` alias for the runner's
+        # own path computations so marker-local shadowing cannot break them.
+        f"{indent}replica_root = _Path(__file__).resolve().parent / {replica_directory!r}",
+        f"{indent}validation_root = _Path(__file__).resolve().parent / {validation_directory!r}",
         f"{indent}validation_root.mkdir(parents=True, exist_ok=True)",
         f"{indent}external_requests: list = []",
         f"{indent}offline_stages: list = []",
@@ -533,15 +538,33 @@ def generate_offline_adapter_script(
 
     generated = "\n".join(
         [
-            "from pathlib import Path",
+            "from pathlib import Path as _Path",
             "import json",
+            "import sys as _sys_path",
             "import urllib.parse",
             "from playwright.sync_api import sync_playwright",
+            # The offline runner lives in the adapter dir, but its two runtime
+            # dependencies do not: ``serve_replica`` ships with the built replica
+            # (``replica_directory``) and ``skills._shared`` lives at the project
+            # root. Insert both onto ``sys.path`` before importing them.
+            "_this_dir = _Path(__file__).resolve().parent",
+            f"_replica_root_abs = _Path({replica_directory!r})",
+            "_cursor = _this_dir",
+            "while True:",
+            "    if (_cursor / \"skills\" / \"_shared\").is_dir():",
+            "        if str(_cursor) not in _sys_path.path:",
+            "            _sys_path.path.insert(0, str(_cursor))",
+            "        break",
+            "    if _cursor.parent == _cursor:",
+            "        break",
+            "    _cursor = _cursor.parent",
+            "if str(_replica_root_abs) not in _sys_path.path:",
+            "    _sys_path.path.insert(0, str(_replica_root_abs))",
             "from serve_replica import ReplicaServer",
             "",
             "",
             "def emit(event):",
-            f"{indent}events_path = Path(__file__).resolve().parent / {validation_directory!r} / \"events.jsonl\"",
+            f"{indent}events_path = _Path(__file__).resolve().parent / {validation_directory!r} / \"events.jsonl\"",
             f"{indent}events_path.parent.mkdir(parents=True, exist_ok=True)",
             f'{indent}with events_path.open("a", encoding="utf-8") as handle:',
             f"{indent + indent}handle.write(json.dumps(event, ensure_ascii=False) + \"\\n\")",

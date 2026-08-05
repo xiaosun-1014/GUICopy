@@ -101,6 +101,8 @@ class ManagedProcess:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             creationflags=creationflags,
             start_new_session=start_new_session,

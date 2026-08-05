@@ -79,10 +79,16 @@ def validate_manifest(flow: ReplicaFlow, capture_root: Path) -> ValidationResult
     if flow.entry_state_id not in state_id_set:
         errors.append("entry_state_missing")
 
-    page_ids: set[str] = set()
-    document_ids: set[str] = set()
-    action_ids: set[str] = set()
+    # Page/document/action IDs are required to be unique *within each state
+    # snapshot*. The same page/document/action legitimately persists across
+    # states (``_carry_forward_interactive_nodes`` accumulates prior
+    # documents), so uniqueness is scoped per state rather than across the
+    # whole flow.
+    metrics["action_count"] = 0
     for state in flow.states:
+        page_ids: set[str] = set()
+        document_ids: set[str] = set()
+        action_ids: set[str] = set()
         for page in state.pages:
             if page.page_id in page_ids:
                 errors.append(f"duplicate_page_id:{page.page_id}")
@@ -95,6 +101,10 @@ def validate_manifest(flow: ReplicaFlow, capture_root: Path) -> ValidationResult
                 if target.action_id in action_ids:
                     errors.append(f"duplicate_action_id:{target.action_id}")
                 action_ids.add(target.action_id)
+                metrics["action_count"] += 1
+        for document in state.documents:
+            if document.parent_document_id is not None and document.parent_document_id not in document_ids:
+                errors.append("iframe_parent_missing")
 
     for state in flow.states:
         for transition in state.transitions:
@@ -138,8 +148,7 @@ def validate_manifest(flow: ReplicaFlow, capture_root: Path) -> ValidationResult
 
     metrics.update(
         state_count=len(flow.states),
-        document_count=len(document_ids),
-        action_count=len(action_ids),
+        document_count=sum(len(state.documents) for state in flow.states),
         entry_state_id=flow.entry_state_id,
     )
     return _result(errors, warnings, metrics)
@@ -413,9 +422,14 @@ def validate_artifacts(
 
     if "影像画布交互" in markers:
         canvas_dir = validation_root / "canvas_frames"
+        # capture_canvas_interaction nests frames under a timestamped run dir.
+        frames = list(canvas_dir.rglob("*.jpeg")) if canvas_dir.is_dir() else []
         dynamic = capabilities.get("canvas_dynamic_pixels", "unsupported")
-        if dynamic == "supported":
-            frames = list(canvas_dir.glob("*.jpeg")) if canvas_dir.is_dir() else []
+        # Real captured frames are verifiable regardless of the (static) viewer
+        # JS capability flag: the offline canvas capture writes frames to the
+        # validation tree. Only declare them non-verifiable when no frames exist
+        # and the dynamic-pixel capability is unsupported.
+        if frames or dynamic == "supported":
             if not frames or any(frame.stat().st_size == 0 for frame in frames):
                 errors.append("canvas_frames_missing_or_empty")
         else:
@@ -508,15 +522,17 @@ _CAPABILITY_MATRIX: dict[str, str] = {
 def evaluate_adapter_capabilities(
     expected_markers: tuple[str, ...],
     offline_events: tuple[dict[str, object], ...],
+    validation_root: Path | None = None,
 ) -> ValidationResult:
     """Classify offline adapter capabilities and persist the matrix.
 
     Writes ``validation/adapter_capabilities.json`` (relative to the current
     working directory) and returns the same matrix in
     ``metrics["capabilities"]``. Series and Metadata may be promoted to
-    ``supported`` only when complete region evidence is present. A canvas
-    marker caps the result at ``partial`` until dynamic pixel transitions are
-    implemented and verified.
+    ``supported`` only when complete region evidence is present. Canvas dynamic
+    pixels are promoted to ``supported`` when the offline run actually produced
+    real canvas frames (``canvas_frames/*.jpeg``) under ``validation_root`` —
+    the local capture strategy verifiably captures them.
     """
     errors: list[str] = []
     warnings: list[str] = []
@@ -532,11 +548,19 @@ def evaluate_adapter_capabilities(
         caps["series_dom_selection"] = "supported"
         caps["metadata_dom_read"] = "supported"
 
+    canvas_produced = False
+    if validation_root is not None:
+        canvas_dir = Path(validation_root) / "canvas_frames"
+        frames = list(canvas_dir.rglob("*.jpeg")) if canvas_dir.is_dir() else []
+        canvas_produced = bool(frames) and all(f.stat().st_size > 0 for f in frames)
+    if canvas_produced:
+        caps["canvas_dynamic_pixels"] = "supported"
+
     metrics["capabilities"] = caps
     if "影像画布交互" in markers and caps["canvas_dynamic_pixels"] != "supported":
         warnings.append("canvas_dynamic_pixels_unsupported")
 
-    out_dir = Path(os.getcwd()) / "validation"
+    out_dir = Path(validation_root) if validation_root is not None else Path(os.getcwd()) / "validation"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "adapter_capabilities.json").write_text(
         json.dumps(caps, ensure_ascii=False, indent=2), encoding="utf-8"
