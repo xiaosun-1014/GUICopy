@@ -19,9 +19,11 @@ from pathlib import Path
 
 from build_replica import build_replica
 from capture_snapshot import capture_interaction_region, capture_locator_snapshot, capture_marker_interaction_region, capture_page_topology, capture_selector_closure, compute_image_diff, decide_state, marker_region_type
+from process_runner import ManagedProcess
 from replay_helpers import read_manifest, sha256_file, write_manifest
 from rewrite_script import ActionPlan, parse_action_plan
 from replica_models import CaptureTimingProfile, DomNodeSnapshot, Rect, ReplicaDocument, ReplicaFlow, ReplicaPage, ReplicaState, ReplicaTransition, StateDiffProfile, StateEvidence
+from runtime_python import codegen_python_executable
 
 
 def wait_for_pre_action_state(page: object, marker_label: str) -> None:
@@ -283,53 +285,19 @@ def run_live_capture(
         environment["REPLICA_STORAGE_STATE"] = str(Path(storage_state).resolve())
     if interactive_auth:
         environment["REPLICA_INTERACTIVE_AUTH"] = "1"
-    process = subprocess.Popen(
-        [sys.executable, str(instrumented_path)],
-        cwd=project_root,
+    managed = ManagedProcess(
+        [codegen_python_executable(), str(instrumented_path)],
+        cwd=Path(project_root),
         env=environment,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        timeout_s=timeout_s,
+        on_event=emit,
     )
-    output_lines: list[str] = []
-    lines: queue.Queue[str | None] = queue.Queue()
-
-    def forward_stdout() -> None:
-        assert process.stdout is not None
-        for line in process.stdout:
-            lines.put(line)
-        lines.put(None)
-
-    reader = threading.Thread(target=forward_stdout, daemon=True)
-    reader.start()
-    deadline = time.monotonic() + timeout_s
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            process.kill()
-            raise subprocess.TimeoutExpired(process.args, timeout_s)
-        try:
-            line = lines.get(timeout=remaining)
-        except queue.Empty:
-            process.kill()
-            raise subprocess.TimeoutExpired(process.args, timeout_s)
-        if line is None:
-            break
-        output_lines.append(line)
-        if emit:
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(event, dict) and "event" in event:
-                emit(event)
-    returncode = process.wait(timeout=max(1, int(deadline - time.monotonic())))
-    stderr = process.stderr.read() if process.stderr is not None else ""
-    if process.stdout is not None:
-        process.stdout.close()
-    if process.stderr is not None:
-        process.stderr.close()
-    return subprocess.CompletedProcess(process.args, returncode, "".join(output_lines), stderr)
+    result = managed.run()
+    if result.timed_out:
+        raise subprocess.TimeoutExpired(result.args, timeout_s)
+    return subprocess.CompletedProcess(
+        result.args, result.returncode, result.stdout, result.stderr
+    )
 
 
 def _load_snapshot_state(capture_root: Path, action_id: str, phase: str) -> tuple[list[ReplicaPage], list[ReplicaDocument]]:
@@ -586,12 +554,32 @@ def merge_annotation_uuids(plan: ActionPlan, annotations_payload: dict[str, obje
 
 
 def await_interactive_auth(stream: object, emit: Callable[[dict[str, str]], None], timeout_s: float = 300) -> None:
-    """Wait for the explicit JSONL confirmation before replaying marked actions."""
+    """Wait for the explicit JSONL confirmation before replaying marked actions.
+
+    The command stream is drained by a daemon reader thread into a queue so the
+    deadline loop never blocks on a single ``readline()``; line parsing and the
+    ``queue.get`` poll interval are bounded (``min(0.25, remaining)`` seconds).
+    """
     emit({"event": "auth_required", "message": "请完成登录后继续"})
+    lines: queue.Queue[str | None] = queue.Queue()
+
+    def reader() -> None:
+        for line in stream:
+            lines.put(line)
+        lines.put(None)
+
+    threading.Thread(target=reader, name="interactive-auth-reader", daemon=True).start()
+
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        line = stream.readline()
-        if not line:
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("authentication_timeout")
+        try:
+            line = lines.get(timeout=min(0.25, remaining))
+        except queue.Empty:
+            continue
+        if line is None:
             raise RuntimeError("authentication_cancelled")
         try:
             command = json.loads(line)
@@ -602,7 +590,6 @@ def await_interactive_auth(stream: object, emit: Callable[[dict[str, str]], None
             return
         if command.get("command") == "cancel":
             raise RuntimeError("authentication_cancelled")
-    raise RuntimeError("authentication_timeout")
 
 
 def classify_capture_error(error: BaseException) -> str:
