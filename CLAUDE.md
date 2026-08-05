@@ -6,6 +6,9 @@
 所有项目记忆（持久化约定、工作流、调试原则）存储在项目目录下：
 
 - **`memory/`** 目录 — 结构化记忆文件（Markdown），每个文件一个主题
+  - `three-stage-workflow.md` — 三阶段工作流与调试原则
+  - `loop-stop-hook-json-validation.md` — `/loop` Stop hook 报 "JSON validation failed" 的根因与规避
+  - `sdd-closeout-experience.md` — SDD 计划收尾执行经验（re-review → 关 task → final review triage → push）
 - **本文件（CLAUDE.md）** — 项目核心上下文，整合所有记忆的要点
 
 不再使用系统级（AppData）记忆存储。如需添加或更新记忆，直接编辑 `memory/` 下的对应文件，并同步更新 CLAUDE.md 中的相关章节。
@@ -281,6 +284,31 @@ viewer 不稳定期（探索）                          viewer 稳定期（生�
 现在在用户发现bug了之后，首先需要进行分析，输出分析方案，并且提供分析报告给用户。如果不确定原因需要尝试复现。
 
 在 complete.py 生成流程中，如果发现生成的代码不合理，**先更新完善 skill，再重新生成 complete 代码**——不要直接手改 complete.py。详见本章「重要调试原则」。
+
+## /loop Stop hook 报 "JSON validation failed"（详见 memory/loop-stop-hook-json-validation.md）
+
+长任务用 `/loop 用子代理把所有计划完成…` 收尾时，每轮结束可能出现 `Stop hook error: JSON validation failed`：
+
+- **根因**：built-in `/loop` 注册的 Stop 钩子要求模型 stdout 恰好是**裸 JSON** 判定 `{"ok": true}` 或 `{"ok": false, "impossible": bool, "reason": "…"}`。本机 proxy 模型（DeepSeek-V4-Flash，`ANTHROPIC_BASE_URL: http://127.0.0.1:15721`）会把判定包进 markdown 围栏/散文，harness 对整段 stdout 做 `JSON.parse` 失败。
+- **非阻塞**：`preventedContinuation:false`——循环不崩，只是无法干净判定，反复自检反复报错。判定逻辑往往本就对（`ok:false` 因任务确实没做完），错只在格式。
+- **查不到配置**：该钩子是 built-in `/loop` 运行时自建的内存钩子，`~/.claude/settings.json` / `~/.claude.json` / 项目 `.claude` / superpowers 插件 hooks.json 都无 Stop hook 可编辑。
+- **规避**：长任务收尾**直接手动在当前会话推进**（review → 关 task → final review → push），让条件真正满足再靠 `/loop` 判定（此时正确输出 `{"ok": true}`）；或把条件措辞写成「只输出裸 JSON、不要代码围栏」。
+
+## SDD 计划收尾（详见 memory/sdd-closeout-experience.md）
+
+用 superpowers SDD 跑多任务实现计划时，收尾路径：
+
+1. **逐 task 收尾**：scoped review 有 Critical/Important → implementer 出 fix round → 提交 → **派发 scoped re-review** 独立验证 fix 真关闭 finding（只审 fix 改动）。
+2. **关 task**：re-review approved 后在 `.superpowers/sdd/{plan}/progress.md`（ledger）记录「fix round + re-review ✅ + complete」。
+3. **final whole-branch review**：全部 task 关完才做，聚焦跨 task 集成 + plan 全局约束合规，对 ledger 里 deferred minor / parked 项做 **triage 定案**（修复 / 规格对齐 / minor 不阻断 / 留待后续，逐一给 reason）。
+4. **push**：只 push `origin/main..HEAD` 未推送提交（`git log --oneline origin/main..HEAD` 看范围）。
+
+**注意事项**
+- 测试/子进程一律用 `D:/Anaconda/envs/codegen-marker/python.exe`，**禁止静默回退 `sys.executable`**（系统 Python 3.7 缺 PyQt6/playwright wheel）。
+- `test_batch_capture_replicate` 在 headless 下 import 时挂起（导入 Playwright/浏览器），非代码引入。单测用：
+  `PYTHONIOENCODING=utf-8 D:/Anaconda/envs/codegen-marker/python.exe -m unittest test.test_orchestrator_events test.test_agent_marker_boundaries test.test_replica_gui -v`
+  （`unittest discover` 会含浏览器集成测试导致挂起。）
+- **triage 倾向**：实现跨事件一致、spec 单点不一致时，倾向**改 spec 文本对齐稳定代码**而非改代码（例：agent_failed 字段实现统一用 `status`、spec §4.7 误写 `reason`，最终改 spec）。
 
 ## 如何运行
 ```bash
