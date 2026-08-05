@@ -49,3 +49,9 @@ recorded_script.py
 .reasonix/*
 !.reasonix/viewers.yaml
 !.reasonix/skills/
+
+# Pipeline run storage
+out/*/runs/
+**/storage_state*.json
+**/pipeline_events.jsonl
+**/pipeline_report.html
