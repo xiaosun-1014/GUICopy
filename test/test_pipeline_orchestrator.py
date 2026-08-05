@@ -12,6 +12,7 @@ from pipeline_models import PipelineConfig, PipelineStatus, PipelineStage, Stage
 from pipeline_orchestrator import (
     PipelineController,
     execute_pipeline_stages,
+    exit_code_for,
     resume_pipeline,
     run_pipeline,
 )
@@ -64,6 +65,27 @@ class StageOrderTests(unittest.TestCase):
             completed = [e for e in events if e["event"] == "completed"]
             self.assertEqual(len(completed), 1)
             self.assertEqual(completed[0]["status"], "success")
+            # Each stage_finished is immediately followed by a summary (§5.5/D3).
+            started = [e for e in events if e["event"] == "stage_started"]
+            finished = [e for e in events if e["event"] == "stage_finished"]
+            finish_idx = [i for i, e in enumerate(events) if e["event"] == "stage_finished"]
+            for i in finish_idx:
+                self.assertEqual(events[i + 1]["event"], "summary")
+                self.assertEqual(events[i + 1].get("scope"), "markers")
+                self.assertIn("success", events[i + 1])
+            self.assertEqual(len(finished), len(started))
+            # completed carries entrypoint artifacts + the final summary snapshot.
+            final = completed[0]
+            expected_artifacts = {
+                "adapter", "manifest", "replica", "offline_adapter",
+                "report_json", "report_html",
+            }
+            self.assertLessEqual(expected_artifacts, set(final["artifacts"]))
+            self.assertEqual(final["summary"]["event"], "summary")
+            self.assertEqual(final["summary"]["scope"], "markers")
+            self.assertEqual(final["summary"]["status"], "success")
+            # authoritative marker counts exposed through the summary snapshot.
+            self.assertEqual(final["summary"]["skipped"], 1)
 
     def test_ready_is_emitted_first(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -80,12 +102,24 @@ class StatusSemanticsTests(unittest.TestCase):
     def test_critical_validation_failure_produces_failed_not_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = make_config(tmp)
+            events: list[dict] = []
             with _patches_for(config, config.output_root / "fixture" / "runs",
                              replica_validation=StageResult(
                                  PipelineStage.REPLICA_VALIDATION, FAILED,
                                  "replica_build", "critical_locator_not_unique")):
-                result = run_pipeline(config)
+                result = run_pipeline(config, emit=events.append)
             self.assertEqual(result.status, FAILED)
+            # D4 on failure: one fatal carrying the failing stage, one completed.
+            fatal = [e for e in events if e["event"] == "fatal"]
+            self.assertEqual(len(fatal), 1)
+            self.assertEqual(fatal[0]["stage"], "validating_replica")
+            completed = [e for e in events if e["event"] == "completed"]
+            self.assertEqual(len(completed), 1)
+            self.assertEqual(completed[0]["status"], "failed")
+            # Summary still emitted after the short-circuited failing stage_finished.
+            finish_idx = [i for i, e in enumerate(events) if e["event"] == "stage_finished"]
+            for i in finish_idx:
+                self.assertEqual(events[i + 1]["event"], "summary")
 
     def test_noncritical_locator_risk_produces_partial(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -106,6 +140,16 @@ class StatusSemanticsTests(unittest.TestCase):
             payload = json.loads(latest.read_text(encoding="utf-8"))
             self.assertEqual(payload["schema_version"], 1)
             self.assertEqual(payload["run_id"], result.run_id)
+
+
+class ExitCodeTests(unittest.TestCase):
+    def test_success_and_partial_map_to_zero(self):
+        self.assertEqual(exit_code_for(SUCCESS), 0)
+        self.assertEqual(exit_code_for(PARTIAL), 0)
+
+    def test_failed_and_cancelled_map_to_one(self):
+        self.assertEqual(exit_code_for(FAILED), 1)
+        self.assertEqual(exit_code_for(CANCELLED), 1)
 
 
 class CancelTests(unittest.TestCase):
@@ -216,20 +260,26 @@ class _PatchStack:
 def _patches_for(config, layout, replica_validation=None, adapter_validation=None):
     """Build a context manager that mocks all external stages.
 
-    Defaults to success; override a validation stage to force failed/partial.
+    Defaults to success with realistic entrypoint artifacts; override a
+    validation stage to force failed/partial.
     """
+    run_dir = layout / "runs" / "x"
     patches = [
         patch("pipeline_orchestrator.run_preflight_stage",
               return_value=StageResult(PipelineStage.PREFLIGHT, SUCCESS,
                                        metrics={"markers": ("报告截图",)})),
         patch("pipeline_orchestrator.run_adapter_generation",
-              return_value=StageResult(PipelineStage.ADAPTER, SUCCESS)),
+              return_value=StageResult(
+                  PipelineStage.ADAPTER, SUCCESS,
+                  artifacts={"completed": str(run_dir / "adapter" / "completed_fixture.py")})),
         patch("pipeline_orchestrator.run_capture",
               return_value=StageResult(
                   PipelineStage.LIVE_CAPTURE, SUCCESS,
-                  artifacts={"manifest_path": str(layout / "runs" / "x" / "capture" / "manifest.json")})),
+                  artifacts={"manifest_path": str(run_dir / "capture" / "manifest.json")})),
         patch("pipeline_orchestrator.run_replica_build",
-              return_value=StageResult(PipelineStage.REPLICA_BUILD, SUCCESS)),
+              return_value=StageResult(
+                  PipelineStage.REPLICA_BUILD, SUCCESS,
+                  artifacts={"entrypoint": str(run_dir / "replica" / "index.html")})),
         patch("pipeline_orchestrator.run_replica_validation",
               return_value=(replica_validation or StageResult(
                   PipelineStage.REPLICA_VALIDATION, SUCCESS,
@@ -237,6 +287,7 @@ def _patches_for(config, layout, replica_validation=None, adapter_validation=Non
         patch("pipeline_orchestrator.run_adapter_validation",
               return_value=(adapter_validation or StageResult(
                   PipelineStage.ADAPTER_VALIDATION, SUCCESS,
+                  artifacts={"offline_adapter": str(run_dir / "adapter" / "completed_fixture_offline.py")},
                   metrics={
                       "driver": "adapter/completed_fixture_offline.py",
                       "capabilities": {"viewer_js_api": "unsupported"},

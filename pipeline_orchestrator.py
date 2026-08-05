@@ -24,6 +24,7 @@ from typing import Callable, Iterable, Optional
 
 from batch_capture_replicate import build_from_manifest, capture_to_manifest
 from orchestrator_events import (
+    MarkerTracker,
     TerminalGuard,
     normalize_child_event,
     ready_event,
@@ -424,13 +425,17 @@ def run_replica_validation(
     )
     if res_replica.metrics.get("driver"):
         metrics["driver"] = res_replica.metrics["driver"]
+    if combined == PipelineStatus.FAILED:
+        category = "privacy_violation" if res_privacy.errors else "replica_build"
+        message = ";".join(errors[:20])
+    else:
+        category = None
+        message = f"warnings: {';'.join(warnings[:10])}" if warnings else ""
     return StageResult(
         PipelineStage.REPLICA_VALIDATION,
         combined,
-        ("privacy_violation" if res_privacy.errors else None)
-        if combined == PipelineStatus.FAILED
-        else None,
-        ";".join(errors[:20]),
+        category,
+        message,
         metrics=metrics,
     )
 
@@ -484,15 +489,10 @@ def run_adapter_validation(
             PipelineStage.ADAPTER_VALIDATION, PipelineStatus.CANCELLED, "cancelled"
         )
     if result.returncode != 0:
-        category = (
-            "offline_external_request"
-            if "offline_external_request" in (result.stderr or "")
-            else "offline_external_request"
-        )
         return StageResult(
             PipelineStage.ADAPTER_VALIDATION,
             PipelineStatus.FAILED,
-            category,
+            "offline_external_request",
             (result.stderr or result.stdout).strip()[-2000:],
         )
 
@@ -546,7 +546,10 @@ class PipelineController:
         self.active_process: ManagedProcess | None = None
         self.results: list[StageResult] = []
         self.last_error_category: str | None = None
+        self.last_error_stage: str | None = None
         self._guard = TerminalGuard()
+        self._markers = MarkerTracker()
+        self.artifacts: dict[str, str] = {}
 
         if run_id is None:
             self.run_id = new_run_id()
@@ -592,6 +595,35 @@ class PipelineController:
             self._guard.note(str(kind))
         self.emit(event)
         self.store.emit(event)
+
+    def _track_markers(self, marker_names: Iterable[str]) -> None:
+        """Record the known marker names so ``summary`` counts are meaningful."""
+        for name in marker_names:
+            if name:
+                self._markers.upsert(
+                    {"marker_id": name, "status": "skipped"}
+                )
+
+    def _summary_counts(self) -> dict[str, int]:
+        return self._markers.counts()
+
+    def _harvest_artifacts(self, result: StageResult) -> None:
+        """Collect run-entrypoint artifact paths from a successful stage."""
+        if result is None or result.stage is None:
+            return
+        artifacts = result.artifacts or {}
+        stage = result.stage.value
+        aliases = {
+            "generating_adapter": ("adapter", "completed"),
+            "capturing_live": ("manifest", "manifest_path"),
+            "building_replica": ("replica", "entrypoint"),
+            "validating_adapter": ("offline_adapter", "offline_adapter"),
+        }
+        if stage in aliases:
+            exposed, source_key = aliases[stage]
+            value = artifacts.get(source_key)
+            if value:
+                self.artifacts[exposed] = value
 
     def run(self) -> PipelineRunResult:
         return execute_pipeline_stages(self)
@@ -671,12 +703,39 @@ def _run_stage(c: PipelineController, stage, error_category, fn):
     c.results.append(result)
     if result.status in (PipelineStatus.FAILED, PipelineStatus.CANCELLED):
         c.last_error_category = result.error_category
+        c.last_error_stage = stage.value
         c._issue(
             {"event": "stage_finished", "stage": stage.value, "status": result.status.value}
         )
+        c._issue(_stage_summary_event(c, stage.value, result.status.value))
         return False, result
-    c._issue({"event": "stage_finished", "stage": stage.value, "status": "success"})
+    # successful / partial: harvest entrypoint artifacts and track markers
+    c._harvest_artifacts(result)
+    if stage == PipelineStage.PREFLIGHT and result.metrics.get("markers"):
+        c._track_markers(result.metrics["markers"])
+    c._issue({"event": "stage_finished", "stage": stage.value, "status": result.status.value})
+    c._issue(_stage_summary_event(c, stage.value, result.status.value))
     return True, result
+
+
+def _stage_summary_event(c: PipelineController, stage: str, status: str) -> dict:
+    """A per-stage ``summary`` with ``scope:"markers"`` and the authoritative
+    MarkerTracker counts (§5.5 / D3)."""
+    return {
+        "event": "summary",
+        "scope": "markers",
+        "stage": stage,
+        "status": status,
+        **_summary_counts_payload(c),
+    }
+
+
+def _summary_counts_payload(c: PipelineController) -> dict:
+    counts = c._summary_counts()
+    return {
+        key: counts.get(key, 0)
+        for key in ("success", "partial", "failed", "skipped")
+    }
 
 
 def _write_latest_json(layout: RunLayout, config: PipelineConfig, run_id: str) -> None:
@@ -712,7 +771,9 @@ def execute_pipeline_stages(c: PipelineController) -> PipelineRunResult:
     for stage, error_category, fn in plan:
         if c.cancelled.is_set():
             c._issue({"event": "stage_finished", "stage": stage.value, "status": "cancelled"})
+            c._issue(_stage_summary_event(c, stage.value, "cancelled"))
             c.last_error_category = "cancelled"
+            c.last_error_stage = stage.value
             break
         cont, _ = _run_stage(c, stage, error_category, fn)
         if not cont:
@@ -735,30 +796,46 @@ def execute_pipeline_stages(c: PipelineController) -> PipelineRunResult:
             "status": report_result.status.value,
         }
     )
+    c._issue(_stage_summary_event(c, PipelineStage.REPORT.value, report_result.status.value))
+    if report_result.status == PipelineStatus.SUCCESS:
+        c.artifacts["report_json"] = str(c.layout.report_json)
+        c.artifacts["report_html"] = str(c.layout.report_html)
 
     # deterministic terminal status
     if c.cancelled.is_set():
         final_status = PipelineStatus.CANCELLED
+        final_error_category = "cancelled"
     elif report_result.status == PipelineStatus.FAILED:
         final_status = PipelineStatus.FAILED
+        final_error_category = c.last_error_category or "artifact_validation"
     else:
         final_status = aggregate_status(c.results)
+        final_error_category = c.last_error_category
 
-    if final_status == PipelineStatus.FAILED and c.last_error_category:
+    final_counts = _summary_counts_payload(c)
+    if final_status == PipelineStatus.FAILED and final_error_category:
         c._issue(
             {
                 "event": "fatal",
-                "error_category": c.last_error_category or "artifact_validation",
-                "stage": None,
+                "error_category": final_error_category,
+                "stage": c.last_error_stage,
             }
         )
-    c._issue({"event": "summary", "status": final_status.value})
+    final_summary = {
+        "event": "summary",
+        "scope": "markers",
+        "status": final_status.value,
+        **final_counts,
+    }
+    c._issue(final_summary)
     c._issue(
         {
             "event": "completed",
             "status": final_status.value,
-            "error_category": c.last_error_category,
+            "error_category": final_error_category,
             "report": c.layout.report_json.name,
+            "artifacts": dict(c.artifacts),
+            "summary": final_summary,
         }
     )
     c._guard.certify()
@@ -863,6 +940,14 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def exit_code_for(status: PipelineStatus) -> int:
+    """Map a run terminal status to a process exit code (§5.10.1).
+
+    ``success`` / ``partial`` → 0; ``failed`` / ``cancelled`` → 1.
+    """
+    return 1 if status in (PipelineStatus.FAILED, PipelineStatus.CANCELLED) else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = _build_parser()
@@ -893,7 +978,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(f"status: {result.status.value}", file=sys.stderr)
     print(f"run_id: {result.run_id}", file=sys.stderr)
-    return 0
+    # §5.10.1: success/partial → 0; failed/cancelled -> non-zero.
+    return exit_code_for(result.status)
 
 
 if __name__ == "__main__":
