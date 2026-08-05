@@ -281,6 +281,26 @@ def _replay_action_lines(step: dict[str, Any], indent: str = "        ") -> list
     return [f"{indent}{locator}.{action_type}({values})"]
 
 
+def _local_page_bootstrap_lines(indent: str, include_goto: bool = True) -> list[str]:
+    """Render the shared local ReplicaServer-backed browser/context/page bootstrap lines.
+
+    Used by both :func:`generate_replay_script` and
+    :func:`generate_offline_adapter_script` so every offline entrypoint derives its
+    ``browser``/``context``/``page``/``pages`` from the same local replica bootstrap
+    (no live network auth). ``include_goto`` lets the offline adapter install its
+    active-network-isolation route handler before navigating to ``server.url``.
+    """
+    lines = [
+        f"{indent}browser = playwright.chromium.launch()",
+        f"{indent}context = browser.new_context()",
+        f"{indent}page = context.new_page()",
+        f'{indent}pages = {{"page": page}}',
+    ]
+    if include_goto:
+        lines.append(f"{indent}page.goto(server.url)")
+    return lines
+
+
 def generate_replay_script(
     replica_directory: str,
     entry_page_bindings: dict[str, str],
@@ -303,22 +323,23 @@ def generate_replay_script(
         else:
             replay_lines.extend(_replay_action_lines(step))
     replay_body = "\n".join(replay_lines) or "        # No marked actions were captured."
+    body = [
+        f"    replica_root = Path(__file__).resolve().parent / {replica_directory!r}",
+        "    with ReplicaServer(replica_root) as server, sync_playwright() as playwright:",
+        *_local_page_bootstrap_lines("        "),
+    ]
+    if bindings:
+        body.append(bindings)
+    body.append(replay_body)
+    body.append("        browser.close()")
+    body_text = "\n".join(body)
     return f'''from pathlib import Path
 from playwright.sync_api import sync_playwright
 from serve_replica import ReplicaServer
 
 
 def run() -> None:
-    replica_root = Path(__file__).resolve().parent / {replica_directory!r}
-    with ReplicaServer(replica_root) as server, sync_playwright() as playwright:
-        browser = playwright.chromium.launch()
-        context = browser.new_context()
-        page = context.new_page()
-        pages = {{"page": page}}
-        page.goto(server.url)
-{bindings}
-{replay_body}
-        browser.close()
+{body_text}
 
 
 if __name__ == "__main__":
@@ -367,6 +388,174 @@ def run() -> None:
 if __name__ == "__main__":
     run()
 '''
+
+
+def _reindent_lines(lines: list[str], new_indent: str) -> list[str]:
+    """Re-indent a source slice onto a new base indentation, preserving inner structure."""
+    non_blank = [line for line in lines if line.strip()]
+    base = min(len(line) - len(line.lstrip()) for line in non_blank) if non_blank else 0
+    return [new_indent + line[base:] if line.strip() else "" for line in lines]
+
+
+def generate_offline_adapter_script(
+    completed_source: str,
+    replica_directory: str,
+    validation_directory: str,
+    capability_policy: Mapping[str, str] | None = None,
+) -> str:
+    """Rewrite a completed adapter into a portable, offline-capable runner.
+
+    The live bootstrap (real URLs / network auth) is removed based on the parsed
+    ``BootstrapPlan`` boundary; only statements after ``source_end_line`` are kept and
+    grouped into per-marker blocks. Each block emits ``marker_started``/``marker_finished``
+    events to ``validation/events.jsonl``. Active network isolation aborts and records
+    every request outside the local replica origin, and the run fails with
+    ``offline_external_request`` if any external request leaks through. Browser and the
+    replica server are always closed in ``finally``.
+    """
+    tree = ast.parse(completed_source)
+    plan = parse_action_plan(completed_source)
+    bootstrap = plan.bootstrap
+    if not bootstrap.skipped_in_offline_replay:
+        raise ValueError("bootstrap.skipped_in_offline_replay must be True for offline rewrite")
+
+    run_functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "run"]
+    if len(run_functions) != 1:
+        raise ValueError(f"expected exactly one top-level 'run' function, found {len(run_functions)}")
+
+    source_end_line = bootstrap.source_end_line
+    kept = [stmt for stmt in run_functions[0].body if stmt.lineno > source_end_line]
+
+    groups = plan.marker_groups
+    buckets: list[list[ast.stmt]] = [[] for _ in groups]
+    for stmt in kept:
+        group_index = -1
+        for index, group in enumerate(groups):
+            if group.source_line < stmt.lineno:
+                group_index = index
+            else:
+                break
+        if group_index >= 0:
+            buckets[group_index].append(stmt)
+
+    policy_by_label = {
+        _normalize_label(label): mode for label, mode in (capability_policy or {}).items()
+    }
+    normalized_groups = [_normalize_label(group.marker_label) for group in groups]
+    source_lines = completed_source.splitlines()
+
+    indent = "    "
+    inner = indent * 2
+    block_indent = indent * 3
+
+    block_lines: list[str] = []
+    for index, group in enumerate(groups):
+        bucket = buckets[index]
+        if not bucket:
+            continue
+        label = group.marker_label
+        mode = policy_by_label.get(normalized_groups[index], "supported")
+        if mode not in {"supported", "degraded", "static-only"}:
+            mode = "supported"
+        marker_comment = (
+            source_lines[group.source_line - 1]
+            if 0 < group.source_line <= len(source_lines)
+            else f"# [MARKER: {label}]"
+        )
+        if marker_comment.strip():
+            block_lines.append(block_indent + marker_comment.lstrip())
+        block_lines.append(f'{block_indent}emit({{"event": "marker_started", "marker": {label!r}}})')
+        if mode == "static-only":
+            block_lines.append(
+                f'{block_indent}emit({{"event": "marker_degraded", "marker": {label!r}, '
+                f'"capability": "canvas_dynamic_pixels"}})'
+            )
+            block_lines.append(
+                f"{block_indent}# static-only: viewer-JS / dynamic-pixel execution skipped "
+                f"(offline stage partial)"
+            )
+            block_lines.append(f"{block_indent}offline_stages.append(\"partial\")")
+            block_lines.append(f'{block_indent}emit({{"event": "marker_finished", "marker": {label!r}, "status": "degraded"}})')
+            continue
+        if mode == "degraded":
+            block_lines.append(f'{block_indent}emit({{"event": "marker_degraded", "marker": {label!r}}})')
+        slice_lines: list[str] = []
+        for stmt in bucket:
+            slice_lines.extend(source_lines[stmt.lineno - 1 : stmt.end_lineno])
+        reindented = _reindent_lines(slice_lines, block_indent)
+        block_lines.extend(reindented if reindented else [f"{block_indent}pass"])
+        block_lines.append(f'{block_indent}emit({{"event": "marker_finished", "marker": {label!r}, "status": {mode!r}}})')
+
+    marker_body = "\n".join(block_lines) or f"{block_indent}pass"
+
+    bindings_comments = "\n".join(
+        f"{block_indent}# {page_var} is restored from local entry binding: {binding!r}"
+        for page_var, binding in bootstrap.entry_page_bindings.items()
+    )
+
+    body_lines = [
+        "def run() -> None:",
+        f"{indent}replica_root = Path(__file__).resolve().parent / {replica_directory!r}",
+        f"{indent}validation_root = Path(__file__).resolve().parent / {validation_directory!r}",
+        f"{indent}validation_root.mkdir(parents=True, exist_ok=True)",
+        f"{indent}external_requests: list = []",
+        f"{indent}offline_stages: list = []",
+        f"{indent}with ReplicaServer(replica_root) as server, sync_playwright() as playwright:",
+        *_local_page_bootstrap_lines(inner, include_goto=False),
+        f'{inner}allowed_origin = "/".join(server.url.split("/")[:3])',
+        f"{inner}def _route(route):",
+        f"{inner + indent}url = route.request.url",
+        f"{inner + indent}parsed = urllib.parse.urlsplit(url)",
+        f"{inner + indent}if parsed.scheme in (\"data\", \"blob\", \"about\") or url.startswith(allowed_origin):",
+        f"{inner + indent + indent}route.continue_()",
+        f"{inner + indent}else:",
+        f"{inner + indent + indent}external_requests.append(url)",
+        f"{inner + indent + indent}route.abort()",
+        f'{inner}context.route("**/*", _route)',
+        f"{inner}try:",
+        f"{block_indent}page.goto(server.url)",
+    ]
+    if bindings_comments:
+        body_lines.append(bindings_comments)
+    body_lines.append(marker_body)
+    body_lines.extend(
+        [
+            f"{inner}finally:",
+            f"{block_indent}browser.close()",
+            f'{indent}validation_root.joinpath("external_requests.json").write_text('
+            f'json.dumps(external_requests, ensure_ascii=False), encoding="utf-8")',
+            f'{indent}if "partial" in offline_stages:',
+            f'{block_indent}print("offline stage: partial", flush=True)',
+            f"{indent}if external_requests:",
+            f'{block_indent}raise RuntimeError("offline_external_request")',
+        ]
+    )
+
+    generated = "\n".join(
+        [
+            "from pathlib import Path",
+            "import json",
+            "import urllib.parse",
+            "from playwright.sync_api import sync_playwright",
+            "from serve_replica import ReplicaServer",
+            "",
+            "",
+            "def emit(event):",
+            f"{indent}events_path = Path(__file__).resolve().parent / {validation_directory!r} / \"events.jsonl\"",
+            f"{indent}events_path.parent.mkdir(parents=True, exist_ok=True)",
+            f'{indent}with events_path.open("a", encoding="utf-8") as handle:',
+            f"{indent + indent}handle.write(json.dumps(event, ensure_ascii=False) + \"\\n\")",
+            "",
+            "",
+            *body_lines,
+            "",
+            "",
+            'if __name__ == "__main__":',
+            f"{indent}run()",
+        ]
+    )
+    ast.parse(generated)
+    return generated
 
 
 def locator_risk_report(plan: ActionPlan) -> dict[str, int]:
