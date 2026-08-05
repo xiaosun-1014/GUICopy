@@ -63,8 +63,17 @@ FTIMAGE_OUTPUT = Path(__file__).resolve().parent / "out" / "ftimage" / "processe
 
 
 def replica_python_executable() -> str:
-    """Use the documented replica environment when available, with a local fallback."""
-    return str(CODEGEN_MARKER_PYTHON if CODEGEN_MARKER_PYTHON.is_file() else Path(sys.executable))
+    """Return the documented replica interpreter, or raise if it is missing.
+
+    Never silently falls back to sys.executable: system Python (3.7) lacks the
+    PyQt6/playwright wheels and is forbidden for subprocesses.
+    """
+    if not CODEGEN_MARKER_PYTHON.is_file():
+        raise RuntimeError(
+            f"缺少复制子进程解释器：{CODEGEN_MARKER_PYTHON}。"
+            "导出离线复刻需要 codegen-marker 环境，请按 CLAUDE.md 用 conda 创建后再试。"
+        )
+    return str(CODEGEN_MARKER_PYTHON)
 
 
 def write_source_text(path: str | Path, source: str) -> None:
@@ -544,6 +553,12 @@ class MainWindow(QMainWindow):
         """Run live capture/build in a dedicated process so Qt stays responsive."""
         if not self.export_replica_btn.isEnabled():
             return
+        try:
+            interpreter = replica_python_executable()
+        except RuntimeError as error:
+            QMessageBox.critical(self, "无法导出离线复刻", str(error))
+            self._show_status("导出已中止：缺少复制子进程解释器", 5000)
+            return
         errors = export_preflight_errors(self._latest_code)
         if errors:
             QMessageBox.warning(self, "无法导出离线复刻", "\n".join(errors))
@@ -559,7 +574,7 @@ class MainWindow(QMainWindow):
             encoding="utf-8",
         )
         process = QProcess(self)
-        process.setProgram(replica_python_executable())
+        process.setProgram(interpreter)
         process.setArguments([
             str(Path(__file__).resolve().parent / "batch_capture_replicate.py"),
             "--mode", "live", "--auth-mode", str(self.replica_auth_mode.currentData()), "--script", str(source_path),

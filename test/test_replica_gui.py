@@ -54,6 +54,20 @@ class ReplicaGuiTests(unittest.TestCase):
     def test_export_prefers_documented_conda_interpreter(self):
         self.assertTrue(replica_python_executable().replace("\\", "/").endswith("codegen-marker/python.exe"))
 
+    def test_missing_interpreter_raises_runtime_error_not_sys_executable_fallback(self):
+        # 解释器缺失时绝不允许静默回退到 sys.executable —— 必须触发明确失败。
+        with patch.object(Path, "is_file", return_value=False):
+            with self.assertRaises(RuntimeError) as ctx:
+                replica_python_executable()
+            self.assertIn("codegen-marker", str(ctx.exception))
+
+    def test_present_interpreter_returns_documented_conda_path_unchanged(self):
+        # 正常路径（解释器存在）行为不变：返回 codegen-marker/python.exe。
+        with patch.object(Path, "is_file", return_value=True):
+            resolved = replica_python_executable().replace("\\", "/")
+            self.assertTrue(resolved.endswith("codegen-marker/python.exe"))
+
+
     def test_save_immediately_enables_export_for_stopped_marked_recording(self):
         self.window._on_code_ready('def run():\n    page.goto("https://example.test")\n')
         cursor = self.window.code_view.textCursor()
