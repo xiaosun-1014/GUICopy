@@ -1,4 +1,8 @@
+import io
+import json
+import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -215,6 +219,212 @@ seq_name, seq_frames = select_series(page)
 
         self.assertIn('SCRIPT_DIR / "report.jpeg"', skill)
         self.assertIn('type="jpeg", quality=95', skill)
+
+
+class AgentEventSinkTests(unittest.TestCase):
+    """事件协议（agent 子协议 §3–§7）：event_sink + --emit-jsonl。"""
+
+    def test_default_call_without_sink_is_unchanged(self):
+        """默认调用 process_script 不传 sink：行为不变、无副作用。"""
+        script = """def run(page):
+    # [MARKER: Meta 信息工具 @ 20260730_225417]
+    page.get_by_title("更多").click()
+    page.locator("#moreBox a.tool.tool-tags").click()
+    page.locator("#tagsBox a.close").click()
+    context.close()
+"""
+        with patch.object(
+            agent,
+            "call_llm",
+            side_effect=AssertionError("Meta marker must not call the LLM"),
+        ):
+            completed = agent.process_script(script)
+        self.assertIn("extract_meta_from_frame", completed)
+        self.assertIn("context.close()", completed)
+        self.assertIsNone(agent.validate_syntax(completed))
+
+    def test_dry_run_emits_only_started_and_finished(self):
+        """--dry-run：只 agent_started + agent_finished{status:"dry_run"}。"""
+        script = """def run(page):
+    # [MARKER: Meta 信息工具]
+    page.get_by_title("更多").click()
+    context.close()
+"""
+        events = []
+        result = agent.process_script(script, dry_run=True, event_sink=events.append)
+        self.assertEqual(result, script)
+        self.assertEqual(
+            [ev["event"] for ev in events],
+            ["agent_started", "agent_finished"],
+        )
+        self.assertEqual(events[-1]["status"], "dry_run")
+
+    def test_event_sequence_deterministic_and_skipped(self):
+        """事件序列：agent_started → [marker_started…] → agent_finished；
+        确定性 marker 无 marker_attempt；无 skill marker 发 marker_skipped。"""
+        script = """def run(page):
+    # [MARKER: Meta 信息工具 @ 20260730_225417]
+    page.get_by_title("更多").click()
+    page.locator("#moreBox a.tool.tool-tags").click()
+    page.locator("#tagsBox a.close").click()
+    # [MARKER: 窗宽窗位 WL/WW]
+    page.locator('input[name="customizeWl"]').fill("0")
+    context.close()
+"""
+        events = []
+        with patch.object(
+            agent,
+            "call_llm",
+            side_effect=AssertionError("Meta marker must not call the LLM"),
+        ):
+            completed = agent.process_script(script, event_sink=events.append)
+
+        self.assertIsNone(agent.validate_syntax(completed))
+
+        event_names = [ev["event"] for ev in events]
+        self.assertEqual(event_names[0], "agent_started")
+        self.assertEqual(event_names[-1], "agent_finished")
+        self.assertEqual(events[0]["marker_count"], 2)
+        self.assertEqual(events[-1]["status"], "success")
+        self.assertIn("output_sha256", events[-1])
+
+        started = {ev["label"]: ev for ev in events if ev["event"] == "marker_started"}
+        self.assertEqual(started["Meta 信息工具"]["generator"], "deterministic")
+        self.assertEqual(started["Meta 信息工具"]["line"], 2)
+        self.assertEqual(
+            started["窗宽窗位 WL/WW"]["generator"], "skipped"
+        )
+        self.assertEqual(started["窗宽窗位 WL/WW"]["line"], 6)
+
+        # 无 skill marker → marker_skipped reason=no_skill
+        skipped = [ev for ev in events if ev["event"] == "marker_skipped"]
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["label"], "窗宽窗位 WL/WW")
+        self.assertEqual(skipped[0]["reason"], "no_skill")
+
+        # 确定性 marker → marker_finished (deterministic)，且无 marker_attempt
+        finished = {ev["label"]: ev for ev in events if ev["event"] == "marker_finished"}
+        self.assertIn("Meta 信息工具", finished)
+        self.assertEqual(finished["Meta 信息工具"]["generator"], "deterministic")
+        self.assertEqual(finished["Meta 信息工具"]["status"], "success")
+        self.assertGreater(finished["Meta 信息工具"]["output_line_count"], 0)
+        attempts = [ev for ev in events if ev["event"] == "marker_attempt"]
+        self.assertEqual(attempts, [])
+
+    def test_llm_retries_exhausted_emits_agent_failed_no_marker_finished(self):
+        """重试耗尽：event 流含 agent_failed 且该 marker 无 marker_finished；
+        agent_failed 不含完整响应/prompt。"""
+        script = """def run(page):
+    # [MARKER: 序列选择]
+    # TODO: 动态选择序列
+    page.get_by_text("固定序列").click()
+"""
+        events = []
+        with patch.object(
+            agent,
+            "call_llm",
+            return_value="```python\n# [MARKER: 序列选择]\nbroken = r\"\n```",
+        ):
+            with self.assertRaisesRegex(RuntimeError, "序列选择"):
+                agent.process_script(script, max_retries=2, event_sink=events.append)
+
+        marker_events = [ev for ev in events if ev.get("label") == "序列选择"]
+        names = [ev["event"] for ev in marker_events]
+        self.assertIn("agent_failed", names)
+        self.assertNotIn("marker_finished", names)
+        self.assertEqual(marker_events[-1]["status"], "exceeded_retries")
+        # 无完整响应/prompt 泄漏
+        self.assertNotIn("prompt", marker_events[-1])
+        self.assertNotIn("response", marker_events[-1])
+
+        attempts = [ev for ev in marker_events if ev["event"] == "marker_attempt"]
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0]["attempt"], 1)
+        self.assertEqual(attempts[-1]["attempt"], 2)
+        self.assertEqual(attempts[0]["max_attempts"], 2)
+        self.assertIn("prompt_sha256", attempts[0])
+
+    def test_llm_call_failed_emits_agent_failed(self):
+        """call_llm 抛错 → agent_failed{status:llm_call_failed}。"""
+        script = """def run(page):
+    # [MARKER: 序列选择]
+    # TODO
+    page.get_by_text("x").click()
+"""
+        events = []
+        with patch.object(agent, "call_llm", side_effect=RuntimeError("boom")):
+            with self.assertRaisesRegex(RuntimeError, "LLM 调用失败"):
+                agent.process_script(script, event_sink=events.append)
+        last = events[-1]
+        self.assertEqual(last["event"], "agent_failed")
+        self.assertEqual(last["status"], "llm_call_failed")
+        self.assertNotIn("prompt", last)
+        self.assertNotIn("response", last)
+
+    def test_llm_success_emits_attempt_then_marker_finished(self):
+        """LLM 成功：marker_attempt → marker_finished{generator:llm, attempts, prompt_sha256}。"""
+        script = """def run(page):
+    # [MARKER: 序列选择]
+    # TODO: 动态选择序列
+    page.get_by_text("固定序列").click()
+"""
+        generated_block = """```python
+# [MARKER: 序列选择]
+seq_name, seq_frames = select_series(page)
+```"""
+        events = []
+        with patch.object(agent, "call_llm", return_value=generated_block):
+            agent.process_script(script, event_sink=events.append)
+
+        marker_events = [ev for ev in events if ev.get("label") == "序列选择"]
+        names = [ev["event"] for ev in marker_events]
+        self.assertEqual(names[0], "marker_started")
+        self.assertEqual(names[1], "marker_attempt")
+        self.assertEqual(names[-1], "marker_finished")
+        self.assertEqual(marker_events[-1]["generator"], "llm")
+        self.assertEqual(marker_events[-1]["status"], "success")
+        self.assertEqual(marker_events[-1]["attempts"], 1)
+        self.assertIn("prompt_sha256", marker_events[-1])
+        self.assertGreater(marker_events[-1]["output_line_count"], 0)
+
+    def test_cli_emit_jsonl_requires_output(self):
+        """--emit-jsonl 不带 --output → parser.error (SystemExit 码 2)。"""
+        with patch("sys.argv", ["agent.py", "foo.py", "--emit-jsonl"]):
+            with self.assertRaises(SystemExit) as cm:
+                agent.main()
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_cli_emit_jsonl_conflicts_show_prompt(self):
+        """--emit-jsonl + --show-prompt → parser.error (SystemExit 码 2)。"""
+        with patch(
+            "sys.argv",
+            ["agent.py", "foo.py", "--emit-jsonl", "-o", "out.py", "--show-prompt"],
+        ):
+            with self.assertRaises(SystemExit) as cm:
+                agent.main()
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_cli_emit_jsonl_dry_run_writes_only_event_lines_to_stdout(self):
+        """--emit-jsonl --dry-run：stdout 只输出两行 JSON 事件，代码写入 --output。"""
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            inp = Path(tmp) / "in.py"
+            inp.write_text("def run(page):\n    pass\n", encoding="utf-8")
+            out = Path(tmp) / "out.py"
+            with patch(
+                "sys.argv",
+                ["agent.py", str(inp), "--emit-jsonl", "-o", str(out), "--dry-run"],
+            ), redirect_stdout(buf):
+                agent.main()
+            self.assertTrue(out.exists())
+        lines = [l for l in buf.getvalue().splitlines() if l.strip()]
+        self.assertEqual(len(lines), 2)
+        parsed = [json.loads(l) for l in lines]
+        self.assertEqual(
+            [ev["event"] for ev in parsed],
+            ["agent_started", "agent_finished"],
+        )
+        self.assertEqual(parsed[-1]["status"], "dry_run")
 
 
 if __name__ == "__main__":
