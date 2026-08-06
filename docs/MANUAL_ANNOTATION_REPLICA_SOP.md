@@ -86,14 +86,25 @@ Replica 静态站点：
 - **原则**：每个你想在复刻里「能点、能切、能读」的节点，都要一个 Marker（或落在关键动作前后）。
 - 保存：「💾 保存处理后代码」→ 生成 `processed_{医院}.py` + `replica_annotations.json`。
 
-### Step 3 — 细粒度选择器精修（让人工标注更准、可做到 `success`）
-这是「人工标注」的**第二步**：让关键动作的 locator 更稳定。
-- **优先让每个关键动作用「稳定 id / role / data-testid」定位**，而非坐标或 ordinal。
-- 若原始脚本用的是 `page.mouse.click(x, y)`（坐标）或 `.nth(2)`（ordinal），**改写脚本**为 `page.locator("#stable_id").click()` 或 `get_by_role(...)`。
-- iframe 内目标：确认脚本用了 `.locator(X).content_frame` 链（复刻会保留 iframe 子文档拓扑）。
-- 你写的选择器越贴近 1–4 挡，`run` 越可能 `success` 而非 `partial`。
+### Step 3 — 在复刻标注面板精修 locator
 
-> 实操提示：`pipeline_report.json` 里有 `stages[].metrics.risk_counts` 与每动作的 `locator_risk`，跑完后看哪些动作落在 `ordinal/structural/coordinate`，把它们改稳再重跑。
+1. 停止录制；录制期间面板只读。
+2. 在右侧按 Marker 展开 ActionTarget。
+3. 优先筛选 `ordinal`、`structural`、`coordinate`。
+4. 选择 locator 动作，检查页面变量与 iframe 链。
+5. 编辑完整 Playwright receiver；不要填写 `.click()`、`.fill()` 等动作调用。
+6. 确认“修改前风险 → 修改后风险”和 iframe 预览。
+7. 点击“应用”；失败时脚本不会改变。
+8. 保存 processed 脚本后再运行复刻导出。
+
+坐标动作首版只读，仍需在左侧把整条动作手动改写为 locator 动作。
+面板风险是静态稳定性提示；唯一性和可见性仍由捕获及离线验证确认。
+
+> 风险桶迁移：本版本统一 GUI、build 和 validation 的分类。
+> `get_by_text` 归入 `text`，`get_by_test_id` 归入
+> `stable_attribute`，简单直接 CSS 使用 `stable_id` 历史桶名。
+> 因桶名发生变化，升级前后的 `risk_counts` 不可直接比较；
+> 同版本不同 run 之间可以比较。
 
 ### Step 4 — 一键跑复刻管道
 - GUI 点「⚙️ 生成 Adapter + 离线复刻」（或命令行 `--operation full`）。
@@ -129,11 +140,11 @@ Replica 静态站点：
 
 > 本节按「最值得做」排序。都来自对当前实现能力的真实盘点，不是臆想。
 
-### 痛点 1（最核心）：没有「人工标注面板」，只能改脚本文本
-- **现状**：locator 由 `parse_action_plan` 自动解析；人工只能通过重写 processed 脚本里的选择器来精修，门槛高、易错、无反馈。
-- **建议 A （推荐，入手）**：给 GUI 加一个「复刻标注面板」——在每个关键 `ActionTarget` 旁显示其自动解析出的 locator + 风险档位，允许**直接改写 locator / 补 iframe 链**，改后 `ast.parse` 校验并回写脚本，即时显示风险变化。
-- **建议 B**：录制时让用户**点选元素**指定稳定定位方式（如右击元素 → 用 `data-testid`/role），替代手写选择器。
-- 受益：把「改文本才生效」变成「可视化高亮 + 风险即时反馈」，显著降低人工标注门槛。
+### 痛点 1（最核心）：人工标注门槛 — 已实现「复刻标注面板」
+- **现状（已落地）**：locator 由 `parse_action_plan` 自动解析；GUI 已带右侧「复刻标注面板」，按 Marker 展示每个 `ActionTarget` 的 locator + 风险档位，可**直接改写 locator / 补 iframe 链**，应用时 `ast` 校验并原子回写脚本、即时显示风险变化（见 Step 3）。坐标动作首版只读，仍需在左侧把整条动作手动改写为 locator 动作。
+- **建议 A（已实现）**：复刻标注面板已按本痛点落地。
+- **建议 B**：录制时让用户**点选元素**指定稳定定位方式（如右击元素 → 用 `data-testid`/role），替代手写选择器 —— 仍为后续能力。
+- 受益：已把「改文本才生效」变成「可视化高亮 + 风险即时反馈」，显著降低人工标注门槛。
 
 ### 痛点 2：风险语义对一线操作者不直观
 - **现状**：`partial` 原因分散（ordinal/structural/coordinate + 能力降级），用户难知道「是选择器不稳还是能力边界」。
@@ -155,11 +166,12 @@ Replica 静态站点：
 ### 优先级小结
 | 顺序 | 改进 | 类型 | 收益 |
 |---|---|---|---|
-| 1 | 复刻标注面板（痛点1） | 新功能 | 人工标注门槛大降 ← **推荐先做** |
+| 1 | 复刻标注面板（痛点1） | 新功能 | 人工标注门槛大降 ← **已实现（本版本）** |
 | 2 | 风险语义可视化（痛点2） | 报告增强 | 操作者可判断 |
 | 3 | 区域/滚动标注（痛点3） | 新能力 | 长列表复刻更完整 |
 | 4 | 画布逐帧能力（痛点4） | 能力扩展 | 画布类可望越过 partial（远期） |
 | 5 | run 间对比（痛点5） | 报告增强 | 迭代可量化 |
+| — | 录制时元素拾取（痛点1 建议B） | 新能力 | 替代手写选择器（后续） |
 
 ---
 
