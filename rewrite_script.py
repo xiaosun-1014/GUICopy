@@ -16,6 +16,64 @@ from replica_models import ActionTarget, BootstrapPlan, FrameHop, LocatorRecipe,
 
 MARKER_RE = re.compile(r"\[MARKER:\s*(?P<label>[^@\]]+?)(?:\s*@[^\]]+)?\]")
 ACTION_METHODS = {"click", "dblclick", "fill", "press", "select_option", "hover"}
+LOCATOR_METHODS = {
+    "locator",
+    "get_by_role",
+    "get_by_text",
+    "get_by_test_id",
+    "get_by_label",
+    "get_by_title",
+}
+
+
+class LocatorEditError(ValueError):
+    """A locator edit that cannot be represented safely by LocatorRecipe."""
+
+
+def _attribute_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _validate_static_locator_calls(expression: ast.AST) -> None:
+    for node in ast.walk(expression):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr not in LOCATOR_METHODS:
+            continue
+        for value in [
+            *node.args,
+            *(keyword.value for keyword in node.keywords if keyword.arg),
+        ]:
+            try:
+                ast.literal_eval(value)
+            except (ValueError, TypeError) as error:
+                raise LocatorEditError(
+                    "locator and iframe selectors must use static literal arguments"
+                ) from error
+
+
+def parse_locator_expression(expression: str) -> LocatorRecipe:
+    """Parse one receiver expression without executing it."""
+    try:
+        node = ast.parse(expression, mode="eval").body
+    except SyntaxError as error:
+        raise LocatorEditError(f"invalid Python expression: {error.msg}") from error
+    if _attribute_name(node) in ACTION_METHODS:
+        raise LocatorEditError("enter only the locator receiver, without an action call")
+    source = ast.unparse(node)
+    root_match = re.match(r"(?P<page>page\d*)\b", source)
+    if root_match is None:
+        raise LocatorEditError("locator must start from a page variable")
+    _validate_static_locator_calls(node)
+    page_var = root_match.group("page")
+    recipe = _locator_from_expression(node, page_var)
+    if recipe is None:
+        raise LocatorEditError("unsupported Playwright locator expression")
+    return recipe
 
 
 @dataclass
@@ -91,7 +149,7 @@ def _locator_from_expression(expression: ast.AST, page_var: str) -> LocatorRecip
         ordinal_value = int(ordinal_match.group(2)) if ordinal_match.group(2) else None
         source = source[: ordinal_match.start()]
 
-    matches = list(re.finditer(r"\.(locator|get_by_role|get_by_text|get_by_test_id|get_by_label|get_by_title)\(", source))
+    matches = list(re.finditer(r"\.({})\(".format("|".join(sorted(LOCATOR_METHODS))), source))
     if not matches:
         return None
     match = matches[-1]

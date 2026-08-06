@@ -3,8 +3,10 @@ import unittest
 from pathlib import Path
 
 from rewrite_script import (
+    LocatorEditError,
     locator_risk_report,
     parse_action_plan,
+    parse_locator_expression,
     source_span_offsets,
 )
 
@@ -140,6 +142,32 @@ page.get_by_role("button", name="确定").click()
             source[start:end],
             'page.get_by_role("button", name="确定")',
         )
+
+    def test_parse_locator_expression_accepts_nested_iframe_receiver(self):
+        recipe = parse_locator_expression(
+            'page1.locator("#iframe").content_frame'
+            '.locator(\'iframe[name="imageFrame"]\').content_frame'
+            '.get_by_role("button", name="确定")'
+        )
+
+        self.assertEqual(recipe.page_var, "page1")
+        self.assertEqual(
+            [hop.selector for hop in recipe.frame_chain],
+            ["#iframe", 'iframe[name="imageFrame"]'],
+        )
+        self.assertEqual(recipe.locator_kind, "role")
+
+    def test_parse_locator_expression_rejects_action_call(self):
+        with self.assertRaisesRegex(LocatorEditError, "receiver"):
+            parse_locator_expression('page.locator("#confirm").click()')
+
+    def test_parse_locator_expression_rejects_dynamic_selector(self):
+        with self.assertRaisesRegex(LocatorEditError, "static literal"):
+            parse_locator_expression("page.locator(selector)")
+
+    def test_parse_locator_expression_rejects_unknown_root(self):
+        with self.assertRaisesRegex(LocatorEditError, "page variable"):
+            parse_locator_expression('browser.locator("#confirm")')
 
 
 if __name__ == "__main__":
