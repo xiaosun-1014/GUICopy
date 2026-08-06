@@ -45,6 +45,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSplitter,
     QStatusBar,
     QVBoxLayout,
     QWidget,
@@ -54,7 +55,14 @@ from agent import parse_markers
 from codegen_manager import CodegenManager
 from markers import DEFAULT_MARKERS, Marker, render
 from orchestrator_events import MarkerTracker, MARKER_STATUSES
-from rewrite_script import parse_action_plan
+from replica_annotation_panel import ReplicaAnnotationPanel
+from rewrite_script import (
+    LocatorEditError,
+    SourceSpan,
+    parse_action_plan,
+    replace_action_locator,
+    source_span_offsets,
+)
 from runtime_python import codegen_python_executable
 
 
@@ -469,6 +477,13 @@ class MainWindow(QMainWindow):
         # 置顶状态
         self._pinned = False
 
+        self._annotation_refresh_timer = QTimer(self)
+        self._annotation_refresh_timer.setSingleShot(True)
+        self._annotation_refresh_timer.setInterval(300)
+        self._annotation_refresh_timer.timeout.connect(
+            self._refresh_annotation_panel
+        )
+
         self._build_ui()
         self._show_status("就绪（右键代码面板插入标记）", 5000)
 
@@ -555,7 +570,20 @@ class MainWindow(QMainWindow):
         layout.addLayout(url_row)
         layout.addLayout(out_row)
         layout.addLayout(ctrl_row)
-        layout.addWidget(self.code_view, 1)
+
+        self.annotation_panel = ReplicaAnnotationPanel()
+        self.annotation_panel.source_jump_requested.connect(
+            self._select_source_span
+        )
+        self.annotation_panel.locator_apply_requested.connect(
+            self._apply_locator_edit
+        )
+        self.editor_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.editor_splitter.addWidget(self.code_view)
+        self.editor_splitter.addWidget(self.annotation_panel)
+        self.editor_splitter.setStretchFactor(0, 3)
+        self.editor_splitter.setStretchFactor(1, 2)
+        layout.addWidget(self.editor_splitter, 1)
 
         self.setStatusBar(QStatusBar())
 
@@ -629,6 +657,7 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self._update_export_enabled()
+        self._refresh_annotation_panel()
         self._show_status(f"录制中 → {output_path}（右键面板插入标记）", 0)
         # 自动置顶，避免被浏览器遮挡
         self._set_pinned(True)
@@ -657,6 +686,7 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self._update_export_enabled()
+        self._refresh_annotation_panel()
         self._show_status("已停止 — 可自由编辑或保存", 5000)
 
     def _on_save(self) -> None:
@@ -741,6 +771,7 @@ class MainWindow(QMainWindow):
         self.cancel_export_btn.setEnabled(True)
         self.replica_auth_mode.setEnabled(False)
         process.start()
+        self._refresh_annotation_panel()
         self._show_status("正在生成 Adapter + 离线复刻…", 0)
 
     def _on_export_output(self, stream: str) -> None:
@@ -866,6 +897,7 @@ class MainWindow(QMainWindow):
         self.continue_auth_btn.setEnabled(False)
         self.replica_auth_mode.setEnabled(True)
         self._update_export_enabled()
+        self._refresh_annotation_panel()
 
         if exit_code == 0 and terminal_ok:
             self._show_status(
@@ -943,12 +975,14 @@ class MainWindow(QMainWindow):
         self._panel_initialized = False
         self._rebuild_display()
         self._update_export_enabled()
+        self._refresh_annotation_panel()
         self._show_status("已清空", 2000)
 
     def _on_text_changed(self) -> None:
-        """面板文本变化 → 同步到 _latest_code 和 _display_items。"""
+        """Synchronize live source and debounce annotation parsing."""
         self._latest_code = self.code_view.toPlainText()
         self._update_export_enabled()
+        self._annotation_refresh_timer.start()
 
     def _set_editor_source(self, source: str) -> None:
         """Atomically synchronize the editor and both line/marker data models."""
@@ -961,6 +995,46 @@ class MainWindow(QMainWindow):
         self.code_view.setPlainText(source)
         self._latest_code = source
         self._update_export_enabled()
+
+    def _refresh_annotation_panel(self) -> None:
+        editable = self._manager is None and self._export_process is None
+        self.annotation_panel.set_editable(editable)
+        if not self._latest_code:
+            self.annotation_panel.set_plan("", parse_action_plan(""))
+            return
+        try:
+            annotations = self._annotations_for_export()["markers"]
+            plan = parse_action_plan(self._latest_code, annotations)
+        except (SyntaxError, ValueError) as error:
+            self.annotation_panel.set_parse_error(str(error))
+            return
+        self.annotation_panel.set_plan(self._latest_code, plan)
+
+    def _select_source_span(self, span: SourceSpan) -> None:
+        start, end = source_span_offsets(self._latest_code, span)
+        cursor = self.code_view.textCursor()
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        self.code_view.setTextCursor(cursor)
+        self.code_view.ensureCursorVisible()
+
+    def _apply_locator_edit(self, action_id: str, expression: str) -> None:
+        original = self._latest_code
+        try:
+            annotations = self._annotations_for_export()["markers"]
+            updated = replace_action_locator(
+                original,
+                action_id,
+                expression,
+                annotations,
+            )
+        except (LocatorEditError, SyntaxError, ValueError) as error:
+            self.annotation_panel.error_label.setText(str(error))
+            self._show_status("Locator 修改未应用", 5000)
+            return
+        self._set_editor_source(updated)
+        self._refresh_annotation_panel()
+        self._show_status("Locator 已更新，请保存后再导出", 5000)
 
     # ---------- worker 线程 → GUI 线程 ----------
     def _on_update_from_worker(self, code: str) -> None:

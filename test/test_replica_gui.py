@@ -202,6 +202,96 @@ page.get_by_role("link").filter(has_text=re.compile(r"^$")).click()
         self.assertTrue(marker["marker_id"])
         self.assertEqual(anchors[0]["marker_id"], marker["marker_id"])
 
+    def _load_editable_locator_source(self):
+        source = '''def run(page):
+    # [MARKER: 序列选择]
+    page.locator(".series").nth(2).dblclick()
+'''
+        self.window._set_editor_source(source)
+        self.window._manager = None
+        self.window._refresh_annotation_panel()
+        return source
+
+    def test_annotation_panel_is_read_only_while_recording(self):
+        self._load_editable_locator_source()
+        self.window._manager = object()
+        self.window._refresh_annotation_panel()
+
+        self.assertFalse(self.window.annotation_panel.editable)
+
+    def test_annotation_panel_applies_locator_and_marks_source_unsaved(self):
+        self._load_editable_locator_source()
+        self.window._saved_source_hash = hashlib.sha256(
+            self.window._latest_code.encode("utf-8")
+        ).hexdigest()
+        self.window._apply_locator_edit(
+            "a_000_001",
+            'page.get_by_test_id("series-primary")',
+        )
+
+        self.assertIn(
+            'page.get_by_test_id("series-primary").dblclick()',
+            self.window._latest_code,
+        )
+        self.assertFalse(self.window.export_replica_btn.isEnabled())
+        action = (
+            self.window.annotation_panel.plan
+            .marker_groups[0]
+            .actions[0]
+        )
+        self.assertEqual(action.locator.locator_kind, "test_id")
+
+    def test_annotation_panel_failed_apply_keeps_source_unchanged(self):
+        source = self._load_editable_locator_source()
+
+        self.window._apply_locator_edit(
+            "a_000_001",
+            "page.locator(selector)",
+        )
+
+        self.assertEqual(self.window._latest_code, source)
+
+    def test_annotation_selection_jumps_to_receiver_source(self):
+        self._load_editable_locator_source()
+        action = self.window.annotation_panel.plan.marker_groups[0].actions[0]
+        span = self.window.annotation_panel.plan.locator_source_spans[action.action_id]
+
+        self.window._select_source_span(span)
+
+        self.assertEqual(
+            self.window.code_view.textCursor().selectedText(),
+            'page.locator(".series").nth(2)',
+        )
+
+    def test_invalid_manual_source_keeps_last_plan_as_read_only_reference(self):
+        self._load_editable_locator_source()
+        previous_plan = self.window.annotation_panel.plan
+        self.window._latest_code = "def broken(:\n"
+
+        self.window._refresh_annotation_panel()
+
+        self.assertIs(self.window.annotation_panel.plan, previous_plan)
+        self.assertFalse(self.window.annotation_panel.tree.isEnabled())
+        self.assertIn(
+            "当前源码无法解析",
+            self.window.annotation_panel.status_label.text(),
+        )
+
+    def test_parse_error_recovers_after_source_is_fixed(self):
+        source = self._load_editable_locator_source()
+        self.window._latest_code = "def broken(:\n"
+        self.window._refresh_annotation_panel()
+        self.assertFalse(self.window.annotation_panel.tree.isEnabled())
+
+        self.window._latest_code = source
+        self.window._refresh_annotation_panel()
+        first_group = self.window.annotation_panel.plan.marker_groups[0]
+        first_action_item = self.window.annotation_panel.tree.topLevelItem(0).child(0)
+        self.window.annotation_panel.tree.setCurrentItem(first_action_item)
+
+        self.assertFalse(self.window.annotation_panel.expression_editor.isReadOnly())
+        self.assertTrue(self.window.annotation_panel.apply_button.isEnabled())
+
     def test_duplicate_marker_headers_preserve_distinct_ids_by_occurrence(self):
         source = '''page.locator("#one").click()
 # [MARKER: 报告截图]
