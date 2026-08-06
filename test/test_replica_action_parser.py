@@ -54,7 +54,7 @@ class ReplicaActionParserTests(unittest.TestCase):
         report = locator_risk_report(self._parse("cxhospital"))
 
         self.assertGreater(report["ordinal"], 0)
-        self.assertGreater(report["simple"], 0)
+        self.assertGreater(report["stable_id"], 0)
         self.assertGreaterEqual(report["non_locator"], 0)
 
     def test_get_by_title_action_is_preserved_for_offline_replay(self):

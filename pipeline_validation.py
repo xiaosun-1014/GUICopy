@@ -31,6 +31,7 @@ from replay_helpers import (
     scan_text_for_secrets,
     sha256_file,
 )
+from locator_risk import LOCATOR_RISK_ORDER, classify_locator_risk
 from replica_models import ReplicaFlow
 from runtime_python import codegen_python_executable
 
@@ -158,34 +159,6 @@ def validate_manifest(flow: ReplicaFlow, capture_root: Path) -> ValidationResult
 # Locator risk
 # ---------------------------------------------------------------------------
 
-_LOCATOR_RISK_ORDER = {
-    "stable_id": 1,
-    "aria": 2,
-    "stable_attribute": 3,
-    "text": 4,
-    "ordinal": 5,
-    "structural": 6,
-    "coordinate": 7,
-}
-
-
-def _locator_risk(target) -> str:
-    """Reuse the build-time risk classification plus the coordinate category."""
-    locator = target.locator
-    if locator is None:
-        if getattr(target, "point", None) is not None or target.action_source_kind == "mouse_xy":
-            return "coordinate"
-        return "non_locator"
-    if locator.ordinal_op:
-        return "ordinal"
-    if locator.locator_kind in {"role", "text", "test_id", "label", "title"}:
-        return "aria"
-    args = locator.locator_args.get("args", [""])
-    if any(token in str(args[0]) for token in (">", ":nth-", "[")):
-        return "structural"
-    return "stable_id"
-
-
 def validate_locator_risk(flow: ReplicaFlow) -> ValidationResult:
     """Apply ordinal/structural/absolute-coordinate risk to critical actions.
 
@@ -210,7 +183,7 @@ def validate_locator_risk(flow: ReplicaFlow) -> ValidationResult:
     for state in flow.states:
         for document in state.documents:
             for target in document.targets:
-                risk = _locator_risk(target)
+                risk = classify_locator_risk(target)
                 risk_counts[risk] = risk_counts.get(risk, 0) + 1
                 if target.replay_policy != "execute":
                     continue
@@ -223,7 +196,7 @@ def validate_locator_risk(flow: ReplicaFlow) -> ValidationResult:
     metrics["risk_counts"] = risk_counts
     metrics["highest_risk"] = max(
         (risk for risk, _ in risk_counts.items() if risk != "non_locator"),
-        key=lambda risk: _LOCATOR_RISK_ORDER.get(risk, 0),
+        key=lambda risk: LOCATOR_RISK_ORDER.get(risk, 0),
         default="non_locator",
     )
     return _result(errors, warnings, metrics)

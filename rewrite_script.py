@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from io import StringIO
 from typing import Any
 
+from locator_risk import classify_locator_risk
 from replica_models import ActionTarget, BootstrapPlan, FrameHop, LocatorRecipe, Point, PopupExpectation
 
 
@@ -652,19 +653,18 @@ def generate_offline_adapter_script(
 
 
 def locator_risk_report(plan: ActionPlan) -> dict[str, int]:
-    """Classify parsed actions by offline locator compatibility risk."""
-    counts = {"simple": 0, "aria": 0, "ordinal": 0, "structural": 0, "non_locator": 0}
+    """Count parsed actions using the shared persisted risk buckets."""
+    counts = {
+        "stable_id": 0,
+        "aria": 0,
+        "stable_attribute": 0,
+        "text": 0,
+        "ordinal": 0,
+        "structural": 0,
+        "coordinate": 0,
+        "non_locator": 0,
+    }
     for group in plan.marker_groups:
         for action in group.actions:
-            locator = action.locator
-            if locator is None:
-                counts["non_locator"] += 1
-            elif locator.ordinal_op:
-                counts["ordinal"] += 1
-            elif locator.locator_kind in {"role", "text", "test_id", "label", "title"}:
-                counts["aria"] += 1
-            elif any(token in str(locator.locator_args.get("args", [""])[0]) for token in (">", ":nth-", "[")):
-                counts["structural"] += 1
-            else:
-                counts["simple"] += 1
+            counts[classify_locator_risk(action)] += 1
     return counts

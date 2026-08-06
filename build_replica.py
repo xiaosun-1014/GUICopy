@@ -8,6 +8,7 @@ import shutil
 from dataclasses import asdict
 from pathlib import Path
 
+from locator_risk import classify_locator_risk
 from replica_models import DomNodeSnapshot, ReplicaDocument, ReplicaFlow, ReplicaState
 from rewrite_script import generate_replay_script, generate_serve_script
 from replay_helpers import sha256_file
@@ -140,21 +141,6 @@ def _replay_steps(flow: ReplicaFlow) -> list[dict[str, object]]:
     return steps
 
 
-def _locator_risk(target) -> str:
-    """Classify the offline replay risk of a single ActionTarget by its locator."""
-    locator = target.locator
-    if locator is None:
-        return "non_locator"
-    if locator.ordinal_op:
-        return "ordinal"
-    if locator.locator_kind in {"role", "text", "test_id", "label", "title"}:
-        return "aria"
-    args = locator.locator_args.get("args", [""])
-    if any(token in str(args[0]) for token in (">", ":nth-", "[")):
-        return "structural"
-    return "simple"
-
-
 def _locator_risk_metadata(flow: ReplicaFlow) -> dict[str, dict[str, object]]:
     """Derive locator risk metadata from the flow's ActionTargets (never empty [])."""
     metadata: dict[str, dict[str, object]] = {}
@@ -163,7 +149,7 @@ def _locator_risk_metadata(flow: ReplicaFlow) -> dict[str, dict[str, object]]:
             for target in document.targets:
                 metadata[target.action_id] = {
                     "marker_id": target.marker_id,
-                    "locator_risk": _locator_risk(target),
+                    "locator_risk": classify_locator_risk(target),
                     "locator_kind": target.locator.locator_kind if target.locator else None,
                     "required_ancestor_count": target.selector_closure.required_ancestor_count if target.selector_closure else 0,
                     "required_sibling_count": target.selector_closure.required_sibling_count if target.selector_closure else 0,

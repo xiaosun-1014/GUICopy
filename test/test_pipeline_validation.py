@@ -171,6 +171,32 @@ class LocatorRiskTests(unittest.TestCase):
         result = validate_locator_risk(flow)
         self.assertEqual(result.status, "success")
 
+    def test_shared_text_and_test_id_buckets_reach_validation_metrics(self):
+        text_target = ActionTarget(
+            "a_text", "m_0", "click", "locator", {"args": []},
+            _ascii_locator(
+                'page.get_by_text("Body")',
+                locator_kind="text",
+                args="Body",
+            ),
+            None, None, None, None, "execute", None, "d_main", None,
+        )
+        test_id_target = ActionTarget(
+            "a_test_id", "m_0", "click", "locator", {"args": []},
+            _ascii_locator(
+                'page.get_by_test_id("open")',
+                locator_kind="test_id",
+                args="open",
+            ),
+            None, None, None, None, "execute", None, "d_main", None,
+        )
+        result = validate_locator_risk(
+            _base_flow(states=[_entry_state(targets=[text_target, test_id_target])])
+        )
+        self.assertEqual(result.metrics["risk_counts"]["text"], 1)
+        self.assertEqual(result.metrics["risk_counts"]["stable_attribute"], 1)
+        self.assertEqual(result.metrics["highest_risk"], "text")
+
 
 class ReplicaValidationTests(unittest.TestCase):
     def _build_replica_with_locator(self, locator_selector, double=False):

@@ -47,7 +47,7 @@ class BuildReplicaTests(unittest.TestCase):
             self.assertIn(f'src="../../assets/by-hash/{sha256_file(assets / "child.png")}.png"', child_document.read_text(encoding="utf-8"))
             self.assertEqual(len(list((output / "assets" / "by-hash").glob("*.png"))), 1)
             locator_mapping = json.loads((output / "locator_mapping.json").read_text(encoding="utf-8"))
-            self.assertEqual(locator_mapping["a_000_001"]["locator_risk"], "simple")
+            self.assertEqual(locator_mapping["a_000_001"]["locator_risk"], "stable_id")
             self.assertEqual(locator_mapping["a_000_001"]["marker_id"], "m_000")
             report = json.loads((output / "replica_build_report.json").read_text(encoding="utf-8"))
             self.assertEqual(report["schema_version"], 1)
