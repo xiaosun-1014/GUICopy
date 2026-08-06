@@ -336,6 +336,57 @@ def parse_action_plan(
     return ActionPlan(bootstrap, groups, expectations, source, locator_source_spans)
 
 
+def _find_action(plan: ActionPlan, action_id: str) -> ActionTarget | None:
+    return next(
+        (
+            action
+            for group in plan.marker_groups
+            for action in group.actions
+            if action.action_id == action_id
+        ),
+        None,
+    )
+
+
+def replace_action_locator(
+    source: str,
+    action_id: str,
+    expression: str,
+    marker_annotations: Sequence[Mapping[str, object]] | None = None,
+) -> str:
+    """Return a fully validated script with one locator receiver replaced."""
+    original_plan = parse_action_plan(source, marker_annotations)
+    original_action = _find_action(original_plan, action_id)
+    if original_action is None or original_action.locator is None:
+        raise LocatorEditError(f"locator action {action_id!r} was not found")
+    span = original_plan.locator_source_spans.get(action_id)
+    if span is None:
+        raise LocatorEditError(f"locator source span for {action_id!r} was not found")
+    recipe = parse_locator_expression(expression)
+    if recipe.page_var != original_action.locator.page_var:
+        raise LocatorEditError(
+            "page variable cannot change during a locator-only edit"
+        )
+    start, end = source_span_offsets(source, span)
+    candidate = source[:start] + expression + source[end:]
+    try:
+        ast.parse(candidate)
+    except SyntaxError as error:
+        raise LocatorEditError(
+            f"updated script is invalid: {error.msg}"
+        ) from error
+    reparsed = parse_action_plan(candidate, marker_annotations)
+    updated_action = _find_action(reparsed, action_id)
+    if updated_action is None or updated_action.locator is None:
+        raise LocatorEditError("target action disappeared after reparsing")
+    if updated_action.action_type != original_action.action_type:
+        raise LocatorEditError("action type changed after locator replacement")
+    if updated_action.marker_id != original_action.marker_id:
+        raise LocatorEditError("marker identity changed after locator replacement")
+    return candidate
+
+
+
 def _replay_locator_expression(step: dict[str, Any]) -> str:
     """Return a local Playwright locator expression from a serialized recipe."""
     locator = step.get("locator")

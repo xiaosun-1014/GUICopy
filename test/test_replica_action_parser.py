@@ -7,6 +7,7 @@ from rewrite_script import (
     locator_risk_report,
     parse_action_plan,
     parse_locator_expression,
+    replace_action_locator,
     source_span_offsets,
 )
 
@@ -168,6 +169,59 @@ page.get_by_role("button", name="确定").click()
     def test_parse_locator_expression_rejects_unknown_root(self):
         with self.assertRaisesRegex(LocatorEditError, "page variable"):
             parse_locator_expression('browser.locator("#confirm")')
+
+    def test_replace_action_locator_changes_only_multiline_receiver(self):
+        source = '''# [MARKER: Meta 信息工具]
+page.locator("#iframe").content_frame.locator(
+    "#old"
+).click(position={"x": 4, "y": 5})
+page.locator("#untouched").fill("2000")
+'''
+        updated = replace_action_locator(
+            source,
+            "a_000_001",
+            'page.locator("#iframe").content_frame.get_by_test_id("confirm")',
+        )
+
+        self.assertIn(
+            'page.locator("#iframe").content_frame'
+            '.get_by_test_id("confirm").click(position={"x": 4, "y": 5})',
+            updated,
+        )
+        self.assertIn('page.locator("#untouched").fill("2000")', updated)
+
+    def test_replace_action_locator_preserves_marker_uuid(self):
+        source = '# [MARKER: 报告截图]\npage.locator("#old").click()\n'
+        annotations = [{
+            "marker_id": "marker-stable",
+            "line": 1,
+            "label": "报告截图",
+        }]
+        updated = replace_action_locator(
+            source,
+            "a_000_001",
+            'page.get_by_role("button", name="Open")',
+            annotations,
+        )
+        reparsed = parse_action_plan(updated, annotations)
+
+        self.assertEqual(reparsed.marker_groups[0].marker_id, "marker-stable")
+        self.assertEqual(reparsed.marker_groups[0].actions[0].marker_id, "marker-stable")
+
+    def test_replace_action_locator_rejects_page_variable_change_atomically(self):
+        source = '# [MARKER: 报告截图]\npage.locator("#old").click()\n'
+        with self.assertRaisesRegex(LocatorEditError, "page variable"):
+            replace_action_locator(
+                source,
+                "a_000_001",
+                'page1.locator("#new")',
+            )
+        self.assertIn('page.locator("#old").click()', source)
+
+    def test_replace_action_locator_rejects_missing_action(self):
+        source = '# [MARKER: 报告截图]\npage.locator("#old").click()\n'
+        with self.assertRaisesRegex(LocatorEditError, "not found"):
+            replace_action_locator(source, "a_999_999", 'page.locator("#new")')
 
 
 if __name__ == "__main__":
