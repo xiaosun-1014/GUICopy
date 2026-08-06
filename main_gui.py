@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import uuid
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -242,16 +243,23 @@ def build_annotations_from_source(
     """
     lines = source_code.split("\n")
 
-    # index known ids by the fingerprint of each known marker item line
-    id_by_fp: Dict[str, str] = {}
+    # index known ids by the fingerprint of each known marker item line,
+    # occurrence-safe: duplicate marker headers preserve distinct ids in order
+    ids_by_fingerprint: Dict[str, deque[str]] = defaultdict(deque)
     for anchor in anchors:
         marker_id = anchor.get("marker_id")
-        for item in anchor.get("items") or []:
-            if item.get("type") != "marker":
-                continue
-            fp = _fingerprint(item.get("text") or "")
-            if fp and marker_id:
-                id_by_fp[fp] = marker_id
+        header = next(
+            (
+                item
+                for item in anchor.get("items") or []
+                if item.get("type") == "marker"
+                and (item.get("text") or "").lstrip().startswith("# [MARKER:")
+            ),
+            None,
+        )
+        if marker_id and header:
+            fingerprint = _fingerprint(header.get("text") or "")
+            ids_by_fingerprint[fingerprint].append(str(marker_id))
 
     markers = []
     for parsed in parse_markers(source_code):
@@ -260,9 +268,8 @@ def build_annotations_from_source(
             lines[line_number - 1] if 1 <= line_number <= len(lines) else ""
         )
         fp = _fingerprint(header)
-        marker_id = id_by_fp.get(fp)
-        if marker_id is None:
-            marker_id = str(uuid.uuid4())
+        known_ids = ids_by_fingerprint.get(fp)
+        marker_id = known_ids.popleft() if known_ids else str(uuid.uuid4())
         label = (parsed.get("name") or "").split("@", 1)[0].strip()
         markers.append(
             {"marker_id": marker_id, "line": line_number, "label": label}
@@ -273,6 +280,63 @@ def build_annotations_from_source(
         "source_script_sha256": hashlib.sha256(source_code.encode("utf-8")).hexdigest(),
         "markers": markers,
     }
+
+
+def rebuild_display_state_from_source(
+    source_code: str,
+    old_anchors: List[Dict],
+) -> tuple[List[Dict[str, str]], List[Dict]]:
+    """Rebuild line items and anchors after an arbitrary source edit."""
+    annotations = build_annotations_from_source(source_code, old_anchors)
+    marker_id_by_line = {
+        int(marker["line"]): str(marker["marker_id"])
+        for marker in annotations["markers"]
+    }
+    old_anchor_by_id = {
+        str(anchor["marker_id"]): anchor
+        for anchor in old_anchors
+        if anchor.get("marker_id")
+    }
+    lines = source_code.splitlines()
+    marker_ranges: dict[int, tuple[int, str]] = {}
+    for start_line, marker_id in marker_id_by_line.items():
+        previous = old_anchor_by_id.get(marker_id)
+        item_count = max(1, len(previous.get("items", []))) if previous else 1
+        end_line = min(len(lines), start_line + item_count - 1)
+        marker_ranges[start_line] = (end_line, marker_id)
+
+    display_items: List[Dict[str, str]] = []
+    rebuilt_anchors: List[Dict] = []
+    codegen_lines: List[str] = []
+    line_number = 1
+    while line_number <= len(lines):
+        marker_range = marker_ranges.get(line_number)
+        if marker_range is None:
+            text = lines[line_number - 1]
+            display_items.append({"type": "codegen", "text": text})
+            codegen_lines.append(text)
+            line_number += 1
+            continue
+        end_line, marker_id = marker_range
+        marker_items = [
+            {
+                "type": "marker",
+                "text": lines[index - 1],
+                "marker_id": marker_id,
+            }
+            for index in range(line_number, end_line + 1)
+        ]
+        display_items.extend(marker_items)
+        codegen_idx = max(0, len(codegen_lines) - 1)
+        fingerprint = _fingerprint(codegen_lines[-1]) if codegen_lines else ""
+        rebuilt_anchors.append({
+            "marker_id": marker_id,
+            "codegen_idx": codegen_idx,
+            "fingerprint": fingerprint,
+            "items": marker_items,
+        })
+        line_number = end_line + 1
+    return display_items, rebuilt_anchors
 
 
 # ---- 代码面板：行号栏 + marker 行背景 ----
@@ -884,6 +948,18 @@ class MainWindow(QMainWindow):
     def _on_text_changed(self) -> None:
         """面板文本变化 → 同步到 _latest_code 和 _display_items。"""
         self._latest_code = self.code_view.toPlainText()
+        self._update_export_enabled()
+
+    def _set_editor_source(self, source: str) -> None:
+        """Atomically synchronize the editor and both line/marker data models."""
+        display_items, anchors = rebuild_display_state_from_source(
+            source,
+            self._marker_anchors,
+        )
+        self._display_items = display_items
+        self._marker_anchors = anchors
+        self.code_view.setPlainText(source)
+        self._latest_code = source
         self._update_export_enabled()
 
     # ---------- worker 线程 → GUI 线程 ----------

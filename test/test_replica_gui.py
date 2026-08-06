@@ -9,7 +9,7 @@ from unittest.mock import patch
 from PyQt6.QtWidgets import QApplication
 
 from batch_capture_replicate import validate_annotations
-from main_gui import MainWindow, build_replica_annotations, export_preflight_errors, normalize_ftimage_codegen, replica_python_executable, write_source_text
+from main_gui import MainWindow, build_annotations_from_source, build_replica_annotations, export_preflight_errors, normalize_ftimage_codegen, rebuild_display_state_from_source, replica_python_executable, write_source_text
 from markers import DEFAULT_MARKERS
 
 
@@ -159,6 +159,84 @@ page.get_by_role("link").filter(has_text=re.compile(r"^$")).click()
         self.assertEqual(process.messages, [b'{"command":"continue_after_auth"}\n'])
         self.assertFalse(self.window.continue_auth_btn.isEnabled())
         self.window._export_process = None
+
+    def test_rebuild_display_state_preserves_marker_id_after_multiline_edit(self):
+        source = '''page.locator(
+    "#open"
+).click()
+# [MARKER: 报告截图]
+# page.screenshot(path="report.png")
+'''
+        anchors = [{
+            "marker_id": "marker-1",
+            "codegen_idx": 0,
+            "fingerprint": 'page.locator("#old").click()',
+            "items": [
+                {
+                    "type": "marker",
+                    "text": "# [MARKER: 报告截图]",
+                    "marker_id": "marker-1",
+                },
+                {
+                    "type": "marker",
+                    "text": '# page.screenshot(path="report.png")',
+                    "marker_id": "marker-1",
+                },
+            ],
+        }]
+
+        items, rebuilt = rebuild_display_state_from_source(source, anchors)
+
+        marker_items = [item for item in items if item["type"] == "marker"]
+        self.assertEqual(len(marker_items), 2)
+        self.assertTrue(all(item["marker_id"] == "marker-1" for item in marker_items))
+        self.assertEqual(rebuilt[0]["marker_id"], "marker-1")
+        self.assertEqual(rebuilt[0]["fingerprint"], ").click()")
+
+    def test_rebuild_display_state_assigns_uuid_to_manually_typed_marker(self):
+        source = 'page.locator("#open").click()\n# [MARKER: 报告截图]\n'
+
+        items, anchors = rebuild_display_state_from_source(source, [])
+
+        marker = next(item for item in items if item["type"] == "marker")
+        self.assertTrue(marker["marker_id"])
+        self.assertEqual(anchors[0]["marker_id"], marker["marker_id"])
+
+    def test_duplicate_marker_headers_preserve_distinct_ids_by_occurrence(self):
+        source = '''page.locator("#one").click()
+# [MARKER: 报告截图]
+page.locator("#two").click()
+# [MARKER: 报告截图]
+'''
+        anchors = [
+            {
+                "marker_id": "marker-1",
+                "codegen_idx": 0,
+                "fingerprint": 'page.locator("#one").click()',
+                "items": [{
+                    "type": "marker",
+                    "text": "# [MARKER: 报告截图]",
+                    "marker_id": "marker-1",
+                }],
+            },
+            {
+                "marker_id": "marker-2",
+                "codegen_idx": 1,
+                "fingerprint": 'page.locator("#two").click()',
+                "items": [{
+                    "type": "marker",
+                    "text": "# [MARKER: 报告截图]",
+                    "marker_id": "marker-2",
+                }],
+            },
+        ]
+
+        annotations = build_annotations_from_source(source, anchors)
+
+        self.assertEqual(
+            [marker["marker_id"] for marker in annotations["markers"]],
+            ["marker-1", "marker-2"],
+        )
 
 
 if __name__ == "__main__":
