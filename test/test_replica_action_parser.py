@@ -2,7 +2,11 @@ import ast
 import unittest
 from pathlib import Path
 
-from rewrite_script import locator_risk_report, parse_action_plan
+from rewrite_script import (
+    locator_risk_report,
+    parse_action_plan,
+    source_span_offsets,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -96,6 +100,45 @@ page.locator("canvas").click(position={"x": 422, "y": 419})
         self.assertEqual(
             plan.marker_groups[0].actions[0].marker_id,
             "4f0df6de-71e9-4e3e-a186-f64be41d12fd",
+        )
+
+
+    def test_locator_source_span_covers_only_receiver(self):
+        source = '''# [MARKER: Meta 信息工具]
+page.locator("#iframe").content_frame.locator(
+    "#confirm"
+).click(position={"x": 1, "y": 2})
+'''
+        plan = parse_action_plan(source)
+        action = plan.marker_groups[0].actions[0]
+        start, end = source_span_offsets(
+            source,
+            plan.locator_source_spans[action.action_id],
+        )
+
+        self.assertEqual(
+            source[start:end],
+            'page.locator("#iframe").content_frame.locator(\n'
+            '    "#confirm"\n'
+            ")",
+        )
+        self.assertEqual(action.action_type, "click")
+        self.assertEqual(action.action_args["position"], {"x": 1, "y": 2})
+
+    def test_locator_source_span_handles_utf8_before_end_column(self):
+        source = '''# [MARKER: 序列选择]
+page.get_by_role("button", name="确定").click()
+'''
+        plan = parse_action_plan(source)
+        action = plan.marker_groups[0].actions[0]
+        start, end = source_span_offsets(
+            source,
+            plan.locator_source_spans[action.action_id],
+        )
+
+        self.assertEqual(
+            source[start:end],
+            'page.get_by_role("button", name="确定")',
         )
 
 

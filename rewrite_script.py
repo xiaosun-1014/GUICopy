@@ -32,6 +32,37 @@ class ActionPlan:
     marker_groups: list[MarkerGroup]
     popup_expectations: list[PopupExpectation]
     instrumented_source: str
+    locator_source_spans: dict[str, SourceSpan] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SourceSpan:
+    start_line: int
+    start_col: int
+    end_line: int
+    end_col: int
+
+
+def _utf8_col_to_character_col(line: str, byte_col: int) -> int:
+    prefix = line.encode("utf-8")[:byte_col]
+    try:
+        return len(prefix.decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise ValueError("AST column ends inside a UTF-8 character") from error
+
+
+def source_span_offsets(source: str, span: SourceSpan) -> tuple[int, int]:
+    """Convert an AST byte-column span to absolute Python string offsets."""
+    lines = source.splitlines(keepends=True)
+    if not (1 <= span.start_line <= span.end_line <= len(lines)):
+        raise ValueError("source span line is outside the script")
+    start_line = lines[span.start_line - 1]
+    end_line = lines[span.end_line - 1]
+    start = sum(len(line) for line in lines[: span.start_line - 1])
+    start += _utf8_col_to_character_col(start_line, span.start_col)
+    end = sum(len(line) for line in lines[: span.end_line - 1])
+    end += _utf8_col_to_character_col(end_line, span.end_col)
+    return start, end
 
 
 def _literal_arguments(argument_text: str) -> tuple[list[Any], dict[str, Any]]:
@@ -199,6 +230,7 @@ def parse_action_plan(
     calls = sorted((node for node in ast.walk(tree) if isinstance(node, ast.Call)), key=lambda node: (node.lineno, node.col_offset))
     action_counts = [0] * len(groups)
     actions_by_line: dict[int, str] = {}
+    locator_source_spans: dict[str, SourceSpan] = {}
     for call in calls:
         candidates = [index for index, group in enumerate(groups) if group.source_line < call.lineno]
         if not candidates:
@@ -209,6 +241,14 @@ def parse_action_plan(
         if action:
             action_counts[group_index] += 1
             action.action_args["_source_line"] = call.lineno
+            if action.locator is not None:
+                receiver = call.func.value
+                locator_source_spans[action.action_id] = SourceSpan(
+                    receiver.lineno,
+                    receiver.col_offset,
+                    receiver.end_lineno,
+                    receiver.end_col_offset,
+                )
             groups[group_index].actions.append(action)
             actions_by_line[call.lineno] = action.action_id
 
@@ -235,7 +275,7 @@ def parse_action_plan(
         )
         body_ids = [actions_by_line[call.lineno] for call in ast.walk(node) if isinstance(call, ast.Call) and call.lineno in actions_by_line]
         expectations.append(PopupExpectation(node.lineno, _page_var(popup_call.func.value), info_var, result_var, body_ids))
-    return ActionPlan(bootstrap, groups, expectations, source)
+    return ActionPlan(bootstrap, groups, expectations, source, locator_source_spans)
 
 
 def _replay_locator_expression(step: dict[str, Any]) -> str:
