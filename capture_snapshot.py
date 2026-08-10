@@ -218,7 +218,7 @@ _MARKER_REGION_CANDIDATES: dict[str, tuple[str, tuple[str, ...]]] = {
     "报告截图": ("report", ("#report", "[data-testid*='report' i]", "main", "body")),
     "序列布局切换": ("layout", ("[data-testid*='layout' i]", "[class*='layout' i]", "[aria-label*='layout' i]", "body")),
     "序列选择": ("series", ("[data-testid*='series' i]", "[class*='series' i]", "[aria-label*='series' i]", "body")),
-    "Meta 信息工具": ("metadata", ("[data-testid*='dicom' i]", "[class*='dicom' i]", "[class*='metadata' i]", "[aria-label*='dicom' i]", "[role='dialog']", "body")),
+    "Meta 信息工具": ("metadata", ("[id*='tags' i]", "[class*='tags' i]", "[data-testid*='tags' i]", "[roles*='tags' i]", "[id*='info' i]", "[class*='info' i]", "[data-testid*='dicom' i]", "[class*='dicom' i]", "[class*='metadata' i]", "[aria-label*='dicom' i]", "[role='dialog']", "body")),
     "窗宽窗位 WL/WW": ("wlww", ("[data-testid*='window' i]", "[class*='window-level' i]", "[class*='wlww' i]", "[aria-label*='window' i]", "[role='dialog']", "body")),
     "影像画布交互": ("canvas", ("canvas", "[class*='cornerstone-canvas' i]", "[data-testid*='canvas' i]", "body")),
 }
@@ -253,12 +253,69 @@ def capture_marker_interaction_region(
     auditable DOM evidence instead of silently losing the region.
     """
     region_type, candidates = _MARKER_REGION_CANDIDATES.get(marker_label, ("generic", ("body",)))
+    # Metadata panels are click-opened scroll containers whose HTML differs per
+    # hospital. The trigger button lives OUTSIDE the panel (the panel is a
+    # sibling container), so we locate the panel root via the candidate selectors
+    # and keep its complete outerHTML — every row stays reachable regardless of
+    # per-viewer structure. Fall back to the generic region otherwise.
+    if region_type == "metadata":
+        panel = capture_marker_panel_region(scope, candidates, document_id)
+        if panel is not None:
+            return panel
     root_locator = _first_visible_marker_root(scope, candidates)
     if target_locator is not None and root_locator.count() == 0:
         root_locator = target_locator
     if region_type == "series":
         return capture_series_interaction_region(root_locator, document_id, max_scroll_steps)
     return capture_interaction_region(root_locator, region_type, document_id)
+
+
+def capture_marker_panel_region(
+    scope: Any,
+    candidates: Sequence[str],
+    document_id: str,
+) -> InteractionRegion | None:
+    """Capture a click-opened panel container's complete DOM, viewer-agnostic.
+
+    Resolves the first *visible* candidate root inside ``scope`` (same selector
+    resolution as the generic region capture) and keeps its full ``outerHTML``
+    verbatim, so the replica renders every row and lets the user scroll. The
+    panel is an independent sibling container of the action button, so we do not
+    walk up from the button — we look for the container directly.
+    """
+    root_locator = _first_visible_marker_root(scope, candidates)
+    # Resolve root identity, then read outerHTML from the resolved element.
+    result = root_locator.evaluate(
+        """element => {
+            const rect = element.getBoundingClientRect();
+            return {
+                html: element.outerHTML,
+                rect: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
+                tag: element.tagName.toLowerCase(),
+            };
+        }"""
+    )
+    if not result or not result.get("html"):
+        return None
+    rect = result["rect"]
+    tag = (result.get("tag") or "").lower()
+    # A document-level root (body/html/main) is the whole page, not a panel.
+    # Fall back to the generic region logic when no real panel selector landed.
+    if tag in {"html", "body", "main", "document", "documentelement"}:
+        return None
+    # Guard against capturing an oversized container that likely is not a panel.
+    if rect["width"] > 0 and rect["height"] > 0 and result["html"].count("<") > 2000:
+        return None
+    root = capture_locator_snapshot(root_locator, "page_viewport_css")
+    return InteractionRegion(
+        f"{document_id}_metadata",
+        "metadata",
+        document_id,
+        root,
+        [],
+        None,
+        full_html=root.outer_html,
+    )
 
 
 def _frame_descriptor(frame: Any) -> dict[str, Any]:

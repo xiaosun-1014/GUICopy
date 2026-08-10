@@ -3,7 +3,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-from capture_snapshot import capture_interaction_region, capture_locator_snapshot, capture_marker_interaction_region, dom_snapshot_from_payload, sanitize_html
+from capture_snapshot import capture_interaction_region, capture_locator_snapshot, capture_marker_interaction_region, capture_marker_panel_region, dom_snapshot_from_payload, sanitize_html
 
 
 class CaptureSnapshotTests(unittest.TestCase):
@@ -100,6 +100,42 @@ class CaptureSnapshotTests(unittest.TestCase):
 
         self.assertEqual(actual, {label: root_id for label, (_, root_id) in expected.items()})
         self.assertEqual(region_types, {label: region_type for label, (region_type, _) in expected.items()})
+
+    def test_metadata_panel_captures_full_container_from_candidates(self):
+        # A click-opened meta panel whose container is unrelated to dicom/metadata/
+        # dialog keywords (e.g. ftimage's #tagsBox with class "box-tags"). The
+        # generic panel capture must resolve it via the candidate selectors and
+        # keep its complete HTML (trigger button lives outside the panel).
+        markup = """<div id="tagsBox" class="box-tags" style="display:block">
+          <div class="content">
+            <div class="panel"><div class="hd">Patient Information</div><div class="bd">
+              <div class="item">Patient Name(x00100010): <span>Tang Yuan Hua</span></div>
+              <div class="item">Patient ID(x00100020): <span>0003699549</span></div>
+            </div></div>
+            <div class="panel"><div class="hd">Study Information</div><div class="bd">
+              <div class="item">Study Date(x00080020): <span>20260723</span></div>
+            </div></div>
+          </div>
+          <a href="javascript:;" class="close">close</a>
+        </div>
+        <button id="btn-tags">Tags</button>"""
+        from capture_snapshot import _MARKER_REGION_CANDIDATES
+        candidates = _MARKER_REGION_CANDIDATES["Meta 信息工具"][1]
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page(viewport={"width": 800, "height": 600})
+            page.set_content(markup)
+            region = capture_marker_panel_region(page, candidates, "d_main")
+            browser.close()
+
+        self.assertIsNotNone(region)
+        self.assertEqual(region.region_type, "metadata")
+        self.assertIn("tagsBox", region.full_html)
+        self.assertIn("Patient Name(x00100010)", region.full_html)
+        self.assertIn("20260723", region.full_html)
+        self.assertIn("Study Information", region.full_html)
+        # The panel root resolved to tagsBox (id matches [id*='tags']).
+        self.assertIn('id="tagsBox"', region.full_html)
 
 
 if __name__ == "__main__":

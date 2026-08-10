@@ -13,6 +13,7 @@ from replica_models import (
     BootstrapPlan,
     CaptureTimingProfile,
     DomNodeSnapshot,
+    InteractionRegion,
     LocatorRecipe,
     Rect,
     ReplicaDocument,
@@ -61,6 +62,39 @@ class BuildReplicaTests(unittest.TestCase):
                 self.assertTrue(page.locator("html").evaluate("element => element.classList.contains('replica-debug')"))
                 self.assertEqual(page.frame_locator("#viewer").locator("body").count(), 1)
                 browser.close()
+
+    def test_metadata_region_renders_scrollable_panel_with_full_html(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assets = root / "assets"
+            assets.mkdir()
+            (assets / "main.png").write_bytes(b"png")
+            panel_html = (
+                '<div id="tagsBox" class="box-tags"><div class="panel">'
+                '<div class="hd">Patient Information</div><div class="bd">'
+                '<div class="item">Patient Name(x00100010): <span>Tang Yuan Hua</span></div>'
+                '<div class="item">Patient ID(x00100020): <span>0003699549</span></div>'
+                '</div></div><div class="panel"><div class="hd">Study Information</div>'
+                '<div class="bd"><div class="item">Study Date(x00080020): <span>20260723</span></div>'
+                '</div></div></div>'
+            )
+            root_dom = DomNodeSnapshot("div", "", {}, Rect(100, 50, 300, 400, "page_viewport_css"), panel_html, {})
+            metadata_region = InteractionRegion(
+                "d_main_metadata", "metadata", "d_main", root_dom, [], None, full_html=panel_html
+            )
+            main = ReplicaDocument("d_main", "p_main", "page", "main", None, None, None, None, {"width": 800, "height": 600}, 1, "css", 0, 0, "assets/main.png", "main", 3, regions=[metadata_region])
+            flow = ReplicaFlow(1, "meta", "recorded.py", "hash", "now", {"width": 800, "height": 600}, BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000", [ReplicaState("s_000", 0, "", "page", [ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)], [main], [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry"))], [])
+            output = root / "replica"
+
+            build_replica(flow, root, output)
+
+            index = (output / "index.html").read_text(encoding="utf-8")
+            self.assertIn('data-replica-panel=""', index)
+            self.assertIn("overflow-y:auto", index)
+            self.assertIn("Patient Name(x00100010)", index)
+            self.assertIn("Study Date(x00080020)", index)
+            self.assertIn('left:100px', index)
+            self.assertIn('max-height:400px', index)
 
     def test_same_document_id_uses_state_specific_screenshot_assets(self):
         with tempfile.TemporaryDirectory() as tmp:

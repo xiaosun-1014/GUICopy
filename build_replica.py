@@ -104,6 +104,28 @@ def _render_document(
             rendered_nodes.add(member_key)
             if member.dom.attributes.get("id"):
                 rendered_element_ids.add(member.dom.attributes["id"])
+    # Full-HTML metadata panels (click-opened scroll containers, viewer-agnostic):
+    # render verbatim inside a max-height, internally scrollable box so all rows
+    # are reachable regardless of panel length. Positioned by the panel's captured
+    # viewport rect; the rest of the page stays as captured.
+    rendered_panel_keys: set[str] = set()
+    for region in document.regions:
+        if region.region_type != "metadata" or not region.full_html:
+            continue
+        html = region.full_html
+        if html in rendered_panel_keys:
+            continue
+        rendered_panel_keys.add(html)
+        rect = region.root.rect
+        panel_style = (
+            f"position:absolute;left:{rect.x}px;top:{rect.y}px;"
+            f"width:{rect.width}px;max-height:{rect.height}px;"
+            f"overflow-y:auto;z-index:2;background:#fff;"
+        )
+        parts.append(
+            f'<div class="replica-panel" style="{panel_style}" '
+            f'data-replica-panel="" data-replica-panel-region="{region.region_id}">{html}</div>'
+        )
     for child in child_documents:
         source = _relative_url(destination, document_paths[child.document_id])
         frame_id = f' id="{child.frame_id}"' if child.frame_id else ""
