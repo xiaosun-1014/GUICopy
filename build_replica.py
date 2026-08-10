@@ -66,6 +66,7 @@ def _render_document(
     document_paths: dict[str, Path],
     asset_path: Path,
     transitions: dict[str, dict[str, str]],
+    back_target: str | None = None,
 ) -> str:
     asset = _relative_url(destination, output_root / asset_path)
     parts = [
@@ -104,27 +105,11 @@ def _render_document(
             rendered_nodes.add(member_key)
             if member.dom.attributes.get("id"):
                 rendered_element_ids.add(member.dom.attributes["id"])
-    # Full-HTML metadata panels (click-opened scroll containers, viewer-agnostic):
-    # render verbatim inside a max-height, internally scrollable box so all rows
-    # are reachable regardless of panel length. Positioned by the panel's captured
-    # viewport rect; the rest of the page stays as captured.
-    rendered_panel_keys: set[str] = set()
-    for region in document.regions:
-        if region.region_type != "metadata" or not region.full_html:
-            continue
-        html = region.full_html
-        if html in rendered_panel_keys:
-            continue
-        rendered_panel_keys.add(html)
-        rect = region.root.rect
-        panel_style = (
-            f"position:absolute;left:{rect.x}px;top:{rect.y}px;"
-            f"width:{rect.width}px;max-height:{rect.height}px;"
-            f"overflow-y:auto;z-index:2;background:#fff;"
-        )
+    if back_target is not None:
         parts.append(
-            f'<div class="replica-panel" style="{panel_style}" '
-            f'data-replica-panel="" data-replica-panel-region="{region.region_id}">{html}</div>'
+            f'<button data-replica-back="{back_target}" style="position:fixed;top:8px;right:8px;z-index:5;'
+            'padding:4px 12px;font:14px/1.4 sans-serif;color:#fff;background:#b91c1c;border:none;'
+            'border-radius:4px;cursor:pointer;">× 关闭</button>'
         )
     for child in child_documents:
         source = _relative_url(destination, document_paths[child.document_id])
@@ -266,7 +251,23 @@ def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Pa
                 for target in document.targets
                 if target.action_id in transitions
             }
-            destination.write_text(_render_document(document, children, output_root, destination, document_paths, asset_paths[(state.state_id, document.document_id)], document_transitions), encoding="utf-8")
+            back_abs = None
+            if state.state_id != flow.entry_state_id:
+                ordered = sorted(flow.states, key=lambda s: s.ordinal)
+                position = [i for i, s in enumerate(ordered) if s.state_id == state.state_id]
+                if position and position[0] > 0:
+                    prev_state = ordered[position[0] - 1]
+                    prev_page = next((p for p in prev_state.pages if p.page_var == "page"), prev_state.pages[0] if prev_state.pages else None)
+                    if prev_page is not None:
+                        prev_doc = next(
+                            (d for d in prev_state.documents if d.document_id == prev_page.entry_document_id),
+                            prev_state.documents[0] if prev_state.documents else None,
+                        )
+                        if prev_doc is not None:
+                            back_abs = _state_root(flow, prev_state, output_root) / _document_path(prev_doc, prev_page.entry_document_id)
+            back_target = _relative_url(destination, back_abs) if back_abs is not None else None
+            is_main = document.document_id == main_entry_document_id
+            destination.write_text(_render_document(document, children, output_root, destination, document_paths, asset_paths[(state.state_id, document.document_id)], document_transitions, back_target if is_main else None), encoding="utf-8")
     entrypoint = output_root / "index.html"
     if not entrypoint.exists():
         entrypoint.write_text("<!doctype html><meta charset=\"utf-8\"><title>Empty replica</title>", encoding="utf-8")
