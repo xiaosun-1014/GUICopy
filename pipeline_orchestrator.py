@@ -318,7 +318,12 @@ def run_capture(
         if candidate.is_absolute():
             manifest_path = candidate
         else:
-            manifest_path = Path(layout.capture_dir) / candidate
+            # The capture child writes manifest.json into its --output dir,
+            # which is layout.capture_dir. The reported entrypoint is that
+            # relative path; re-anchor it here rather than stacking the
+            # relative capture_dir on top of it (which paths to a doubled,
+            # non-existent location).
+            manifest_path = layout.capture_dir / candidate.name
     if result.returncode != 0 or manifest_path is None or not manifest_path.is_file():
         category = "network"
         hint = (result.stderr or result.stdout or "capture failed").strip()[-2000:]
