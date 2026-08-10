@@ -23,6 +23,13 @@ document.addEventListener('click', event => {
     const group = option.closest('[role="listbox"], [data-replica-series]') || option.parentElement;
     group.querySelectorAll('[role="option"]').forEach(item => item.setAttribute('aria-selected', item === option ? 'true' : 'false'));
   }
+  const backEl = event.target.closest('[data-replica-back]');
+  if (backEl) {
+    event.preventDefault();
+    const target = backEl.getAttribute('data-replica-back');
+    if (target) window.top.location.assign(target);
+    return;
+  }
   const element = event.target.closest('[data-replica-action]');
   if (!element) return;
   const transition = window.__REPLICA_TRANSITIONS__[element.dataset.replicaAction];
