@@ -150,7 +150,14 @@ def ensure_post_action_state(
             return
         if _wait_for_metadata_panel_state(page, locator_factory, timeout_s, stable_s):
             return
-        raise TimeoutError(f"post-action state did not stabilize for marker: {marker_label}")
+        # The panel never stabilized (or its container is not matched by the
+        # candidate selectors). Do NOT raise here: raising would abort the
+        # after capture in LiveCaptureSession.after, leaving no after
+        # topology.json and silently dropping the whole marked action from the
+        # flow (see _has_snapshot_pair). Falling through captures an at-most
+        # empty / unrendered panel state, which is no worse than the legacy
+        # behavior that never waited for metadata at all.
+        return
     if wait_for_post_action_state(page, marker_label, timeout_s, stable_s):
         return
     if marker_label == "序列选择" and callable(locator_factory):

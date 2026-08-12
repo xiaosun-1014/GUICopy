@@ -60,7 +60,7 @@ Expected: FAIL because the nested-document branch captures the trigger parent ra
 
 - [x] **Step 3: Route nested metadata through the specialized capture path**
 
-For metadata, construct an owning-document scope with `target_locator.locator("xpath=/html")` and call `capture_marker_interaction_region(scope, marker_label, target_document.document_id, target_locator)`. Preserve existing behavior for other nested marker types.
+For metadata, construct an owning-document scope with `target_locator.locator("xpath=ancestor::html")` and call `capture_marker_interaction_region(scope, marker_label, target_document.document_id, target_locator)`. Preserve existing behavior for other nested marker types.
 
 - [x] **Step 4: Run the capture test and verify GREEN**
 
@@ -88,7 +88,7 @@ Expected: FAIL because metadata currently returns immediately.
 
 - [x] **Step 3: Implement bounded condition polling**
 
-For metadata, derive the target document root with `locator_factory().locator("xpath=/html")`, find the first visible metadata candidate, and poll a signature of text content plus `scrollHeight`. Return after the same signature is observed for `stable_s`; return `False` on timeout. Do not retry-click metadata.
+For metadata, derive the target document root with `locator_factory().locator("xpath=ancestor::html")`, find the first visible metadata candidate, and poll a signature of text content plus `scrollHeight`. Return after the same signature is observed for `stable_s`; return `False` on timeout. Do not retry-click metadata.
 
 - [x] **Step 4: Run the readiness test and verify GREEN**
 

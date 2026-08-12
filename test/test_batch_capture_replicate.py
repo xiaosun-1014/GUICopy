@@ -191,6 +191,43 @@ run()
             self.assertEqual(page.locator("#late-row").count(), 1)
             browser.close()
 
+    def test_metadata_unstable_panel_does_not_abort_after_capture(self):
+        # A metadata panel whose content never stabilizes must not make
+        # ensure_post_action_state raise: raising would skip the after capture
+        # in LiveCaptureSession.after and silently drop the marked action from
+        # the flow (missing after topology.json -> _has_snapshot_pair fails).
+        with tempfile.TemporaryDirectory() as tmp, sync_playwright() as playwright:
+            session = LiveCaptureSession(Path(tmp))
+            browser = playwright.chromium.launch()
+            page = browser.new_page()
+            page.set_content(
+                '<button id="btn-tags">Tags</button>'
+                '<div id="tagsBox"><div><span id="live">0</span></div></div>'
+                '<script>'
+                'let n = 0;'
+                'setInterval(() => { document.querySelector("#live").textContent = ++n; }, 40);'
+                '</script>'
+            )
+            target = lambda: page.locator("#btn-tags")
+
+            # The live counter keeps changing, so the signature never stabilizes
+            # within the short timeout. This must return normally (no raise) and
+            # the after snapshot must still be written.
+            replica_batch.ensure_post_action_state(
+                page,
+                "Meta 信息工具",
+                target,
+                timeout_s=0.6,
+                stable_s=0.2,
+            )
+            session._capture("a_meta", "after", page, target, "Meta 信息工具")
+            topology = json.loads(
+                (Path(tmp) / "snapshots" / "a_meta" / "after" / "topology.json").read_text(encoding="utf-8")
+            )
+            browser.close()
+
+        self.assertTrue(topology["documents"])
+
     def test_flow_uses_after_target_when_before_target_is_missing(self):
         source = '''from playwright.sync_api import sync_playwright
 
