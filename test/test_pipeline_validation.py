@@ -212,12 +212,15 @@ class ReplicaValidationTests(unittest.TestCase):
             '<button id="go">Go</button>', {"display": "block"},
         )
         locator = _ascii_locator(f'page.locator("{locator_selector}")', args=locator_selector)
+        # ``double=True`` renders the same action id twice, so the overlay
+        # ``[data-replica-action="a_0"]`` appears twice -- the new
+        # data-replica-action uniqueness check must flag it as not unique.
         targets = [
             ActionTarget(
-                f"a_{i}", "m_0", "click", "locator", {"args": []},
+                "a_0", "m_0", "click", "locator", {"args": []},
                 locator, dom, None, None, None, "execute", None, "d_main", None,
             )
-            for i in range(2 if double else 1)
+            for _ in range(2 if double else 1)
         ]
         flow = _base_flow(states=[_entry_state(targets=targets)])
         from build_replica import build_replica
@@ -250,6 +253,56 @@ class ReplicaValidationTests(unittest.TestCase):
         self.assertEqual(result.metrics["manifest_replay_exit_code"], 0)
         # The completed adapter driver must never be recorded by manifest replay.
         self.assertNotIn("completed", result.metrics["driver"])
+
+    def test_unique_data_replica_action_overlay_passes_validation(self):
+        # A single execute target rendered as a unique data-replica-action
+        # overlay must validate cleanly. This is the ftimage ``a_001_001`` path
+        # that previously failed: the captured semantic locator (get_by_role /
+        # get_by_title) matched 0 elements because sanitize_html stripped the
+        # href/role/title attributes from the replica's overlay DOM.
+        tmpdir, root, _ = self._build_replica_with_locator("#go")
+        try:
+            result = validate_replica(root, root / "capture" / "manifest.json", timeout_ms=45000)
+        finally:
+            tmpdir.cleanup()
+        self.assertEqual(result.status, "success", result.errors)
+        self.assertNotIn("critical_locator_not_unique", result.errors)
+
+    def test_carry_forward_targets_are_not_validated_on_home_page(self):
+        # Only the entry state's targets render on the replica home page. Later
+        # states carry the same document id forward with accumulated targets
+        # whose overlays live on their own per-state pages; validating those on
+        # the home page would always match 0 and false-positive
+        # critical_locator_not_unique (ftimage regressed with 77 such errors).
+        tmpdir = tempfile.TemporaryDirectory()
+        try:
+            root = Path(tmpdir.name)
+            assets = root / "assets"
+            assets.mkdir()
+            (assets / "d_main.png").write_bytes(b"png")
+            dom = DomNodeSnapshot(
+                "button", "Go", {"id": "go"},
+                Rect(10, 10, 80, 30, "page_viewport_css"),
+                '<button id="go">Go</button>', {"display": "block"},
+            )
+            loc = _ascii_locator('page.locator("#go")', args="#go")
+            entry_targets = [
+                ActionTarget("a_0", "m_0", "click", "locator", {"args": []}, loc, dom, None, None, None, "execute", None, "d_main", None)
+            ]
+            carry_target = ActionTarget("a_1", "m_1", "click", "locator", {"args": []}, loc, dom, None, None, None, "execute", None, "d_main", None)
+            entry = _entry_state(targets=entry_targets, state_id="s_000")
+            later = _entry_state(targets=entry_targets + [carry_target], state_id="s_001")
+            flow = _base_flow(states=[entry, later])
+            from build_replica import build_replica
+            build_replica(flow, root, root / "replica")
+            capture_dir = root / "capture"
+            capture_dir.mkdir(exist_ok=True)
+            write_manifest(capture_dir / "manifest.json", flow)
+            result = validate_replica(root, capture_dir / "manifest.json", timeout_ms=60000)
+            self.assertEqual(result.status, "success", result.errors)
+            self.assertEqual(result.metrics["locator_total"], 1)
+        finally:
+            tmpdir.cleanup()
 
 
 class ArtifactValidationTests(unittest.TestCase):

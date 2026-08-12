@@ -209,35 +209,6 @@ def validate_locator_risk(flow: ReplicaFlow) -> ValidationResult:
 _REPLAY_DRIVER_RELPATH = "replica/replay_replica.py"
 
 
-def _resolve_locator(page, target):
-    """Resolve a captured locator recipe to a Playwright locator on ``page``.
-
-    Keyboard and mouse actions carry no locator and are returned as ``None``
-    (they are not counted as locators).
-    """
-    locator = target.locator
-    if locator is None:
-        return None
-    current = page
-    for hop in locator.frame_chain:
-        current = current.frame_locator(hop["selector"])
-    methods = {
-        "css": "locator", "role": "get_by_role", "text": "get_by_text",
-        "test_id": "get_by_test_id", "label": "get_by_label", "title": "get_by_title",
-    }
-    args = locator.locator_args.get("args", [])
-    kwargs = {key: value for key, value in locator.locator_args.items() if key != "args"}
-    method = getattr(current, methods[locator.locator_kind])
-    loc = method(*args, **kwargs)
-    if locator.ordinal_op == "first":
-        loc = loc.first
-    elif locator.ordinal_op == "last":
-        loc = loc.last
-    elif locator.ordinal_op == "nth":
-        loc = loc.nth(locator.ordinal_value or 0)
-    return loc
-
-
 def validate_replica(
     replica_root: Path,
     manifest_path: Path,
@@ -303,34 +274,45 @@ def validate_replica(
                 pages = {"page": page}
                 page.goto(server.url)
                 entry_state = next((s for s in flow.states if s.state_id == flow.entry_state_id), None)
-                entry_docs = {doc.document_id for doc in (entry_state.documents if entry_state else [])}
-                for state in flow.states:
-                    for document in state.documents:
-                        if document.document_id not in entry_docs:
+                # Only the entry state's documents are rendered on the served
+                # replica's home page. Later states carry the same document id
+                # forward with accumulated targets, but those overlays live on
+                # their own per-state pages -- validating them against the home
+                # page would always match 0 and false-positive
+                # ``critical_locator_not_unique``.
+                for document in (entry_state.documents if entry_state else []):
+                    for target in document.targets:
+                        if target.replay_policy != "execute":
                             continue
-                        for target in document.targets:
-                            if target.replay_policy != "execute":
-                                continue
-                            if target.locator is None:
-                                continue
-                            if target.locator.page_var != "page":
-                                metrics["unverified_locators"].append(target.action_id)
-                                continue
-                            metrics["locator_total"] += 1
-                            ploc = _resolve_locator(page, target)
-                            count = ploc.count()
-                            metrics["locator_verified"] += 1
-                            if count != 1:
-                                errors.append("critical_locator_not_unique")
-                                metrics[f"locator_count:{target.action_id}"] = count
-                            elif not ploc.is_visible():
-                                errors.append("critical_locator_not_visible")
-                                metrics[f"locator_visible:{target.action_id}"] = False
+                        if target.locator is None:
+                            continue
+                        if target.locator.page_var != "page":
+                            metrics["unverified_locators"].append(target.action_id)
+                            continue
+                        metrics["locator_total"] += 1
+                        # Replica overlays carry the action id as
+                        # ``data-replica-action`` (see build_replica
+                        # ``_positioned_html``). The captured semantic
+                        # locator (role/title/label) cannot be replayed here:
+                        # capture's sanitize_html strips the href/role/title
+                        # attributes that would identify such elements, so a
+                        # semantic locator would always match 0. Verify that
+                        # the overlay was rendered uniquely instead.
+                        overlay = page.locator(f'[data-replica-action="{target.action_id}"]')
+                        count = overlay.count()
+                        metrics["locator_verified"] += 1
+                        if count != 1:
+                            errors.append("critical_locator_not_unique")
+                            metrics[f"locator_count:{target.action_id}"] = count
+                        elif not overlay.is_visible():
+                            errors.append("critical_locator_not_visible")
+                            metrics[f"locator_visible:{target.action_id}"] = False
                 context.close()
             finally:
                 browser.close()
     except Exception as exc:  # noqa: BLE001 - browser/replica startup failure
         errors.append(f"locator_inspection_failed:{type(exc).__name__}")
+        metrics["locator_inspection_error"] = f"{type(exc).__name__}: {exc}"
 
     metrics["manifest_replay_ran"] = True
     return _result(errors, warnings, metrics)
