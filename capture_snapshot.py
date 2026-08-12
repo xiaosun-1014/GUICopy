@@ -283,7 +283,22 @@ def capture_marker_panel_region(
     panel is an independent sibling container of the action button, so we do not
     walk up from the button — we look for the container directly.
     """
-    root_locator = _first_visible_marker_root(scope, candidates)
+    root_locator = None
+    for selector in candidates:
+        matches = scope.locator(selector)
+        for index in range(matches.count()):
+            candidate = matches.nth(index)
+            if not candidate.is_visible():
+                continue
+            tag = candidate.evaluate("element => element.tagName.toLowerCase()")
+            if tag in {"a", "button", "input", "select", "textarea"}:
+                continue
+            root_locator = candidate
+            break
+        if root_locator is not None:
+            break
+    if root_locator is None:
+        return None
     # Resolve root identity, then read outerHTML from the resolved element.
     result = root_locator.evaluate(
         """element => {
@@ -314,7 +329,6 @@ def capture_marker_panel_region(
         root,
         [],
         None,
-        full_html=root.outer_html,
     )
 
 

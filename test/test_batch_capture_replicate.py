@@ -138,6 +138,59 @@ run()
             self.assertTrue((Path(tmp) / "snapshots" / "a_000_001" / "after" / "topology.json").exists())
             browser.close()
 
+    def test_metadata_panel_is_captured_from_target_frame(self):
+        with tempfile.TemporaryDirectory() as tmp, sync_playwright() as playwright:
+            session = LiveCaptureSession(Path(tmp))
+            browser = playwright.chromium.launch()
+            page = browser.new_page(viewport={"width": 800, "height": 600})
+            page.set_content('<iframe id="viewer" style="width:500px;height:400px"></iframe>')
+            frame = page.frames[-1]
+            frame.set_content(
+                '<button id="btn-tags">Tags</button>'
+                '<div id="tagsBox"><div>Patient Name: Example</div></div>'
+            )
+            target = lambda: page.frame_locator("#viewer").locator("#btn-tags")
+
+            session._capture("a_meta", "after", page, target, "Meta 信息工具")
+            topology = json.loads(
+                (Path(tmp) / "snapshots" / "a_meta" / "after" / "topology.json").read_text(encoding="utf-8")
+            )
+            browser.close()
+
+        child = next(document for document in topology["documents"] if document["parent_document_id"] is not None)
+        metadata = next(region for region in child["regions"] if region["region_type"] == "metadata")
+        self.assertEqual(metadata["root"]["attributes"].get("id"), "tagsBox")
+        self.assertIn('id="tagsBox"', metadata["root"]["outer_html"])
+
+    def test_metadata_post_action_waits_for_stable_panel_content(self):
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page()
+            page.set_content(
+                '<button id="btn-tags" onclick="openMetadata()">Tags</button>'
+                '<div id="tagsBox" style="display:none"><div>Patient Name: Example</div></div>'
+                '<script>'
+                'function openMetadata() {'
+                '  const panel = document.querySelector("#tagsBox");'
+                '  panel.style.display = "block";'
+                '  setTimeout(() => panel.insertAdjacentHTML("beforeend", "<div id=late-row>Study Date: 20260812</div>"), 150);'
+                '}'
+                '</script>'
+            )
+            target = lambda: page.locator("#btn-tags")
+            target().click()
+
+            replica_batch.ensure_post_action_state(
+                page,
+                "Meta 信息工具",
+                target,
+                timeout_s=2.0,
+                stable_s=0.2,
+            )
+
+            self.assertEqual(page.locator("#late-row").count(), 1)
+            browser.close()
+
     def test_flow_uses_after_target_when_before_target_is_missing(self):
         source = '''from playwright.sync_api import sync_playwright
 

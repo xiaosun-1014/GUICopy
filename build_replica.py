@@ -112,6 +112,24 @@ def _render_document(
             rendered_nodes.add(member_key)
             if member.dom.attributes.get("id"):
                 rendered_element_ids.add(member.dom.attributes["id"])
+    rendered_metadata_regions: set[str] = set()
+    for region in document.regions:
+        if (
+            region.region_type != "metadata"
+            or not region.root.outer_html
+            or region.region_id in rendered_metadata_regions
+        ):
+            continue
+        rendered_metadata_regions.add(region.region_id)
+        rect = region.root.rect
+        panel_style = (
+            f"position:absolute;left:{rect.x}px;top:{rect.y}px;"
+            f"width:{rect.width}px;height:{rect.height}px;overflow-y:auto;z-index:2;"
+        )
+        parts.append(
+            f'<div data-replica-panel-region="{region.region_id}" style="{panel_style}">'
+            f"{region.root.outer_html}</div>"
+        )
     if back_target is not None:
         parts.append(
             f'<button data-replica-back="{back_target}" style="position:fixed;top:8px;right:8px;z-index:5;'
@@ -229,6 +247,20 @@ def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Pa
         state_root = _state_root(flow, state, output_root)
         main_page = next((page for page in state.pages if page.page_var == "page"), state.pages[0] if state.pages else None)
         main_entry_document_id = main_page.entry_document_id if main_page else ""
+        active_page = next(
+            (page for page in state.pages if page.page_var == state.active_page_var),
+            main_page,
+        )
+        active_entry_document_id = active_page.entry_document_id if active_page else ""
+        active_page_has_metadata = bool(
+            active_page
+            and any(
+                region.region_type == "metadata"
+                for candidate in state.documents
+                if candidate.page_id == active_page.page_id
+                for region in candidate.regions
+            )
+        )
         document_paths = {document.document_id: state_root / _document_path(document, main_entry_document_id) for document in state.documents}
         transitions: dict[str, dict[str, object]] = {}
         for transition in state.transitions:
@@ -264,17 +296,28 @@ def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Pa
                 position = [i for i, s in enumerate(ordered) if s.state_id == state.state_id]
                 if position and position[0] > 0:
                     prev_state = ordered[position[0] - 1]
-                    prev_page = next((p for p in prev_state.pages if p.page_var == "page"), prev_state.pages[0] if prev_state.pages else None)
+                    prev_main_page = next(
+                        (page for page in prev_state.pages if page.page_var == "page"),
+                        prev_state.pages[0] if prev_state.pages else None,
+                    )
+                    prev_page = next(
+                        (page for page in prev_state.pages if page.page_var == prev_state.active_page_var),
+                        prev_main_page,
+                    )
                     if prev_page is not None:
                         prev_doc = next(
                             (d for d in prev_state.documents if d.document_id == prev_page.entry_document_id),
                             prev_state.documents[0] if prev_state.documents else None,
                         )
                         if prev_doc is not None:
-                            back_abs = _state_root(flow, prev_state, output_root) / _document_path(prev_doc, prev_page.entry_document_id)
+                            prev_main_entry_id = prev_main_page.entry_document_id if prev_main_page else ""
+                            back_abs = _state_root(flow, prev_state, output_root) / _document_path(prev_doc, prev_main_entry_id)
             back_target = _relative_url(destination, back_abs) if back_abs is not None else None
-            is_main = document.document_id == main_entry_document_id
-            destination.write_text(_render_document(document, children, output_root, destination, document_paths, asset_paths[(state.state_id, document.document_id)], document_transitions, back_target if is_main else None), encoding="utf-8")
+            show_metadata_back = (
+                document.document_id == active_entry_document_id
+                and active_page_has_metadata
+            )
+            destination.write_text(_render_document(document, children, output_root, destination, document_paths, asset_paths[(state.state_id, document.document_id)], document_transitions, back_target if show_metadata_back else None), encoding="utf-8")
     entrypoint = output_root / "index.html"
     if not entrypoint.exists():
         entrypoint.write_text("<!doctype html><meta charset=\"utf-8\"><title>Empty replica</title>", encoding="utf-8")

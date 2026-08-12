@@ -18,7 +18,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from build_replica import build_replica
-from capture_snapshot import capture_interaction_region, capture_locator_snapshot, capture_marker_interaction_region, capture_page_topology, capture_selector_closure, compute_image_diff, decide_state, marker_region_type
+from capture_snapshot import _MARKER_REGION_CANDIDATES, capture_interaction_region, capture_locator_snapshot, capture_marker_interaction_region, capture_page_topology, capture_selector_closure, compute_image_diff, decide_state, marker_region_type
 from process_runner import ManagedProcess
 from replay_helpers import read_manifest, sha256_file, write_manifest
 from rewrite_script import ActionPlan, parse_action_plan
@@ -82,6 +82,56 @@ def wait_for_post_action_state(
     return False
 
 
+def _metadata_panel_signature(locator_factory: object) -> str | None:
+    try:
+        target = locator_factory()
+        scope = target.locator("xpath=ancestor::html")
+        candidates = _MARKER_REGION_CANDIDATES["Meta 信息工具"][1]
+        for selector in candidates:
+            matches = scope.locator(selector)
+            for index in range(matches.count()):
+                candidate = matches.nth(index)
+                if not candidate.is_visible():
+                    continue
+                payload = candidate.evaluate(
+                    """element => ({
+                        tag: element.tagName.toLowerCase(),
+                        text: (element.innerText || element.textContent || '').trim(),
+                        scrollHeight: element.scrollHeight,
+                    })"""
+                )
+                if payload["tag"] in {"a", "button", "input", "select", "textarea", "html", "body", "main"}:
+                    continue
+                return f'{payload["text"]}\0{payload["scrollHeight"]}'
+    except Exception:
+        return None
+    return None
+
+
+def _wait_for_metadata_panel_state(
+    page: object,
+    locator_factory: object,
+    timeout_s: float,
+    stable_s: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_s
+    previous: str | None = None
+    stable_since: float | None = None
+    while time.monotonic() < deadline:
+        signature = _metadata_panel_signature(locator_factory)
+        now = time.monotonic()
+        if signature is None:
+            previous = None
+            stable_since = None
+        elif signature != previous:
+            previous = signature
+            stable_since = now
+        elif stable_since is not None and now - stable_since >= stable_s:
+            return True
+        page.wait_for_timeout(100)
+    return False
+
+
 def ensure_post_action_state(
     page: object,
     marker_label: str,
@@ -90,6 +140,17 @@ def ensure_post_action_state(
     stable_s: float = 1.0,
 ) -> None:
     """Retry a series transition once when the recorded dblclick did not change UI state."""
+    if marker_label == "Meta 信息工具":
+        if not callable(locator_factory):
+            return
+        try:
+            if locator_factory().count() == 0:
+                return
+        except Exception:
+            return
+        if _wait_for_metadata_panel_state(page, locator_factory, timeout_s, stable_s):
+            return
+        raise TimeoutError(f"post-action state did not stabilize for marker: {marker_label}")
     if wait_for_post_action_state(page, marker_label, timeout_s, stable_s):
         return
     if marker_label == "序列选择" and callable(locator_factory):
@@ -145,6 +206,14 @@ class LiveCaptureSession:
                         target_document = frame_documents[0]
             if target_document is documents[0]:
                 region = capture_marker_interaction_region(page, marker_label, target_document.document_id, target_locator)
+            elif marker_label == "Meta 信息工具":
+                owning_document = target_locator.locator("xpath=ancestor::html")
+                region = capture_marker_interaction_region(
+                    owning_document,
+                    marker_label,
+                    target_document.document_id,
+                    target_locator,
+                )
             else:
                 region = capture_interaction_region(target_locator.locator("xpath=.."), marker_region_type(marker_label), target_document.document_id)
             target_document.regions.append(region)

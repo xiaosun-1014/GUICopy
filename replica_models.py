@@ -170,7 +170,6 @@ class InteractionRegion:
     root: DomNodeSnapshot
     members: list[RegionMember]
     series_collection: SeriesCollectionEvidence | None
-    full_html: str | None = None
 
 
 @dataclass

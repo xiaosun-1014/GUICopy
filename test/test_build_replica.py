@@ -1,4 +1,5 @@
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,6 +23,18 @@ from replica_models import (
     ReplicaState,
     StateEvidence,
 )
+
+
+def _metadata_region(document_id: str) -> InteractionRegion:
+    panel = DomNodeSnapshot(
+        "div",
+        "Patient Metadata",
+        {"id": "tagsBox"},
+        Rect(20, 20, 240, 120, "page_viewport_css"),
+        '<div id="tagsBox">Patient Metadata</div>',
+        {"display": "block"},
+    )
+    return InteractionRegion(f"{document_id}_metadata", "metadata", document_id, panel, [], None)
 
 
 class BuildReplicaTests(unittest.TestCase):
@@ -63,7 +76,54 @@ class BuildReplicaTests(unittest.TestCase):
                 self.assertEqual(page.frame_locator("#viewer").locator("body").count(), 1)
                 browser.close()
 
-    def test_non_entry_page_renders_close_back_button_without_covering_panel(self):
+    def test_metadata_region_renders_complete_scrollable_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir()
+            (root / "assets" / "main.png").write_bytes(b"png")
+            panel = DomNodeSnapshot(
+                "div",
+                "Patient Information Final Metadata Row",
+                {"id": "tagsBox"},
+                Rect(40, 50, 300, 120, "page_viewport_css"),
+                '<div id="tagsBox"><div style="height:300px">Final Metadata Row</div></div>',
+                {"display": "block"},
+            )
+            document = ReplicaDocument(
+                "d_main", "p_main", "page", "main", None, None, None, None,
+                {"width": 800, "height": 600}, 1, "css", 0, 0,
+                "assets/main.png", "main", 3,
+                regions=[InteractionRegion("r_meta", "metadata", "d_main", panel, [], None)],
+            )
+            flow = ReplicaFlow(
+                1, "meta", "recorded.py", "hash", "now", {"width": 800, "height": 600},
+                BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000",
+                [ReplicaState(
+                    "s_000", 0, "", "page",
+                    [ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)],
+                    [document], [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry"),
+                )],
+                [],
+            )
+
+            output = root / "replica"
+            build_replica(flow, root, output)
+            rendered = (output / "index.html").read_text(encoding="utf-8")
+
+            self.assertIn('data-replica-panel-region="r_meta"', rendered)
+            self.assertIn("Final Metadata Row", rendered)
+            self.assertIn("overflow-y:auto", rendered)
+            with ReplicaServer(output) as server, sync_playwright() as playwright:
+                browser = playwright.chromium.launch()
+                page = browser.new_page()
+                page.goto(server.url)
+                scroll_state = page.locator('[data-replica-panel-region="r_meta"]').evaluate(
+                    "element => ({clientHeight: element.clientHeight, scrollHeight: element.scrollHeight})"
+                )
+                self.assertGreater(scroll_state["scrollHeight"], scroll_state["clientHeight"])
+                browser.close()
+
+    def test_non_entry_metadata_page_renders_panel_and_close_back_button(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             assets = root / "assets"; assets.mkdir()
@@ -75,6 +135,7 @@ class BuildReplicaTests(unittest.TestCase):
             doc1 = ReplicaDocument(
                 "d_meta", "p_main", "page", "main", None, None, None, None,
                 {"width": 800, "height": 600}, 1, "css", 0, 0, "assets/main.png", "meta", 3,
+                regions=[_metadata_region("d_meta")],
             )
             flow = ReplicaFlow(
                 1, "meta", "recorded.py", "hash", "now",
@@ -104,9 +165,132 @@ class BuildReplicaTests(unittest.TestCase):
             s1 = (output / "states" / "s_001" / "index.html").read_text(encoding="utf-8")
             self.assertIn("data-replica-back=", s1)
             self.assertIn("关闭", s1)
-            self.assertRegex(s1, r'data-replica-back="[^"]*index\.html"')
-            self.assertNotIn("data-replica-panel", s1)
+            # back must point exactly at the previous state's entry page (s_000 ->
+            # output root index.html), and that target file must actually exist.
+            back_target = re.search(r'data-replica-back="([^"]+)"', s1)
+            self.assertIsNotNone(back_target, "back button must carry a data-replica-back target")
+            self.assertEqual(back_target.group(1), "../../index.html")
+            self.assertTrue((output / "states" / "s_001" / "../../index.html").resolve().is_file())
+            self.assertIn("data-replica-panel-region", s1)
+            self.assertIn("overflow-y:auto", s1)
             self.assertIn("replica-bg", s1)
+
+    def test_back_button_click_navigates_to_previous_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir()
+            (root / "assets" / "main.png").write_bytes(b"png")
+            doc0 = ReplicaDocument(
+                "d_main", "p_main", "page", "main", None, None, None, None,
+                {"width": 800, "height": 600}, 1, "css", 0, 0, "assets/main.png", "main", 3,
+            )
+            doc1 = ReplicaDocument(
+                "d_meta", "p_main", "page", "main", None, None, None, None,
+                {"width": 800, "height": 600}, 1, "css", 0, 0, "assets/main.png", "meta", 3,
+                regions=[_metadata_region("d_meta")],
+            )
+            flow = ReplicaFlow(
+                1, "meta", "recorded.py", "hash", "now",
+                {"width": 800, "height": 600},
+                BootstrapPlan(1, 1, True, {}), [],
+                CaptureTimingProfile(), "s_000",
+                [
+                    ReplicaState(
+                        "s_000", 0, "", "page",
+                        [ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)],
+                        [doc0], [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry"),
+                    ),
+                    ReplicaState(
+                        "s_001", 1, "", "page",
+                        [ReplicaPage("p_main", "page", "main", None, None, "d_meta", True, False)],
+                        [doc1], [], StateEvidence(True, False, False, False, 0, 0, 0, 0, "nav"),
+                    ),
+                ],
+                [],
+            )
+            output = root / "replica"
+            build_replica(flow, root, output)
+            with ReplicaServer(output) as server, sync_playwright() as playwright:
+                browser = playwright.chromium.launch()
+                page = browser.new_page()
+                state_url = server.url.replace("/index.html", "/states/s_001/index.html")
+                page.goto(state_url)
+                self.assertEqual(page.locator('[data-replica-back]').count(), 1)
+                with page.expect_navigation() as nav:
+                    page.click('[data-replica-back]')
+                self.assertTrue(nav.value.url == server.url, f"expected back to entry page, got {nav.value.url}")
+                browser.close()
+
+    def test_non_metadata_state_has_no_close_button(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir()
+            (root / "assets" / "main.png").write_bytes(b"png")
+            page_model = ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)
+            evidence = StateEvidence(False, False, False, False, 0, 0, 0, 0, "state")
+            states = []
+            for ordinal in range(2):
+                document = ReplicaDocument(
+                    "d_main", "p_main", "page", "main", None, None, None, None,
+                    {"width": 800, "height": 600}, 1, "css", 0, 0,
+                    "assets/main.png", f"state-{ordinal}", 3,
+                )
+                states.append(ReplicaState(f"s_{ordinal:03d}", ordinal, "", "page", [page_model], [document], [], evidence))
+            flow = ReplicaFlow(
+                1, "plain", "recorded.py", "hash", "now", {"width": 800, "height": 600},
+                BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000", states, [],
+            )
+
+            output = root / "replica"
+            build_replica(flow, root, output)
+
+            rendered = (output / "states" / "s_001" / "index.html").read_text(encoding="utf-8")
+            self.assertNotIn("data-replica-back", rendered)
+
+    def test_metadata_popup_places_close_on_active_popup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir()
+            (root / "assets" / "main.png").write_bytes(b"main")
+            (root / "assets" / "popup.png").write_bytes(b"popup")
+            state0_document = ReplicaDocument(
+                "d_main", "p_main", "page", "main", None, None, None, None,
+                {"width": 800, "height": 600}, 1, "css", 0, 0,
+                "assets/main.png", "main", 4,
+            )
+            state1_main = ReplicaDocument(
+                "d_main", "p_main", "page", "main", None, None, None, None,
+                {"width": 800, "height": 600}, 1, "css", 0, 0,
+                "assets/main.png", "main", 4,
+            )
+            state1_popup = ReplicaDocument(
+                "d_popup", "p_popup", "page1", "popup", None, None, None, None,
+                {"width": 640, "height": 480}, 1, "css", 0, 0,
+                "assets/popup.png", "popup", 5,
+                regions=[_metadata_region("d_popup")],
+            )
+            main_page = ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)
+            popup_page = ReplicaPage("p_popup", "page1", "popup", "p_main", "viewer", "d_popup", True, False)
+            evidence = StateEvidence(False, False, False, False, 0, 0, 0, 0, "state")
+            flow = ReplicaFlow(
+                1, "popup-meta", "recorded.py", "hash", "now", {"width": 800, "height": 600},
+                BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000",
+                [
+                    ReplicaState("s_000", 0, "", "page", [main_page], [state0_document], [], evidence),
+                    ReplicaState("s_001", 1, "", "page1", [main_page, popup_page], [state1_main, state1_popup], [], evidence),
+                ],
+                [],
+            )
+
+            output = root / "replica"
+            build_replica(flow, root, output)
+            state_root = output / "states" / "s_001"
+            main_html = (state_root / "index.html").read_text(encoding="utf-8")
+            popup_html = (state_root / "pages" / "p_popup" / "index.html").read_text(encoding="utf-8")
+
+            self.assertNotIn("data-replica-back", main_html)
+            self.assertIn("data-replica-back", popup_html)
+            self.assertIn("index.html", popup_html)
 
     def test_same_document_id_uses_state_specific_screenshot_assets(self):
         with tempfile.TemporaryDirectory() as tmp:

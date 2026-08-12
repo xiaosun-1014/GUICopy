@@ -130,12 +130,14 @@ class CaptureSnapshotTests(unittest.TestCase):
 
         self.assertIsNotNone(region)
         self.assertEqual(region.region_type, "metadata")
-        self.assertIn("tagsBox", region.full_html)
-        self.assertIn("Patient Name(x00100010)", region.full_html)
-        self.assertIn("20260723", region.full_html)
-        self.assertIn("Study Information", region.full_html)
+        # The full panel HTML is preserved on the region root (full_html was a
+        # redundant alias of root.outer_html and has been removed).
+        self.assertIn("tagsBox", region.root.outer_html)
+        self.assertIn("Patient Name(x00100010)", region.root.outer_html)
+        self.assertIn("20260723", region.root.outer_html)
+        self.assertIn("Study Information", region.root.outer_html)
         # The panel root resolved to tagsBox (id matches [id*='tags']).
-        self.assertIn('id="tagsBox"', region.full_html)
+        self.assertIn('id="tagsBox"', region.root.outer_html)
 
 
 if __name__ == "__main__":
