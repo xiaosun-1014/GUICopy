@@ -156,6 +156,63 @@ class PipelineGuiTests(unittest.TestCase):
         self.assertEqual(annotations["markers"][0]["marker_id"], "anchor-1")
         self.assertEqual(annotations["markers"][0]["line"], 2)
 
+    # ---- D3 / operation selection ----
+
+    def test_operation_combo_defaults_to_full_and_passes_operation_arg(self):
+        _mark_recording(self.window)
+        self.assertEqual(self.window.replica_operation_combo.currentData(), "full")
+        with tempfile.TemporaryDirectory() as tmp:
+            recording = Path(tmp) / "out" / "ftimage" / "processed_script_ftimage.py"
+            self.window.output_input.setText(str(recording))
+            self.window._on_save()
+            with patch("main_gui.QProcess.start"):
+                self.window._on_export_replica()
+            args = self.window._export_process.arguments()
+            self.assertEqual(args[args.index("--operation") + 1], "full")
+
+    def test_capture_build_option_passes_operation_arg(self):
+        _mark_recording(self.window)
+        self.window.replica_operation_combo.setCurrentIndex(
+            self.window.replica_operation_combo.findData("capture-build")
+        )
+        self.assertEqual(self.window.replica_operation_combo.currentData(), "capture-build")
+        with tempfile.TemporaryDirectory() as tmp:
+            recording = Path(tmp) / "out" / "ftimage" / "processed_script_ftimage.py"
+            self.window.output_input.setText(str(recording))
+            self.window._on_save()
+            with patch("main_gui.QProcess.start"):
+                self.window._on_export_replica()
+            args = self.window._export_process.arguments()
+            self.assertEqual(args[args.index("--operation") + 1], "capture-build")
+
+    def test_operation_combo_disabled_during_export_reenabled_after(self):
+        _mark_recording(self.window)
+        with tempfile.TemporaryDirectory() as tmp:
+            recording = Path(tmp) / "out" / "ftimage" / "processed_script_ftimage.py"
+            self.window.output_input.setText(str(recording))
+            self.window._on_save()
+            with patch("main_gui.QProcess.start"):
+                self.window._on_export_replica()
+            # during export the operation combo is locked (like replica_auth_mode)
+            self.assertFalse(self.window.replica_operation_combo.isEnabled())
+            # resume: mock a terminal success report then finish
+            report = Path(tmp) / "pipeline_report.json"
+            report.write_text('{"status":"success"}', encoding="utf-8")
+            self.window._final_pipeline_report = report
+            self.window._on_export_finished(0, object())
+            self.assertTrue(self.window.replica_operation_combo.isEnabled())
+
+    def test_capture_build_success_does_not_depend_on_adapter_artifact(self):
+        _mark_recording(self.window)
+        # A capture-build run never produces completed_<hospital>.py; the GUI
+        # completion judgment reads only pipeline_report.json terminal status.
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "pipeline_report.json"
+            report.write_text('{"status":"partial"}', encoding="utf-8")
+            self.window._final_pipeline_report = report
+            self.window._on_export_finished(0, object())
+            self.assertIn("离线复刻完成", self.window.statusBar().currentMessage())
+
     # ---- D3 marker_result / summary consumption ----
 
     def test_marker_result_upsert_updates_counts(self):

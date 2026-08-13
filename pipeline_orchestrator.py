@@ -141,7 +141,7 @@ def _prepare_full_run(config: PipelineConfig, layout: RunLayout) -> PipelineConf
     )
 
 
-def validate_resume_prerequisites(layout: RunLayout, operation: str) -> None:
+def validate_resume_prerequisites(layout: RunLayout, hospital: str, operation: str) -> None:
     """Enforce the exact per-operation resume gates (see task brief)."""
     if operation == "adapter-only":
         if not layout.source_dir.is_dir() or not any(layout.source_dir.iterdir()):
@@ -150,10 +150,11 @@ def validate_resume_prerequisites(layout: RunLayout, operation: str) -> None:
         if not (layout.capture_dir / "manifest.json").is_file():
             raise ValueError("resume replica-build requires capture/manifest.json")
     elif operation == "offline-validation":
+        completed_adapter = layout.adapter_dir / f"completed_{hospital}.py"
         missing = [
             path
             for path in (
-                layout.adapter_dir / "completed_offline.py",
+                completed_adapter,
                 layout.capture_dir / "manifest.json",
                 layout.replica_dir / "index.html",
             )
@@ -542,7 +543,9 @@ class PipelineController:
         run_id: str | None = None,
         operation: str = "full",
     ) -> None:
-        if operation not in {"full", "adapter-only", "replica-build", "offline-validation"}:
+        if operation not in {
+            "full", "adapter-only", "replica-build", "offline-validation", "capture-build",
+        }:
             raise ValueError("unsupported pipeline operation")
         self.config = config
         self.emit = emit or (lambda event: None)
@@ -561,14 +564,14 @@ class PipelineController:
             self.layout = create_run_layout(
                 config.output_root, config.hospital, self.run_id
             )
-            if operation == "full":
+            if operation in {"full", "capture-build"}:
                 self.config = _prepare_full_run(config, self.layout)
         else:
             self.run_id = run_id
             self.layout = load_existing_run_layout(
                 config.output_root, config.hospital, run_id
             )
-            validate_resume_prerequisites(self.layout, operation)
+            validate_resume_prerequisites(self.layout, config.hospital, operation)
 
         self.store = PipelineStore(self.layout)
 
@@ -726,6 +729,24 @@ def _stage_plan(c: PipelineController):
              lambda: run_replica_validation(config, layout, c)),
             (PipelineStage.ADAPTER_VALIDATION, "offline_external_request",
              lambda: run_adapter_validation(config, layout, c, marker_names())),
+        ]
+    elif c.operation == "capture-build":
+        plan += [
+            (PipelineStage.PREFLIGHT, "preflight",
+             lambda: run_preflight_stage(config, layout, c)),
+        ]
+
+        def _cb_capture():
+            res = run_capture(config, layout, c)
+            if res.status == PipelineStatus.SUCCESS and res.artifacts.get("manifest_path"):
+                state["manifest"] = Path(res.artifacts["manifest_path"])
+            return res
+
+        plan += [
+            (PipelineStage.LIVE_CAPTURE, "capture_failure", _cb_capture),
+            (PipelineStage.REPLICA_BUILD, "replica_build", replica_build_fn),
+            (PipelineStage.REPLICA_VALIDATION, "replica_build",
+             lambda: run_replica_validation(config, layout, c)),
         ]
     elif c.operation == "adapter-only":
         plan += [
@@ -996,7 +1017,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--auth-timeout", type=int, default=300)
     parser.add_argument(
         "--operation",
-        choices=["full", "adapter-only", "replica-build", "offline-validation"],
+        choices=["full", "adapter-only", "replica-build", "offline-validation",
+                 "capture-build"],
         default="full",
     )
     parser.add_argument("--run-id", default=None)
@@ -1016,9 +1038,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    if args.operation != "full" and not args.run_id:
+    if args.operation not in {"full", "capture-build"} and not args.run_id:
         parser.error("non-full operation requires --run-id")
-    if args.operation == "full" and args.run_id:
+    if args.operation in {"full", "capture-build"} and args.run_id:
         parser.error("full operation does not take --run-id")
 
     config = _cli_config(args)

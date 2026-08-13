@@ -529,6 +529,9 @@ class MainWindow(QMainWindow):
         self.replica_auth_mode = QComboBox()
         self.replica_auth_mode.addItem("脚本登录", "scripted")
         self.replica_auth_mode.addItem("手动登录", "interactive")
+        self.replica_operation_combo = QComboBox()
+        self.replica_operation_combo.addItem("完整（Adapter + 复刻）", "full")
+        self.replica_operation_combo.addItem("只复刻（跳过 Adapter）", "capture-build")
         self.continue_auth_btn = QPushButton("登录完成，继续")
         self.continue_auth_btn.clicked.connect(self._on_continue_auth)
         self.continue_auth_btn.setEnabled(False)
@@ -544,6 +547,7 @@ class MainWindow(QMainWindow):
         ctrl_row.addWidget(self.export_replica_btn)
         ctrl_row.addWidget(self.cancel_export_btn)
         ctrl_row.addWidget(self.replica_auth_mode)
+        ctrl_row.addWidget(self.replica_operation_combo)
         ctrl_row.addWidget(self.continue_auth_btn)
         ctrl_row.addWidget(self.pin_btn)
         ctrl_row.addWidget(self.clear_btn)
@@ -762,6 +766,7 @@ class MainWindow(QMainWindow):
             "--hospital", hospital,
             "--output-root", str(output_root),
             "--auth-mode", str(self.replica_auth_mode.currentData()),
+            "--operation", str(self.replica_operation_combo.currentData()),
         ])
         process.readyReadStandardOutput.connect(lambda: self._on_export_output("stdout"))
         process.readyReadStandardError.connect(lambda: self._on_export_output("stderr"))
@@ -770,9 +775,14 @@ class MainWindow(QMainWindow):
         self.export_replica_btn.setEnabled(False)
         self.cancel_export_btn.setEnabled(True)
         self.replica_auth_mode.setEnabled(False)
+        self.replica_operation_combo.setEnabled(False)
         process.start()
         self._refresh_annotation_panel()
-        self._show_status("正在生成 Adapter + 离线复刻…", 0)
+        operation = self.replica_operation_combo.currentData()
+        if operation == "capture-build":
+            self._show_status("正在生成离线复刻…", 0)
+        else:
+            self._show_status("正在生成 Adapter + 离线复刻…", 0)
 
     def _on_export_output(self, stream: str) -> None:
         if self._export_process is None:
@@ -896,6 +906,7 @@ class MainWindow(QMainWindow):
         self.cancel_export_btn.setEnabled(False)
         self.continue_auth_btn.setEnabled(False)
         self.replica_auth_mode.setEnabled(True)
+        self.replica_operation_combo.setEnabled(True)
         self._update_export_enabled()
         self._refresh_annotation_panel()
 

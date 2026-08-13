@@ -12,11 +12,16 @@ from pipeline_models import PipelineConfig, PipelineStatus, PipelineStage, Stage
 from orchestrator_events import normalize_child_event
 from pipeline_orchestrator import (
     PipelineController,
+    _build_parser,
+    _prepare_full_run,
+    _stage_plan,
     execute_pipeline_stages,
     exit_code_for,
+    main,
     resume_pipeline,
     run_pipeline,
 )
+from pipeline_io import create_run_layout
 from pipeline_validation import ValidationResult
 
 SUCCESS = PipelineStatus.SUCCESS
@@ -97,6 +102,96 @@ class StageOrderTests(unittest.TestCase):
             self.assertEqual(result.status, SUCCESS)
             self.assertEqual(events[0]["event"], "ready")
             self.assertEqual(events[0]["run_id"], result.run_id)
+
+    def test_capture_build_stage_plan_skips_adapter(self):
+        """capture-build = preflight -> live_capture -> replica_build -> replica_validation.
+
+        It must NOT schedule ADAPTER (generating_adapter) or ADAPTER_VALIDATION
+        (validating_adapter); the pipeline is pure capture + build (no LLM).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(tmp)
+            c = PipelineController(config, operation="capture-build")
+            plan = _stage_plan(c)
+            stages = [stage.value for stage, _cat, _fn in plan]
+            self.assertEqual(
+                stages,
+                ["preflight", "capturing_live", "building_replica", "validating_replica"],
+            )
+            self.assertNotIn("generating_adapter", stages)
+            self.assertNotIn("validating_adapter", stages)
+
+
+class CliRunIdRulesTests(unittest.TestCase):
+    """CLI run-id rules exercised through main() / _build_parser (not just the
+    controller): capture-build behaves like full (new run, no --run-id)."""
+
+    _BASE = [
+        "--script", "processed_fixture.py",
+        "--annotations", "annotations_fixture.json",
+        "--hospital", "fixture",
+        "--output-root", "out",
+    ]
+
+    def test_capture_build_without_run_id_is_accepted(self):
+        argv = self._BASE + ["--operation", "capture-build"]
+        args = _build_parser().parse_args(argv)
+        self.assertEqual(args.operation, "capture-build")
+        self.assertIsNone(args.run_id)
+
+    def test_capture_build_with_run_id_is_rejected(self):
+        argv = self._BASE + ["--operation", "capture-build", "--run-id", "run-x"]
+        with self.assertRaises(SystemExit) as ctx:
+            main(argv)
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_full_with_run_id_is_rejected(self):
+        argv = self._BASE + ["--operation", "full", "--run-id", "run-x"]
+        with self.assertRaises(SystemExit) as ctx:
+            main(argv)
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_non_full_without_run_id_is_rejected(self):
+        for op in ("adapter-only", "replica-build", "offline-validation"):
+            argv = self._BASE + ["--operation", op]
+            with self.assertRaises(SystemExit) as ctx:
+                main(argv)
+            self.assertEqual(ctx.exception.code, 2, f"operation {op} should be rejected")
+
+    def test_main_accepts_capture_build_and_mints_new_run(self):
+        """A bare main() capture-build must reach controller construction (new
+        run path), not hit the parser.error gate."""
+        class _FakeResult:
+            status = SUCCESS
+            run_id = "r1"
+
+        class _FakeController:
+            def __init__(self, config, emit=None, run_id=None, operation="full"):
+                self._emit = emit
+                self.active_process = None
+
+            def send_command(self, command):
+                pass
+
+            def run(self):
+                return _FakeResult()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "processed_fixture.py"
+            script.write_text("# [MARKER: 报告截图]\n", encoding="utf-8")
+            ann = Path(tmp) / "annotations_fixture.json"
+            ann.write_text("{}", encoding="utf-8")
+            out_root = Path(tmp) / "out"
+            argv = [
+                "--script", str(script),
+                "--annotations", str(ann),
+                "--hospital", "fixture",
+                "--output-root", str(out_root),
+                "--operation", "capture-build",
+            ]
+            with patch("pipeline_orchestrator.PipelineController", _FakeController):
+                code = main(argv)
+            self.assertEqual(code, 0)  # no parser.error; new-run path executed
 
 
 class StatusSemanticsTests(unittest.TestCase):
@@ -299,7 +394,8 @@ class ResumeTests(unittest.TestCase):
             (run_root / "logs").mkdir(parents=True)
             (run_root / "replica" / "index.html").write_text("<html></html>", encoding="utf-8")
             (run_root / "capture" / "manifest.json").write_text("{}", encoding="utf-8")
-            (run_root / "adapter" / "completed_offline.py").write_text("x", encoding="utf-8")
+            # Resume gate requires the real hospital-named adapter (completed_<hospital>.py).
+            (run_root / "adapter" / "completed_fixture.py").write_text("x", encoding="utf-8")
             with patch("pipeline_orchestrator.capture_to_manifest") as capture, \
                  _patches_for(config, config.output_root / "fixture" / "runs"):
                 result = resume_pipeline(config, "run-offline",
@@ -320,6 +416,44 @@ class ResumeTests(unittest.TestCase):
             self.assertFalse(any(
                 p.name.startswith("storage_state") for p in result.layout.root.rglob("*")
             ))
+
+    def test_capture_build_is_not_resumable(self):
+        """capture-build is a new-run operation: it is deliberately NOT in the
+        validate_resume_prerequisites whitelist, so a --run-id resume must be
+        rejected by the else branch (second line of defense)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(tmp)
+            run_root = config.output_root / "fixture" / "runs" / "run-cb"
+            run_root.mkdir(parents=True)
+            (run_root / "source").mkdir()
+            (run_root / "adapter").mkdir()
+            (run_root / "capture").mkdir()
+            (run_root / "replica").mkdir()
+            (run_root / "validation").mkdir()
+            (run_root / "logs").mkdir()
+            with self.assertRaisesRegex(ValueError, "unsupported pipeline operation"):
+                resume_pipeline(config, run_id="run-cb", operation="capture-build")
+
+    def test_prepare_full_run_normalizes_crlf_source_to_lf(self):
+        """_copy_lf copies text source into the run as LF only.
+
+        Contract: the run copy is LF-normalized, while the inlined
+        ``source_script_sha256`` in annotations is computed against the ORIGINAL
+        file — so a CRLF source would trip preflight's annotations_hash_mismatch
+        (GUI normally saves LF, so this only bites hand-edited CRLF inputs).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(tmp)
+            crlf = "def run():\r\n    page.goto(\"x\")\r\n"
+            config.source_script.write_bytes(crlf.encode("utf-8"))
+            layout = create_run_layout(config.output_root, config.hospital, "run-crlf")
+            effective = _prepare_full_run(config, layout)
+            run_copy_text = effective.source_script.read_text(encoding="utf-8")
+            # LF normalization: no carriage returns survive into the run copy.
+            self.assertNotIn("\r", run_copy_text)
+            self.assertEqual(
+                run_copy_text, "def run():\n    page.goto(\"x\")\n"
+            )
 
 
 class ReportDriverTests(unittest.TestCase):

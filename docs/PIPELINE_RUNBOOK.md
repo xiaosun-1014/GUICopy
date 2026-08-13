@@ -28,9 +28,12 @@
 
 ## 4. 一键操作（GUI）
 
-点「⚙️ 生成 Adapter + 离线复刻」，选择登录方式后点击。GUI 以子进程启动
-`pipeline_orchestrator.py`，事件流（`auth_required` / `auth_completed` /
-各阶段事件 / `completed`）实时回显到面板。
+点「⚙️ 生成 Adapter + 离线复刻」，选择登录方式与运行方式（`完整（Adapter + 复刻）` /
+`只复刻（跳过 Adapter）`）后点击。GUI 以子进程启动 `pipeline_orchestrator.py`，事件流
+（`auth_required` / `auth_completed` / 各阶段事件 / `completed`）实时回显到面板。
+
+> **运行方式**：选「只复刻」→ `--operation capture-build`，仅现场采集 + 构建复刻，跳过 adapter
+> （不烧 LLM API，也不生成 completed adapter）；GUI 状态文案动态显示「正在生成离线复刻…」。
 
 ### 登录方式
 
@@ -109,7 +112,16 @@ D:/Anaconda/envs/codegen-marker/python.exe pipeline_orchestrator.py \
 ... --operation offline-validation
 ```
 
-`--operation`：`full | adapter-only | replica-build | offline-validation`。
+`--operation`：`full | capture-build | adapter-only | replica-build | offline-validation`。
+
+- **`full` / `capture-build` 是「新 run」操作**，不接受 `--run-id`（在 §4 / 或首次跑复刻的 CLI 用）。
+  `capture-build` = `preflight → 现场采集 → 复刻构建 → 复刻校验`，**跳过 adapter**（不烧 LLM API），
+  也**不生成** `completed_{医院}.py`。
+- **`adapter-only` / `replica-build` / `offline-validation` 是「重跑」操作**，必须带 `--run-id` 续跑既有 run。
+- **`offline-validation` 的 resume gate** 前置文件是 `adapter/completed_{医院}.py`（医院真名，非固定
+  `completed_offline.py`；离线 runner 由该 stage 现场生成）。同一 run 想闭环 adapter 驱动的离线校验，
+  先 `adapter-only` 生成 `completed_{医院}.py`，再 `offline-validation`。
+
 `--auth-mode`：`scripted | interactive | storage-state`。
 命令行可选 `--model`（LLM 模型）、`--retry`（Adapter 重试次数，默认 3）、
 `--capture-timeout`（现场采集超时，默认 900s）、`--auth-timeout`（默认 300s）。
