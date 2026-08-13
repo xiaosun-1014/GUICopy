@@ -2,6 +2,7 @@
 and the D4 event protocol. All external stages are mocked; no real browser or
 LLM is ever launched."""
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -22,6 +23,7 @@ from pipeline_orchestrator import (
     run_pipeline,
 )
 from pipeline_io import create_run_layout
+from pipeline_preflight import run_preflight
 from pipeline_validation import ValidationResult
 
 SUCCESS = PipelineStatus.SUCCESS
@@ -121,6 +123,28 @@ class StageOrderTests(unittest.TestCase):
             self.assertNotIn("generating_adapter", stages)
             self.assertNotIn("validating_adapter", stages)
 
+    def test_capture_build_executes_without_adapter_functions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(tmp)
+            layout = config.output_root / "fixture" / "runs"
+            with _patches_for(config, layout), \
+                 patch("pipeline_orchestrator.run_adapter_generation") as adapter, \
+                 patch("pipeline_orchestrator.run_adapter_validation") as validation:
+                result = PipelineController(config, operation="capture-build").run()
+            self.assertEqual(result.status, SUCCESS)
+            self.assertEqual(
+                [stage.stage for stage in result.stages],
+                [
+                    PipelineStage.PREFLIGHT,
+                    PipelineStage.LIVE_CAPTURE,
+                    PipelineStage.REPLICA_BUILD,
+                    PipelineStage.REPLICA_VALIDATION,
+                    PipelineStage.REPORT,
+                ],
+            )
+            adapter.assert_not_called()
+            validation.assert_not_called()
+
 
 class CliRunIdRulesTests(unittest.TestCase):
     """CLI run-id rules exercised through main() / _build_parser (not just the
@@ -158,24 +182,16 @@ class CliRunIdRulesTests(unittest.TestCase):
                 main(argv)
             self.assertEqual(ctx.exception.code, 2, f"operation {op} should be rejected")
 
+    def test_controller_rejects_resume_operations_without_run_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(tmp)
+            for operation in ("adapter-only", "replica-build", "offline-validation"):
+                with self.subTest(operation=operation):
+                    with self.assertRaisesRegex(ValueError, "requires run_id"):
+                        PipelineController(config, operation=operation)
+
     def test_main_accepts_capture_build_and_mints_new_run(self):
-        """A bare main() capture-build must reach controller construction (new
-        run path), not hit the parser.error gate."""
-        class _FakeResult:
-            status = SUCCESS
-            run_id = "r1"
-
-        class _FakeController:
-            def __init__(self, config, emit=None, run_id=None, operation="full"):
-                self._emit = emit
-                self.active_process = None
-
-            def send_command(self, command):
-                pass
-
-            def run(self):
-                return _FakeResult()
-
+        """A bare main() capture-build mints a run and persists immutable input."""
         with tempfile.TemporaryDirectory() as tmp:
             script = Path(tmp) / "processed_fixture.py"
             script.write_text("# [MARKER: 报告截图]\n", encoding="utf-8")
@@ -189,9 +205,19 @@ class CliRunIdRulesTests(unittest.TestCase):
                 "--output-root", str(out_root),
                 "--operation", "capture-build",
             ]
-            with patch("pipeline_orchestrator.PipelineController", _FakeController):
+            with _patches_for(config=PipelineConfig(
+                "fixture", script, ann, out_root
+            ), layout=out_root / "fixture" / "runs"), \
+                 patch("pipeline_orchestrator._stdin_command_reader"):
                 code = main(argv)
-            self.assertEqual(code, 0)  # no parser.error; new-run path executed
+            self.assertEqual(code, 0)
+            runs = list((out_root / "fixture" / "runs").iterdir())
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(
+                (runs[0] / "source" / script.name).read_text(encoding="utf-8"),
+                script.read_text(encoding="utf-8"),
+            )
+            self.assertTrue((runs[0] / "source" / ann.name).is_file())
 
 
 class StatusSemanticsTests(unittest.TestCase):
@@ -403,6 +429,55 @@ class ResumeTests(unittest.TestCase):
             capture.assert_not_called()
             self.assertIn(result.status, {SUCCESS, PARTIAL})
 
+    def test_adapter_only_then_offline_validation_passes_same_run_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(tmp)
+            layout_root = config.output_root / "fixture" / "runs"
+
+            def capture_fn(_config, layout, _controller):
+                manifest = layout.capture_dir / "manifest.json"
+                manifest.write_text("{}", encoding="utf-8")
+                return StageResult(
+                    PipelineStage.LIVE_CAPTURE, SUCCESS,
+                    artifacts={"manifest_path": str(manifest)},
+                )
+
+            def build_fn(_config, layout, _controller, _manifest):
+                entrypoint = layout.replica_dir / "index.html"
+                entrypoint.write_text("<html></html>", encoding="utf-8")
+                return StageResult(
+                    PipelineStage.REPLICA_BUILD, SUCCESS,
+                    artifacts={"entrypoint": str(entrypoint)},
+                )
+
+            def adapter_fn(_config, layout, _controller):
+                completed = layout.adapter_dir / "completed_fixture.py"
+                completed.write_text("x", encoding="utf-8")
+                return StageResult(
+                    PipelineStage.ADAPTER, SUCCESS,
+                    artifacts={"completed": str(completed)},
+                )
+
+            with _patches_for(config, layout_root), \
+                 patch("pipeline_orchestrator.run_capture", capture_fn), \
+                 patch("pipeline_orchestrator.run_replica_build", build_fn):
+                initial = PipelineController(config, operation="capture-build").run()
+            with _patches_for(config, layout_root), \
+                 patch("pipeline_orchestrator.run_adapter_generation", adapter_fn):
+                adapted = resume_pipeline(
+                    config, initial.run_id, operation="adapter-only"
+                )
+            with patch("pipeline_orchestrator.capture_to_manifest") as capture, \
+                 _patches_for(config, layout_root):
+                validated = resume_pipeline(
+                    config, initial.run_id, operation="offline-validation"
+                )
+
+            self.assertEqual(adapted.run_id, initial.run_id)
+            self.assertEqual(validated.run_id, initial.run_id)
+            capture.assert_not_called()
+            self.assertIn(validated.status, {SUCCESS, PARTIAL})
+
     def test_new_full_run_copies_source_into_immutable_run_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = make_config(tmp)
@@ -454,6 +529,26 @@ class ResumeTests(unittest.TestCase):
             self.assertEqual(
                 run_copy_text, "def run():\n    page.goto(\"x\")\n"
             )
+
+    def test_preflight_reports_hash_mismatch_after_crlf_source_is_normalized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(tmp)
+            crlf = "# [MARKER: 报告截图]\r\npage.locator('#open-viewer').click()\r\n"
+            config.source_script.write_bytes(crlf.encode("utf-8"))
+            config.annotations_path.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "source_script_sha256": hashlib.sha256(crlf.encode("utf-8")).hexdigest(),
+                    "markers": [
+                        {"marker_id": "m-1", "line": 1, "label": "报告截图"}
+                    ],
+                }),
+                encoding="utf-8",
+            )
+            layout = create_run_layout(config.output_root, config.hospital, "run-crlf")
+            effective = _prepare_full_run(config, layout)
+            result = run_preflight(effective)
+            self.assertIn("annotations_hash_mismatch", result.errors)
 
 
 class ReportDriverTests(unittest.TestCase):

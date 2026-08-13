@@ -547,6 +547,8 @@ class PipelineController:
             "full", "adapter-only", "replica-build", "offline-validation", "capture-build",
         }:
             raise ValueError("unsupported pipeline operation")
+        if operation in {"adapter-only", "replica-build", "offline-validation"} and run_id is None:
+            raise ValueError(f"{operation} operation requires run_id")
         self.config = config
         self.emit = emit or (lambda event: None)
         self.operation = operation
@@ -1041,7 +1043,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.operation not in {"full", "capture-build"} and not args.run_id:
         parser.error("non-full operation requires --run-id")
     if args.operation in {"full", "capture-build"} and args.run_id:
-        parser.error("full operation does not take --run-id")
+        parser.error("full/capture-build operations do not take --run-id")
 
     config = _cli_config(args)
     emit = lambda event: print(json.dumps(event, ensure_ascii=False), flush=True)

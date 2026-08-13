@@ -532,6 +532,9 @@ class MainWindow(QMainWindow):
         self.replica_operation_combo = QComboBox()
         self.replica_operation_combo.addItem("完整（Adapter + 复刻）", "full")
         self.replica_operation_combo.addItem("只复刻（跳过 Adapter）", "capture-build")
+        self.replica_operation_combo.currentIndexChanged.connect(
+            self._update_replica_operation_text
+        )
         self.continue_auth_btn = QPushButton("登录完成，继续")
         self.continue_auth_btn.clicked.connect(self._on_continue_auth)
         self.continue_auth_btn.setEnabled(False)
@@ -730,15 +733,21 @@ class MainWindow(QMainWindow):
         """
         if not self.export_replica_btn.isEnabled():
             return
+        operation = self.replica_operation_combo.currentData()
+        action_name = (
+            "生成离线复刻"
+            if operation == "capture-build"
+            else "生成 Adapter + 离线复刻"
+        )
         try:
             interpreter = replica_python_executable()
         except RuntimeError as error:
-            QMessageBox.critical(self, "无法生成 Adapter + 离线复刻", str(error))
+            QMessageBox.critical(self, f"无法{action_name}", str(error))
             self._show_status("已中止：缺少复制子进程解释器", 5000)
             return
         errors = export_preflight_errors(self._latest_code)
         if errors:
-            QMessageBox.warning(self, "无法生成 Adapter + 离线复刻", "\n".join(errors))
+            QMessageBox.warning(self, f"无法{action_name}", "\n".join(errors))
             return
         recording_path = Path(self.output_input.text().strip() or self.DEFAULT_OUTPUT).resolve()
         # persist the source + annotations (run copies are made by the orchestrator)
@@ -766,23 +775,43 @@ class MainWindow(QMainWindow):
             "--hospital", hospital,
             "--output-root", str(output_root),
             "--auth-mode", str(self.replica_auth_mode.currentData()),
-            "--operation", str(self.replica_operation_combo.currentData()),
+            "--operation", str(operation),
         ])
         process.readyReadStandardOutput.connect(lambda: self._on_export_output("stdout"))
         process.readyReadStandardError.connect(lambda: self._on_export_output("stderr"))
         process.finished.connect(self._on_export_finished)
+        process.errorOccurred.connect(self._on_export_error)
         self._export_process = process
         self.export_replica_btn.setEnabled(False)
         self.cancel_export_btn.setEnabled(True)
         self.replica_auth_mode.setEnabled(False)
         self.replica_operation_combo.setEnabled(False)
         process.start()
+        if self._export_process is not process:
+            return
         self._refresh_annotation_panel()
-        operation = self.replica_operation_combo.currentData()
         if operation == "capture-build":
             self._show_status("正在生成离线复刻…", 0)
         else:
             self._show_status("正在生成 Adapter + 离线复刻…", 0)
+
+    def _on_export_error(self, error: QProcess.ProcessError) -> None:
+        """Restore export controls when the child process cannot be started."""
+        if error != QProcess.ProcessError.FailedToStart:
+            return
+        detail = (
+            self._export_process.errorString()
+            if self._export_process is not None
+            else "子进程无法启动"
+        )
+        self._export_process = None
+        self.cancel_export_btn.setEnabled(False)
+        self.continue_auth_btn.setEnabled(False)
+        self.replica_auth_mode.setEnabled(True)
+        self.replica_operation_combo.setEnabled(True)
+        self._update_export_enabled()
+        self._refresh_annotation_panel()
+        self._show_status(f"离线复刻启动失败：{detail}", 5000)
 
     def _on_export_output(self, stream: str) -> None:
         if self._export_process is None:
@@ -979,6 +1008,12 @@ class MainWindow(QMainWindow):
         has_marker = any(item["type"] == "marker" for item in self._display_items)
         is_saved = self._saved_source_hash == hashlib.sha256(self._latest_code.encode("utf-8")).hexdigest()
         self.export_replica_btn.setEnabled(bool(self._latest_code and has_marker and is_saved and self._manager is None and self._export_process is None))
+
+    def _update_replica_operation_text(self) -> None:
+        if self.replica_operation_combo.currentData() == "capture-build":
+            self.export_replica_btn.setText("⚙️ 生成离线复刻")
+        else:
+            self.export_replica_btn.setText("⚙️ 生成 Adapter + 离线复刻")
 
     def _on_clear(self) -> None:
         self._display_items.clear()

@@ -16,6 +16,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from PyQt6.QtCore import QProcess
 from PyQt6.QtWidgets import QApplication
 
 from main_gui import MainWindow, build_annotations_from_source
@@ -184,6 +185,45 @@ class PipelineGuiTests(unittest.TestCase):
                 self.window._on_export_replica()
             args = self.window._export_process.arguments()
             self.assertEqual(args[args.index("--operation") + 1], "capture-build")
+            self.assertEqual(
+                self.window.statusBar().currentMessage(),
+                "正在生成离线复刻…",
+            )
+
+    def test_capture_build_updates_button_and_preflight_dialog_text(self):
+        _mark_recording(self.window)
+        self.window.replica_operation_combo.setCurrentIndex(
+            self.window.replica_operation_combo.findData("capture-build")
+        )
+        self.assertEqual(self.window.export_replica_btn.text(), "⚙️ 生成离线复刻")
+        with tempfile.TemporaryDirectory() as tmp:
+            recording = Path(tmp) / "out" / "ftimage" / "processed_script_ftimage.py"
+            self.window.output_input.setText(str(recording))
+            self.window._on_save()
+            with patch(
+                "main_gui.replica_python_executable", side_effect=RuntimeError("missing")
+            ), patch("main_gui.QMessageBox.critical") as critical:
+                self.window._on_export_replica()
+        self.assertEqual(critical.call_args.args[1], "无法生成离线复刻")
+
+    def test_failed_to_start_restores_export_controls(self):
+        _mark_recording(self.window)
+        with tempfile.TemporaryDirectory() as tmp:
+            recording = Path(tmp) / "out" / "ftimage" / "processed_script_ftimage.py"
+            self.window.output_input.setText(str(recording))
+            self.window._on_save()
+            with patch(
+                "main_gui.QProcess.start",
+                side_effect=lambda: self.window._on_export_error(
+                    QProcess.ProcessError.FailedToStart
+                ),
+            ):
+                self.window._on_export_replica()
+        self.assertIsNone(self.window._export_process)
+        self.assertTrue(self.window.export_replica_btn.isEnabled())
+        self.assertTrue(self.window.replica_auth_mode.isEnabled())
+        self.assertTrue(self.window.replica_operation_combo.isEnabled())
+        self.assertIn("离线复刻启动失败", self.window.statusBar().currentMessage())
 
     def test_operation_combo_disabled_during_export_reenabled_after(self):
         _mark_recording(self.window)
