@@ -9,6 +9,7 @@
   - `three-stage-workflow.md` — 三阶段工作流与调试原则
   - `loop-stop-hook-json-validation.md` — `/loop` Stop hook 报 "JSON validation failed" 的根因与规避
   - `sdd-closeout-experience.md` — SDD 计划收尾执行经验（re-review → 关 task → final review triage → push）
+  - `codex-windows-sandbox-1385.md` — cc 调 codex 报 `CreateProcessWithLogonW 1385` 的根因与修复（`~/.codex/config.toml` 的 `windows.sandbox=elevated` 在本机不可用，改 `unelevated` 并重启会话）
 - **本文件（CLAUDE.md）** — 项目核心上下文，整合所有记忆的要点
 
 不再使用系统级（AppData）记忆存储。如需添加或更新记忆，直接编辑 `memory/` 下的对应文件，并同步更新 CLAUDE.md 中的相关章节。
