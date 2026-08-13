@@ -45,6 +45,25 @@ class ManagedProcessResult:
     cancelled: bool = False
 
 
+def _child_env(explicit_env: Mapping[str, str] | None) -> dict[str, str] | None:
+    """Build the child environment, forcing UTF-8 stdio regardless of host locale.
+
+    Children emit UTF-8 JSON events on stdout (e.g. adapter marker events whose
+    names are Chinese). On a Windows host without ``PYTHONIOENCODING`` set, the
+    child's ``sys.stdout`` defaults to the ANSI code page (GBK), and printing a
+    JSON string that already contains the UTF-8 replacement char ``\\ufffd``
+    raises ``'gbk' codec can't encode character '\\ufffd'`` mid-stream. Force
+    UTF-8 I/O (and UTF-8 mode) so no GBK console/locale can crash the child.
+    """
+    if explicit_env is None:
+        env = dict(os.environ)
+    else:
+        env = dict(explicit_env)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env.setdefault("PYTHONUTF8", "1")
+    return env
+
+
 @dataclass
 class ManagedProcess:
     """Spawn and supervise one child process, reading both streams concurrently.
@@ -99,7 +118,7 @@ class ManagedProcess:
         process = subprocess.Popen(
             list(self.args),
             cwd=self.cwd,
-            env=dict(self.env) if self.env is not None else None,
+            env=_child_env(self.env),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
