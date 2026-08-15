@@ -49,6 +49,45 @@ KNOWN_QUERY_SECRET_KEYS = {
     "id_token", "session", "cookie",
 }
 
+_TEXT_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+
+
+def strip_known_query_secrets(text: str) -> str:
+    """Remove credential-bearing query pairs from URLs embedded in text.
+
+    This is intended for persisted post-capture artifacts. Unlike
+    :func:`redact_url`, it removes the sensitive key as well as its value so a
+    later privacy scan cannot mistake a safe placeholder for a live secret.
+    Non-secret query parameters are preserved.
+    """
+    def replace(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        parsed = urlsplit(candidate)
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        fragment_path, separator, fragment_query = parsed.fragment.partition("?")
+        fragment_pairs = parse_qsl(fragment_query, keep_blank_values=True) if separator else []
+        if not any(
+            key.lower() in KNOWN_QUERY_SECRET_KEYS
+            for key, _ in (*query_pairs, *fragment_pairs)
+        ):
+            return candidate
+        safe_query = urlencode([
+            (key, value)
+            for key, value in query_pairs
+            if key.lower() not in KNOWN_QUERY_SECRET_KEYS
+        ])
+        safe_fragment_query = urlencode([
+            (key, value)
+            for key, value in fragment_pairs
+            if key.lower() not in KNOWN_QUERY_SECRET_KEYS
+        ])
+        safe_fragment = fragment_path
+        if separator and safe_fragment_query:
+            safe_fragment += "?" + safe_fragment_query
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, safe_query, safe_fragment))
+
+    return _TEXT_URL_RE.sub(replace, text)
+
 
 def _known_source_query_value(sample: str) -> str | None:
     """Return the first known secret key found in a URL query string.

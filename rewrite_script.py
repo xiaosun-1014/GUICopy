@@ -149,6 +149,12 @@ def _locator_from_expression(expression: ast.AST, page_var: str) -> LocatorRecip
         ordinal_value = int(ordinal_match.group(2)) if ordinal_match.group(2) else None
         source = source[: ordinal_match.start()]
 
+    filter_kwargs: dict[str, Any] = {}
+    filter_match = re.search(r"\.filter\((?P<args>[^()]*)\)$", source)
+    if filter_match:
+        _filter_args, filter_kwargs = _literal_arguments(filter_match.group("args"))
+        source = source[: filter_match.start()]
+
     matches = list(re.finditer(r"\.({})\(".format("|".join(sorted(LOCATOR_METHODS))), source))
     if not matches:
         return None
@@ -165,6 +171,8 @@ def _locator_from_expression(expression: ast.AST, page_var: str) -> LocatorRecip
         "get_by_title": "title",
     }[method]
     locator_args: dict[str, object] = {"args": args, **kwargs}
+    if filter_kwargs:
+        locator_args["_filter"] = filter_kwargs
     return LocatorRecipe(source, page_var, frame_chain, kind, locator_args, ordinal_op, ordinal_value)
 
 
@@ -399,12 +407,16 @@ def _replay_locator_expression(step: dict[str, Any]) -> str:
     expression = f"pages[{locator['page_var']!r}]"
     for hop in locator.get("frame_chain", []):
         expression += f".frame_locator({hop['selector']!r})"
-    args = locator.get("locator_args", {})
+    args = dict(locator.get("locator_args", {}))
+    filter_kwargs = args.pop("_filter", {})
     positional = ", ".join(repr(value) for value in args.get("args", []))
     keywords = ", ".join(f"{key}={value!r}" for key, value in args.items() if key != "args")
     joined = ", ".join(value for value in (positional, keywords) if value)
     methods = {"css": "locator", "role": "get_by_role", "text": "get_by_text", "test_id": "get_by_test_id", "label": "get_by_label", "title": "get_by_title"}
     expression += f".{methods[locator['locator_kind']]}({joined})"
+    if filter_kwargs:
+        filters = ", ".join(f"{key}={value!r}" for key, value in filter_kwargs.items())
+        expression += f".filter({filters})"
     if locator.get("ordinal_op") == "first":
         expression += ".first"
     elif locator.get("ordinal_op") == "last":

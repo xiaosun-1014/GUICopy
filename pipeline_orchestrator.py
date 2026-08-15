@@ -50,7 +50,7 @@ from pipeline_validation import (
     validate_replica,
 )
 from process_runner import ManagedProcess, ManagedProcessResult
-from replay_helpers import read_manifest
+from replay_helpers import read_manifest, sha256_file, strip_known_query_secrets
 from rewrite_script import generate_offline_adapter_script
 from runtime_python import codegen_python_executable
 
@@ -141,6 +141,63 @@ def _prepare_full_run(config: PipelineConfig, layout: RunLayout) -> PipelineConf
         source_script=source_copy,
         annotations_path=annotations_copy,
     )
+
+
+def _scrub_run_query_secrets_after_capture(layout: RunLayout) -> int:
+    """Remove URL query credentials from persisted run artifacts.
+
+    Live capture needs the original shared URL, so scrubbing happens only after
+    the browser subprocess has exited. The capture manifest's provenance hash
+    is then refreshed against its now-scrubbed source copy.
+    """
+    changed = 0
+    text_suffixes = {
+        ".csv", ".html", ".js", ".json", ".jsonl", ".log", ".mjs",
+        ".py", ".txt", ".xml", ".yaml", ".yml",
+    }
+    for path in sorted(layout.root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in text_suffixes:
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        scrubbed = strip_known_query_secrets(text)
+        if scrubbed != text:
+            path.write_text(scrubbed, encoding="utf-8", newline="\n")
+            changed += 1
+
+    manifest_path = layout.capture_dir / "manifest.json"
+    if manifest_path.is_file():
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        source_relpath = str(payload.get("source_script_relpath") or "")
+        source_path = layout.capture_dir / source_relpath
+        if source_relpath and source_path.is_file():
+            current_hash = sha256_file(source_path)
+            if payload.get("source_script_sha256") != current_hash:
+                payload["source_script_sha256"] = current_hash
+                manifest_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                changed += 1
+    source_files = sorted(layout.source_dir.glob("*.py"))
+    if len(source_files) == 1:
+        source_hash = sha256_file(source_files[0])
+        for annotations_path in sorted(layout.source_dir.glob("*.json")):
+            try:
+                annotations = json.loads(annotations_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(annotations, dict) or "source_script_sha256" not in annotations:
+                continue
+            if annotations.get("source_script_sha256") != source_hash:
+                annotations["source_script_sha256"] = source_hash
+                annotations_path.write_text(
+                    json.dumps(annotations, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                changed += 1
+    return changed
 
 
 def validate_resume_prerequisites(layout: RunLayout, hospital: str, operation: str) -> None:
@@ -322,6 +379,15 @@ def run_capture(
         return StageResult(
             PipelineStage.LIVE_CAPTURE, PipelineStatus.CANCELLED, "cancelled"
         )
+    try:
+        scrubbed_files = _scrub_run_query_secrets_after_capture(layout)
+    except Exception as exc:  # noqa: BLE001 - unsafe artifacts must stop the run
+        return StageResult(
+            PipelineStage.LIVE_CAPTURE,
+            PipelineStatus.FAILED,
+            "privacy_violation",
+            f"post_capture_query_scrub_failed:{type(exc).__name__}",
+        )
     event = _last_json_event(result.stdout, "completed")
     manifest_path: Path | None = None
     if event is not None and event.get("entrypoint"):
@@ -349,7 +415,7 @@ def run_capture(
     # only the stage status is downgraded to PARTIAL (never deleting the main
     # recording path nor forcing a hard FAILED for an otherwise-healthy run).
     coverage = controller.series_tracker.coverage()
-    metrics: dict = {}
+    metrics: dict = {"query_secret_files_scrubbed": scrubbed_files}
     status = PipelineStatus.SUCCESS
     message = ""
     error_category: str | None = None
@@ -386,12 +452,17 @@ def run_replica_build(
         )
 
     try:
+        flow = read_manifest(manifest_path, layout.capture_dir)
+        source_path = (layout.capture_dir / flow.source_script_relpath).resolve()
+        source_path.relative_to(layout.capture_dir.resolve())
+        if not source_path.is_file():
+            raise FileNotFoundError("captured source script missing")
         entrypoint = build_from_manifest(
             manifest_path,
             layout.capture_dir,
             layout.replica_dir,
             emit=child_emit,
-            source_path=config.source_script,
+            source_path=source_path,
         )
     except Exception as exc:  # noqa: BLE001 - surfaced as a build failure
         return StageResult(

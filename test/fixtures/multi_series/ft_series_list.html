@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Anonymized FTImage-style series list — os-viewport scroll container</title>
+<style>
+  /* Both os-viewports mirror the OverlayScrollbars container of the real FTImage
+     page: height-constrained with overflow so series below the fold only become
+     visible after a scroll. */
+  .os-viewport {
+    height: 240px; width: 400px; overflow: auto; border: 1px solid #bbb;
+    box-sizing: border-box; background: #fff;
+  }
+  h1 { font-size: 16px; }
+  .muted { color: #888; }
+  .os-viewport a {
+    display: block; height: 32px; box-sizing: border-box; line-height: 30px;
+    padding: 0 8px; border-bottom: 1px solid #eee; text-decoration: none;
+    color: #222; font-size: 13px; white-space: nowrap;
+  }
+  .os-viewport a .total { color: #666; }
+</style>
+</head>
+<body>
+  <h1>Anonymized FTImage-style series list</h1>
+  <p class="muted">
+    Mirrors the FTImage site: series rows are <code>a &gt; div.desc &gt; span.total</code>
+    inside a scrolling <code>div.os-viewport</code> and carry <b>no</b> <code>id</code> /
+    <code>data-*</code> identity attribute, so discovery must fall back to row text.
+    The 8th row (MPR-Sag_bone) starts below the fold and is only enumerated after scrolling.
+    A second, interfering <code>div.os-viewport</code> (no series rows) sits lower in the
+    document to mirror the real page's two os-viewports — the discovery root must be the
+    first one and cannot count interference content.
+  </p>
+
+  <!-- Real series container: FIRST os-viewport in document order, so
+       [class*=os-viewport] .first resolves here (mirrors real site "取 .first").
+       No id / data-* anywhere in the fixture — ft rows have no stable identity. -->
+  <div class="os-viewport">
+    <a href="javascript:;"><div class="desc">Scout</div><span class="total">/共 2张</span></a>
+    <a href="javascript:;"><div class="desc">10.0 x 10.0_lung</div><span class="total">/共 41张</span></a>
+    <a href="javascript:;"><div class="desc">1.0 x 1.0_head</div><span class="total">/共 105张</span></a>
+    <a href="javascript:;"><div class="desc">5.0 x 5.0_chest</div><span class="total">/共 88张</span></a>
+    <a href="javascript:;"><div class="desc">2.0 x 2.0_abdomen</div><span class="total">/共 66张</span></a>
+    <a href="javascript:;"><div class="desc">0.8 x 0.8_pelvis</div><span class="total">/共 200张</span></a>
+    <a href="javascript:;"><div class="desc">1.5 x 1.5_neck</div><span class="total">/共 150张</span></a>
+    <!-- SCROLL-REVEALED: below the fold until the container scrolls. -->
+    <a href="javascript:;"><div class="desc">3.0 x 3.0 MPR-Sag_bone</div><span class="total">/共 131张</span></a>
+  </div>
+
+  <!-- Interfering os-viewport: same container class but NO series rows (no a:has(span.total)).
+       Discovery must stay scoped to the first container and ignore this one. -->
+  <div class="os-viewport" style="margin-top: 12px;">
+    <p style="padding: 8px; font-size: 12px; color: #555;">
+      Interfering OverlayScrollbars viewport (page shows two os-viewports on the real site).
+      Holds unrelated UI text — no <code>a &gt; span.total</code> series rows, so a
+      container-scoped discovery must enumerate 0 items here.
+    </p>
+    <a href="javascript:;" style="display:none;">hidden link without span.total</a>
+  </div>
+</body>
+</html>

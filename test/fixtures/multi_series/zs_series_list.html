@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Anonymized zscloud-style series list — StudyList #HLeftThumnail</title>
+<style>
+  /* The thumbnails scroll container of the zscloud viewer frame. Height-constrained
+     with overflow so the series are enumerated across a scroll like the real site. */
+  #HLeftThumnail {
+    /* ~3 rows visible; the 4th series is below the fold and scroll-revealed. */
+    height: 100px; width: 420px; overflow: auto; border: 1px solid #bbb;
+    box-sizing: border-box; background: #fff; list-style: none; margin: 0; padding: 0;
+  }
+  h1 { font-size: 16px; }
+  .muted { color: #888; }
+  #HLeftThumnail li {
+    display: block; padding: 6px 8px; border-bottom: 1px solid #eee;
+    background: #fff; font-size: 12px; color: #333; cursor: pointer;
+  }
+  #HLeftThumnail li.select { background: #dbe9ff; } /* selected-state mirror */
+  #HLeftThumnail li a { text-decoration: none; color: inherit; }
+  #HLeftThumnail li .countClass { color: #666; }
+  #patient-header { margin-top: 14px; border: 1px dashed #ccc; padding: 8px; }
+  #patient-header li {
+    display: block; padding: 4px 8px; font-size: 12px; color: #555; background: #fafafa;
+  }
+</style>
+</head>
+<body>
+  <h1>Anonymized zscloud-style series list</h1>
+  <p class="muted">
+    Mirrors the zscloud viewer thumbnails: rows are <code>li.ui-draggable</code> inside a
+    scrolling <code>div.StudyList#HLeftThumnail</code>, each with
+    <code>div.thumnailClass &gt; a &gt; i.countClass</code> and an <code>id</code> in the shape
+    of a DICOM SeriesInstanceUID (all values fictional). The 2nd row carries an extra
+    <code>select</code> class token (selected state). Out-of-container
+    <code>li.ui-draggable</code> nodes — the patient-header / examination LI of the real page —
+    live under a different parent and must be excluded by container scoping (they carry
+    no "N幅" sequence text).
+  </p>
+
+  <!-- Root scrolling container (viewer frame): 4 series rows. -->
+  <div class="StudyList" id="HLeftThumnail">
+    <li class="ui-draggable" id="1.2.826.0.1.3680043.201.1001">
+      <div class="thumnailClass"><a href="javascript:;"><span class="desc">5.0 x 5.0 / MPR / 201 / </span><i class="countClass">68幅</i></a></div>
+    </li>
+    <li class="ui-draggable select" id="1.2.826.0.1.3680043.201.1002">
+      <div class="thumnailClass"><a href="javascript:;"><span class="desc">1.0 x 1.0 / AXIAL / 315 / </span><i class="countClass">341幅</i></a></div>
+    </li>
+    <li class="ui-draggable" id="1.2.826.0.1.3680043.201.1003">
+      <div class="thumnailClass"><a href="javascript:;"><span class="desc">2.0 x 2.0 / SAG / 430 / </span><i class="countClass">175幅</i></a></div>
+    </li>
+    <li class="ui-draggable" id="1.2.826.0.1.3680043.201.1004">
+      <div class="thumnailClass"><a href="javascript:;"><span class="desc">0.8 x 0.8 / COR / 512 / </span><i class="countClass">96幅</i></a></div>
+    </li>
+  </div>
+
+  <!-- OUT-OF-CONTAINER nodes: same li.ui-draggable class, different parent. On the real
+       page these are the patient-header / examination LI; container-scoped discovery
+       (root = #HLeftThumnail) must NOT count them. No "N幅" text so they are not
+       confusable with the in-container series rows either. -->
+  <div id="patient-header">
+    <ul style="list-style:none; margin:0; padding:0;">
+      <li class="ui-draggable" id="1.2.826.0.1.3680043.201.9001">
+        <div class="thumnailClass"><a href="javascript:;"><span class="desc">检查信息 / Patient Anon</span></a></div>
+      </li>
+      <li class="ui-draggable" id="1.2.826.0.1.3680043.201.9002">
+        <div class="thumnailClass"><a href="javascript:;"><span class="desc">检查 / 4 序列</span></a></div>
+      </li>
+    </ul>
+  </div>
+</body>
+</html>

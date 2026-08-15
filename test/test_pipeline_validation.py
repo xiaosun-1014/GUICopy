@@ -35,7 +35,7 @@ from replica_models import (
     SeriesExpansionEvidence,
     StateEvidence,
 )
-from replay_helpers import write_manifest
+from replay_helpers import strip_known_query_secrets, write_manifest
 
 
 def _node():
@@ -217,6 +217,44 @@ class ManifestValidationTests(unittest.TestCase):
             result = validate_manifest(flow, root)
         self.assertEqual(result.status, "failed")
         self.assertIn("iframe_parent_missing", result.errors)
+
+    def test_iframe_parent_is_validated_within_each_state(self):
+        states = []
+        for ordinal in range(2):
+            parent = _document(f"d_parent_{ordinal}")
+            child = _document(f"d_child_{ordinal}")
+            child.parent_document_id = parent.document_id
+            states.append(ReplicaState(
+                f"s_{ordinal:03d}", ordinal, "https://example.test/", "page",
+                [ReplicaPage("p_main", "page", "main", None, None, parent.document_id, True, False)],
+                [parent, child], [],
+                StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry"),
+            ))
+        flow = _base_flow(states=states)
+        flow.entry_state_id = states[0].state_id
+        flow.source_script_relpath = ""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir()
+            for state in states:
+                for document in state.documents:
+                    (root / document.screenshot_asset_relpath).write_bytes(b"png")
+            result = validate_manifest(flow, root)
+        self.assertNotIn("iframe_parent_missing", result.errors)
+        self.assertEqual(result.status, "success", result.errors)
+
+
+class QuerySecretRedactionTests(unittest.TestCase):
+    def test_strip_known_query_secrets_removes_keys_and_preserves_safe_query(self):
+        source = (
+            'page.goto("https://viewer.example.test/open?token=secret&study=demo")\n'
+            'page.goto("https://viewer.example.test/#/open?code=secret&study=demo")\n'
+            'safe = "https://viewer.example.test/open?study=demo"'
+        )
+        cleaned = strip_known_query_secrets(source)
+        self.assertNotIn("token=", cleaned)
+        self.assertNotIn("secret", cleaned)
+        self.assertEqual(cleaned.count("study=demo"), 3)
 
 
 class SeriesBranchValidationTests(unittest.TestCase):

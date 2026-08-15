@@ -265,6 +265,40 @@ class CaptureReadinessTests(unittest.TestCase):
             self.assertIsNone(metadata_panel_signature(target))
             browser.close()
 
+    def test_signature_ignores_visible_patient_info_when_tags_panel_is_hidden(self):
+        """A permanent patient banner must not make a closed panel look open."""
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page()
+            page.set_content(
+                '<button id="more">More</button>'
+                '<div class="tags-toolbar">Tags</div>'
+                '<div class="patientInfo info-container">Patient Name: Anonymous<br>Age: 42</div>'
+                '<div id="tagsBox" style="display:none">Series Number: 7</div>'
+            )
+            target = lambda: page.locator("#more")
+
+            self.assertIsNone(metadata_panel_signature(target))
+            browser.close()
+
+    def test_signature_accepts_zscloud_ui_dialog_with_series_fields(self):
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page()
+            page.set_content(
+                '<button id="dicom">DICOM</button>'
+                '<div class="ui-dialog">'
+                '<button class="ui-dialog-titlebar-close">Close</button>'
+                '<div>SeriesNumber: 201<br>SeriesDescription: MPR</div>'
+                '</div>'
+            )
+
+            signature = metadata_panel_signature(lambda: page.locator("#dicom"))
+
+            self.assertIsNotNone(signature)
+            self.assertIn("SeriesDescription", signature)
+            browser.close()
+
     def test_content_delays_then_loads_and_stabilizes(self):
         """Panel that fills in over time eventually returns True once stable."""
         with sync_playwright() as playwright:
@@ -371,6 +405,43 @@ def run(page):
     page.locator("#meta-close").click()
 '''
         return classify_recording_template(parse_action_plan(source))
+
+    def _multi_step_template(self):
+        from batch_capture_replicate import classify_recording_template
+        from rewrite_script import parse_action_plan
+        source = '''from playwright.sync_api import sync_playwright
+
+def run(page):
+    # [MARKER: 序列选择]
+    page.locator("#series .item").first.click()
+    # [MARKER: Meta 信息工具]
+    page.locator("#more").click()
+    page.get_by_role("link").filter(has_text="Tags").click()
+    page.locator("#meta-close").click()
+'''
+        return classify_recording_template(parse_action_plan(source))
+
+    def test_multi_step_metadata_open_and_close_execute_full_chain(self):
+        """The live transaction executes More -> Tags, but never close as open."""
+        with tempfile.TemporaryDirectory() as tmp, sync_playwright() as playwright:
+            session = LiveCaptureSession(Path(tmp))
+            browser = playwright.chromium.launch()
+            page = browser.new_page()
+            page.set_content("""
+<div id="series"><div class="item">Series A</div></div>
+<div class="patientInfo info-container">Patient Name: Anonymous</div>
+<button id="more" onclick="document.getElementById('tags').style.display='block'">More</button>
+<a id="tags" href="#" style="display:none" onclick="document.getElementById('tagsBox').style.display='block';this.remove();return false">Tags</a>
+<button id="meta-close" onclick="document.getElementById('tagsBox').style.display='none'">Close</button>
+<div id="tagsBox" style="display:none">Series Number: 7<br>Series Description: Chest</div>
+""")
+            template = self._multi_step_template()
+
+            self.assertTrue(session._open_metadata_if_needed(page, template, {"page": page}, True))
+            self.assertTrue(page.locator("#tagsBox").is_visible())
+            self.assertTrue(session._open_metadata_if_needed(page, template, {"page": page}, False))
+            self.assertFalse(page.locator("#tagsBox").is_visible())
+            browser.close()
 
     def test_restore_detects_close_that_does_not_hide_panel(self):
         """_restore_hub_state must NOT silently succeed when the Metadata panel

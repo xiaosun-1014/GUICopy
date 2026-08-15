@@ -6,7 +6,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-from build_replica import build_replica
+from build_replica import _redact_known_series_identities, _series_member_html, build_replica
 from replay_helpers import ReplicaServer
 from replay_helpers import sha256_file
 from replay_helpers import series_key_slug
@@ -26,6 +26,35 @@ from replica_models import (
     ReplicaTransition,
     StateEvidence,
 )
+
+
+class SeriesMemberPrivacyTests(unittest.TestCase):
+    def test_series_member_removes_identity_from_root_and_descendants(self):
+        raw_key = "1.2.826.0.1.3680043.201.9001"
+        snapshot = DomNodeSnapshot(
+            "li",
+            "Anonymous series",
+            {"id": raw_key, "title": "private label"},
+            Rect(0, 0, 100, 30, "page_viewport_css"),
+            (
+                f'<li id="{raw_key}" title="private label" data-series-uid="{raw_key}">'
+                f'<span id="thumb-{raw_key}">{raw_key}</span></li>'
+            ),
+            {"display": "block"},
+        )
+        rendered = _series_member_html(snapshot, "public-slug", selected=False, disabled=False)
+        self.assertNotIn(raw_key, rendered)
+        self.assertNotIn("private label", rendered)
+        self.assertIn('data-replica-series-key="public-slug"', rendered)
+
+    def test_known_identity_is_redacted_from_non_series_markup(self):
+        raw_key = "1.2.826.0.1.3680043.201.9002"
+        rendered = _redact_known_series_identities(
+            f'<span id="thumb-{raw_key}">{raw_key}</span>',
+            {raw_key: {"slug": "public-slug"}},
+        )
+        self.assertNotIn(raw_key, rendered)
+        self.assertEqual(rendered.count("public-slug"), 2)
 
 
 def _metadata_region(document_id: str) -> InteractionRegion:

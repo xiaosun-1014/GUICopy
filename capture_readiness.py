@@ -15,11 +15,37 @@ from __future__ import annotations
 
 import hashlib
 import io
+import re
 import time
 
 from PIL import Image, ImageStat
 
 from capture_snapshot import _MARKER_REGION_CANDIDATES
+
+
+_METADATA_TEXT_RE = re.compile(
+    r"(?:series\s*(?:number|description|instance\s*uid)|"
+    r"study\s*(?:description|instance\s*uid)|"
+    r"\(\s*[0-9a-f]{4}\s*,\s*[0-9a-f]{4}\s*\)|序列(?:号|描述|实例))",
+    re.IGNORECASE,
+)
+
+
+def _metadata_candidate_allowed(selector: str, text: str, tag: str) -> bool:
+    """Return whether a visible candidate plausibly represents Metadata.
+
+    Generic ``*info*`` selectors match patient banners, while strong ``*tags*``
+    selectors can match permanent toolbar containers. Every accepted root must
+    therefore carry Metadata-specific fields, not merely a suggestive class.
+    """
+    normalized_tag = (tag or "").lower()
+    if normalized_tag in {
+        "a", "button", "html", "body", "i", "input", "main", "select",
+        "span", "svg", "textarea",
+    }:
+        return False
+    _ = selector
+    return bool(_METADATA_TEXT_RE.search(text or ""))
 
 
 def metadata_panel_signature(locator_factory: object) -> str | None:
@@ -51,7 +77,7 @@ def metadata_panel_signature(locator_factory: object) -> str | None:
                         scrollHeight: element.scrollHeight,
                     })"""
                 )
-                if payload["tag"] in {"a", "button", "input", "select", "textarea", "html", "body", "main"}:
+                if not _metadata_candidate_allowed(selector, payload["text"], payload["tag"]):
                     continue
                 return f'{payload["text"]}\0{payload["scrollHeight"]}'
     except Exception:

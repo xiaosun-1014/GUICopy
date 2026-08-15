@@ -92,6 +92,43 @@ viewers:
       item_container_selectors: []
 
   # --------------------------------------------------------------------------
+  # ftimage (yyx.ftimage.cn) — 真实站 viewer
+  # 序列激活 = dblclick（录制原样继承）
+  # --------------------------------------------------------------------------
+  ftimage:
+    url_patterns:
+      - "yyx.ftimage.cn"
+    sequence_select:
+      item_container_selector: "div.os-viewport"    # 滚动容器（页里有 2 个，发现逻辑取首个可见）
+      item_selector: "a:has(span.total)"            # 序列行 = A > div.desc > span.total
+      identity_attrs: []                            # 无稳定属性 → 文本 fallback
+    meta_panel:
+      open_button_names:
+        - "更多"
+        - "Tags"
+      close_button_selectors:
+        - "#tagsBox a.close"
+    # 注：序列激活 = dblclick（录制原样继承）
+
+  # --------------------------------------------------------------------------
+  # zscloud (zscloud.zs-hospital.sh.cn) — 真实站 viewer
+  # viewer 在第二层 iframe（/viewer/.../Viewer/Index）；序列激活 = dblclick
+  # --------------------------------------------------------------------------
+  zscloud:
+    url_patterns:
+      - "zscloud.zs-hospital.sh.cn"
+    sequence_select:
+      item_container_selector: "#HLeftThumnail"     # thumbnails 滚动容器（viewer frame 内）
+      item_selector: "li.ui-draggable"
+      identity_attrs: ["id"]                        # li id 是 SeriesInstanceUID 形态；公开面已 slug
+    meta_panel:
+      open_button_names:
+        - "DICOM信息 F2"
+      close_button_selectors:
+        - ".ui-dialog-titlebar-close"
+    # 注：viewer 在第二层 iframe（/viewer/.../Viewer/Index）；序列激活 = dblclick
+
+  # --------------------------------------------------------------------------
   # 通用兜底 — 未匹配任何已知 viewer 时使用
   # 配置尽量宽松，让脚本能从录制脚本反推 + VL 兜底
   # --------------------------------------------------------------------------

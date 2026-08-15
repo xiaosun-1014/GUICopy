@@ -206,16 +206,17 @@ def _series_frame_count_from_text(text: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _series_stable_attributes(snapshot: DomNodeSnapshot) -> dict[str, str]:
+def _series_stable_attributes(snapshot: DomNodeSnapshot, identity_attrs: Sequence[str] | None = None) -> dict[str, str]:
     stable: dict[str, str] = {}
-    for name in _SERIES_IDENTITY_ATTRS:
+    attrs = _SERIES_IDENTITY_ATTRS if identity_attrs is None else tuple(identity_attrs)
+    for name in attrs:
         value = snapshot.attributes.get(name)
         if value:
             stable[name] = value
     return stable
 
 
-def _series_identity(snapshot: DomNodeSnapshot) -> tuple[tuple[str, str], dict[str, str], str | None]:
+def _series_identity(snapshot: DomNodeSnapshot, identity_attrs: Sequence[str] | None = None) -> tuple[tuple[str, str], dict[str, str], str | None]:
     """Return (identity_key, stable_attributes, key_basis).
 
     ``identity_key`` drives cross-scroll dedup; distinct keys mean distinct
@@ -223,8 +224,9 @@ def _series_identity(snapshot: DomNodeSnapshot) -> tuple[tuple[str, str], dict[s
     build ``series_key`` (None when only the text-fallback exists, so the caller
     appends the document id + same-name occurrence index).
     """
-    stable = _series_stable_attributes(snapshot)
-    for name in _SERIES_IDENTITY_ATTRS:
+    attrs = _SERIES_IDENTITY_ATTRS if identity_attrs is None else tuple(identity_attrs)
+    stable = _series_stable_attributes(snapshot, attrs)
+    for name in attrs:
         if name in stable:
             return (f"attr:{name}", stable[name]), stable, stable[name]
     norm = _normalize_series_text(snapshot.text)
@@ -255,20 +257,28 @@ def discover_series_candidates(
     document_id: str,
     max_scroll_steps: int = 40,
     max_duration_s: float = 10.0,
+    item_selector: str | None = None,
+    identity_attrs: Sequence[str] | None = None,
 ) -> tuple[list[SeriesDescriptor], list[RegionMember], SeriesCollectionEvidence]:
     """Deterministically enumerate scrollable series rows into stable descriptors.
 
     This is the single scroll-harvest discovery algorithm shared by ordinary
-    snapshot capture and future auto-exploration. It restores the original
+    snapshot capture and auto-exploration. It restores the original
     ``scrollTop`` on every exit path, dedups virtualized list nodes that are
     reused across scroll positions, and never stores Locators, element handles
     or absolute coordinates -- only stable descriptions.
+
+    ``item_selector`` / ``identity_attrs`` override the hardcoded per-viewer
+    defaults so real sites whose series rows are not ``.series-item``/``li``
+    (e.g. FTImage's ``a > div.desc > span.total``) can be enumerated without
+    changing the shared defaults (``None`` keeps the current behavior).
 
     Returns ``(descriptors, members, evidence)`` where each descriptor's
     ``member_id`` matches the corresponding region member, so the discovered
     count is directly auditable against the collected region members.
     """
-    items = root_locator.locator(_SERIES_ITEM_SELECTOR)
+    id_attrs = _SERIES_IDENTITY_ATTRS if identity_attrs is None else tuple(identity_attrs)
+    items = root_locator.locator(item_selector or _SERIES_ITEM_SELECTOR)
     initial = root_locator.evaluate("element => ({top: element.scrollTop, height: element.clientHeight, scrollHeight: element.scrollHeight})")
     discovered: dict[tuple[str, str], dict[str, Any]] = {}
     order: list[tuple[str, str]] = []
@@ -279,7 +289,7 @@ def discover_series_candidates(
         while True:
             for index in range(items.count()):
                 snapshot = capture_locator_snapshot(items.nth(index), "region_content_css")
-                identity_key, stable, _ = _series_identity(snapshot)
+                identity_key, stable, _ = _series_identity(snapshot, id_attrs)
                 if identity_key not in discovered:
                     discovered[identity_key] = {
                         "snapshot": snapshot,
@@ -322,7 +332,7 @@ def discover_series_candidates(
         snapshot = record["snapshot"]
         members.append(RegionMember(member_id, snapshot.tag_name, snapshot))
         if record["stable"]:
-            series_key = next(record["stable"][name] for name in _SERIES_IDENTITY_ATTRS if name in record["stable"])
+            series_key = next(record["stable"][name] for name in id_attrs if name in record["stable"])
         else:
             norm = _normalize_series_text(snapshot.text)
             occurrence = same_name_index.get(norm, 0)
@@ -347,14 +357,21 @@ def discover_series_candidates(
     return descriptors, members, evidence
 
 
-def capture_series_interaction_region(root_locator: Any, document_id: str, max_scroll_steps: int = 40) -> InteractionRegion:
+def capture_series_interaction_region(
+    root_locator: Any,
+    document_id: str,
+    max_scroll_steps: int = 40,
+    item_selector: str | None = None,
+    identity_attrs: Sequence[str] | None = None,
+) -> InteractionRegion:
     """Harvest scrollable series rows as a region, restoring scroll position afterward.
 
     Delegates to :func:`discover_series_candidates` (the single scroll-harvest
     algorithm) and packages its region members into an ``InteractionRegion``.
     """
     _, members, evidence = discover_series_candidates(
-        root_locator, document_id, max_scroll_steps=max_scroll_steps
+        root_locator, document_id, max_scroll_steps=max_scroll_steps,
+        item_selector=item_selector, identity_attrs=identity_attrs,
     )
     root = capture_locator_snapshot(root_locator)
     return InteractionRegion(f"{document_id}_series", "series", document_id, root, members, evidence)
@@ -364,7 +381,7 @@ _MARKER_REGION_CANDIDATES: dict[str, tuple[str, tuple[str, ...]]] = {
     "报告截图": ("report", ("#report", "[data-testid*='report' i]", "main", "body")),
     "序列布局切换": ("layout", ("[data-testid*='layout' i]", "[class*='layout' i]", "[aria-label*='layout' i]", "body")),
     "序列选择": ("series", ("[data-testid*='series' i]", "[class*='series' i]", "[aria-label*='series' i]", "body")),
-    "Meta 信息工具": ("metadata", ("[id*='tags' i]", "[class*='tags' i]", "[data-testid*='tags' i]", "[roles*='tags' i]", "[id*='info' i]", "[class*='info' i]", "[data-testid*='dicom' i]", "[class*='dicom' i]", "[class*='metadata' i]", "[aria-label*='dicom' i]", "[role='dialog']", "body")),
+    "Meta 信息工具": ("metadata", ("[id*='tags' i]", "[class*='tags' i]", "[data-testid*='tags' i]", "[roles*='tags' i]", "[id*='info' i]", "[class*='info' i]", "[data-testid*='dicom' i]", "[class*='dicom' i]", "[class*='metadata' i]", "[aria-label*='dicom' i]", ".ui-dialog:has(.ui-dialog-titlebar-close)", "[role='dialog']", "body")),
     "窗宽窗位 WL/WW": ("wlww", ("[data-testid*='window' i]", "[class*='window-level' i]", "[class*='wlww' i]", "[aria-label*='window' i]", "[role='dialog']", "body")),
     "影像画布交互": ("canvas", ("canvas", "[class*='cornerstone-canvas' i]", "[data-testid*='canvas' i]", "body")),
 }
@@ -391,12 +408,17 @@ def capture_marker_interaction_region(
     document_id: str,
     target_locator: Any | None = None,
     max_scroll_steps: int = 40,
+    item_selector: str | None = None,
+    identity_attrs: Sequence[str] | None = None,
 ) -> InteractionRegion:
     """Capture the smallest documented interaction region for a marker action.
 
     ``scope`` is a Playwright ``Page`` or ``Frame``.  The selectors deliberately
     stay viewer-agnostic and finish at ``body`` so an unfamiliar viewer still has
-    auditable DOM evidence instead of silently losing the region.
+    auditable DOM evidence instead of silently losing the region. For the
+    ``series`` region type, ``item_selector`` / ``identity_attrs`` are forwarded
+    to :func:`capture_series_interaction_region` to support per-viewer row
+    structures (hardcoded defaults otherwise).
     """
     region_type, candidates = _MARKER_REGION_CANDIDATES.get(marker_label, ("generic", ("body",)))
     # Metadata panels are click-opened scroll containers whose HTML differs per
@@ -412,7 +434,10 @@ def capture_marker_interaction_region(
     if target_locator is not None and root_locator.count() == 0:
         root_locator = target_locator
     if region_type == "series":
-        return capture_series_interaction_region(root_locator, document_id, max_scroll_steps)
+        return capture_series_interaction_region(
+            root_locator, document_id, max_scroll_steps,
+            item_selector=item_selector, identity_attrs=identity_attrs,
+        )
     return capture_interaction_region(root_locator, region_type, document_id)
 
 

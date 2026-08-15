@@ -15,6 +15,7 @@ from pipeline_orchestrator import (
     PipelineController,
     _build_parser,
     _prepare_full_run,
+    _scrub_run_query_secrets_after_capture,
     _stage_plan,
     execute_pipeline_stages,
     exit_code_for,
@@ -47,6 +48,45 @@ def make_config(tmp: str) -> PipelineConfig:
         output_root=root,
         retry_count=3,
     )
+
+
+class PostCapturePrivacyTests(unittest.TestCase):
+    def test_scrub_removes_query_credentials_and_refreshes_manifest_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = create_run_layout(Path(tmp), "fixture", "run_001")
+            source_text = 'page.goto("https://viewer.example/open?token=secret&study=demo")\n'
+            for path in (
+                layout.source_dir / "recorded.py",
+                layout.capture_dir / "recorded.py",
+                layout.capture_dir / "instrumented_replay.py",
+            ):
+                path.write_text(source_text, encoding="utf-8")
+            topology = layout.capture_dir / "snapshots" / "one" / "topology.json"
+            topology.parent.mkdir(parents=True)
+            topology.write_text(
+                json.dumps({"url": "https://viewer.example/open?token=secret&study=demo"}),
+                encoding="utf-8",
+            )
+            manifest = layout.capture_dir / "manifest.json"
+            manifest.write_text(json.dumps({
+                "source_script_relpath": "recorded.py",
+                "source_script_sha256": "stale",
+                "source_url": "https://viewer.example/open?token=secret&study=demo",
+            }), encoding="utf-8")
+
+            changed = _scrub_run_query_secrets_after_capture(layout)
+
+            self.assertGreaterEqual(changed, 4)
+            for path in layout.root.rglob("*"):
+                if path.is_file() and path.suffix in {".json", ".py"}:
+                    text = path.read_text(encoding="utf-8")
+                    self.assertNotIn("token=", text)
+                    self.assertNotIn("secret", text)
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            expected = hashlib.sha256(
+                (layout.capture_dir / "recorded.py").read_bytes()
+            ).hexdigest()
+            self.assertEqual(payload["source_script_sha256"], expected)
 
 
 class StageOrderTests(unittest.TestCase):

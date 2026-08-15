@@ -12,6 +12,8 @@
 | `nested_outer.html` | 两层 iframe 变体的中间 iframe，内嵌最内层序列列表。 |
 | `nested_inner.html` | 两层 iframe 变体的最内层 iframe，持有与 `series_list.html` 中相同的 5 序列列表。 |
 | `popup.html` | popup 变体：popup 文档直接持有可滚动序列列表 + viewer + metadata（无 iframe）。 |
+| `ft_series_list.html` | 单文档 FTImage 风格序列列表镜像（真实站点 Spike 固化）。`div.os-viewport` 滚动容器内含 8 个 `a > div.desc > span.total` 序列行；**无任何 id/data-\*** 身份属性；1 行初始在折叠区外（滚动发现）；页面还有第 2 个不含序列行的干扰 `div.os-viewport`（取 `.first` + 容器限定验证）。 |
+| `zs_series_list.html` | 单文档中山 zscloud 风格序列列表镜像（真实站点 Spike 固化）。`div.StudyList#HLeftThumnail` 滚动容器内含 4 个 `li.ui-draggable[id]`（id 为**虚构** UID 形态，`1.2.826.0.1.3680043.201.1001`…`.1004`）；第 2 行 class 含 `select`（选中态）；容器外另放 2 个 `li.ui-draggable`（模拟病人头/检查 LI，验证容器限定后不计入）。 |
 | `README.md` | 本文件。 |
 
 ## 序列清单（三份 HTML 共用同一套序列编排）
@@ -79,6 +81,49 @@
 应改用 `set_content` 同源方式构建两层 iframe（镜像
 `test/test_batch_capture_replicate.py::test_nested_frame_series_uses_scroll_harvest` 的做法），
 只用静态文件作为人类可读的结构参考。
+
+## 真实站点镜像 fixture（ft / zscloud）
+
+这两个 fixture 是「真实站多序列发现适配」（`docs/TASK_HANDOFF_FT_ZSCLOUD_SERIES_ADAPT.md`，
+真实站点只读探测 §2.1）的结构固化，全部数值为**虚构**匿名数据（UID 一律在
+`1.2.826.0.1.3680043.201.*` 段），不含任何真实病人文本/token/检查号。
+
+### ft_series_list.html（FTImage 风格）
+
+- 滚动容器 = 文档中 **第一个** `div.os-viewport`（overlay scrollbars 视口，页里共 2 个，
+  `.first` 即真实序列容器；第 2 个是干扰容器，用于验证容器限定/取首个可见）。
+- 序列行 = `a:has(span.total)`（结构 `a > div.desc > span.total`），**无 id / data-\*** 身份属性
+  → `_series_identity` 走文本 fallback（`key` 形如 `ft::scout /共 2张::x0`）。
+- 第 8 行 `3.0 x 3.0 MPR-Sag_bone`（共 131张）初始在折叠区外，滚动后枚举到（`reached_end=True`）。
+- 发现调用：
+  ```python
+  discover_series_candidates(root, "ft",
+      item_selector="a:has(span.total)", identity_attrs=[])
+  # root = page.locator("[class*=os-viewport]").first
+  # 预期：8 个 descriptor、key 唯一、reached_end；干扰容器 nth(1) → 0 个
+  ```
+- 默认（不传参数）选择器 `_SERIES_ITEM_SELECTOR` 不含 `a:has(...)` → 对 ft fixture 匹配 **0 个**
+  （证明必须显式传 `item_selector`，改默认行为的回归不会误通过）。
+
+### zs_series_list.html（中山 zscloud 风格）
+
+- 滚动容器 = `div.StudyList#HLeftThumnail`，~3 行可见、第 4 行滚动后进入视口。
+- 序列行 = `li.ui-draggable`（结构 `li > div.thumnailClass > a > i.countClass`），
+  每行 `id` 为虚构 SeriesInstanceUID 形态 `1.2.826.0.1.3680043.201.1001`…`.1004` → 序列 key 直接取 id。
+- 第 2 行 class 额外含 `select`（选中态结构镜像）。注意：当前 `_series_selected` 只按
+  **属性**（`aria-selected` / `selected` / `data-selected`）判定选中，**不看 class 令牌**，
+  故本 fixture 的 `selected` 字段恒为 `False`——fixture 保留 class 是为了结构忠实，不是断言点。
+- 文档里共 6 个 `li.ui-draggable`：容器内 4 个 + 病人头/检查 LI 2 个（`.9001` / `.9002`，
+  无「N幅」文本）。根限定为 `#HLeftThumnail` 时外部 LI 不计入。
+- 发现调用：
+  ```python
+  discover_series_candidates(root, "zs",
+      item_selector="li.ui-draggable", identity_attrs=["id"])
+  # root = page.locator("#HLeftThumnail")
+  # 预期：4 个 descriptor、key = 4 个虚构 UID 且唯一、外部 li（.9001/.9002）不计入
+  ```
+- 身份安全：内部 `series_key` 用虚构 UID 可以；公开面（serve/事件/日志/报告）仍须走
+  `series_key_slug()`/hash，`title`（病人姓名）绝不可进入任何 identity/输出。
 
 ## 冒烟验证
 

@@ -147,11 +147,6 @@ def validate_manifest(flow: ReplicaFlow, capture_root: Path) -> ValidationResult
         errors.append("asset_missing_or_out_of_root")
         metrics["asset_problems"] = asset_problems
 
-    for state in flow.states:
-        for document in state.documents:
-            if document.parent_document_id is not None and document.parent_document_id not in document_ids:
-                errors.append("iframe_parent_missing")
-
     if flow.source_script_relpath:
         source = capture_root / flow.source_script_relpath
         if source.is_file():

@@ -15,6 +15,7 @@ import sys
 import time
 import queue
 import threading
+import yaml
 from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, replace
 from collections.abc import Callable
@@ -23,7 +24,7 @@ from pathlib import Path
 from PIL import Image, ImageStat
 
 from build_replica import build_replica
-from capture_readiness import canvas_hash, metadata_panel_signature, metadata_uid_sha256_prefix, screenshot_nonblank, viewer_dom_fingerprint, wait_for_metadata_panel_state
+from capture_readiness import _metadata_candidate_allowed, canvas_hash, metadata_panel_signature, metadata_uid_sha256_prefix, screenshot_nonblank, viewer_dom_fingerprint, wait_for_metadata_panel_state
 from capture_snapshot import capture_interaction_region, capture_locator_snapshot, capture_marker_interaction_region, capture_page_topology, capture_selector_closure, compute_image_diff, decide_state, marker_region_type, discover_series_candidates, sanitize_html, _MARKER_REGION_CANDIDATES
 from process_runner import ManagedProcess
 from replay_helpers import read_manifest, sha256_file, write_manifest
@@ -366,14 +367,72 @@ def _emit_series_event(event: dict[str, object]) -> None:
     print(json.dumps(event, ensure_ascii=False), flush=True)
 
 
-def _series_scope_root(target_locator: object) -> object:
+# Shared per-viewer series-discovery config (skills/_shared/viewers.yaml).
+# Derivable from ``Path(__file__).resolve().parents[0]`` because this module
+# lives in the repo root. Kept as a module constant so unit tests/stubs can
+# point it at a controlled fixture without touching the shared file.
+_SERIES_VIEWERS_YAML = Path(__file__).resolve().parents[0] / "skills" / "_shared" / "viewers.yaml"
+
+
+def _series_viewer_config_for(page: object) -> dict[str, object]:
+    """Match a live ``page`` URL against skills/_shared/viewers.yaml and return
+    the per-viewer series-discovery configuration.
+
+    Returns ``{'item_container_selector','item_selector','identity_attrs'}``
+    (only the keys present in the matched viewer's ``sequence_select``) so the
+    series hub/row structure of real sites (e.g. FTImage's ``a > span.total``
+    rows, zscloud's ``li.ui-draggable`` rows) is selected from config instead of
+    the hardcoded defaults. An empty dict means "no matching viewer — keep the
+    hardcoded shared defaults", and *any* failure (missing file, bad YAML,
+    unreadable page URL) also yields ``{}`` so a broken config can never abort
+    capture.
+    """
+    try:
+        url = getattr(page, "url", None)
+        if not url:
+            return {}
+        viewers_path = _SERIES_VIEWERS_YAML
+        with open(viewers_path, "r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+        viewers = (data or {}).get("viewers") or {}
+        for _name, viewer in viewers.items():
+            if not isinstance(viewer, dict):
+                continue
+            patterns = viewer.get("url_patterns") or []
+            if any(pattern and str(pattern) in str(url) for pattern in patterns):
+                sequence_select = viewer.get("sequence_select") or {}
+                cfg: dict[str, object] = {}
+                for key in ("item_container_selector", "item_selector", "identity_attrs"):
+                    if key in sequence_select and sequence_select.get(key) is not None:
+                        cfg[key] = sequence_select[key]
+                return cfg
+    except Exception:
+        return {}
+    return {}
+
+
+def _series_scope_root(target_locator: object, container_selector: str | None = None) -> object:
     """Return the scrollable series-list container that owns the target, same-frame.
 
     Mirrors the marker-aware series-region root resolution (walking only the
     target's own frame via ``ancestor::html`` — never a top-level DOM traversal
-    cross into a child iframe).
+    cross into a child iframe). When ``container_selector`` is given (from the
+    per-viewer config) it is preferred over the generic candidate selectors —
+    the first *visible* match inside the target's own frame wins (e.g. FTImage's
+    ``div.os-viewport`` has two instances; zscloud's list lives inside the
+    viewer's second-level iframe, which ``ancestor::html`` already bounds). Any
+    container-matching failure falls through to the existing candidate/body logic.
     """
     scope = target_locator.locator("xpath=ancestor::html")
+    if container_selector:
+        try:
+            matches = scope.locator(container_selector)
+            for index in range(matches.count()):
+                candidate = matches.nth(index)
+                if candidate.is_visible():
+                    return candidate
+        except Exception:
+            pass
     for selector in _MARKER_REGION_CANDIDATES["序列选择"][1]:
         matches = scope.locator(selector)
         for index in range(matches.count()):
@@ -402,6 +461,7 @@ def _resolve_locator_recipe(recipe: LocatorRecipe, pages: dict[str, object]) -> 
         except Exception:
             return None
     locator_args = dict(recipe.locator_args or {})
+    filter_kwargs = locator_args.pop("_filter", {})
     positional = list(locator_args.get("args", []))
     keywords = {key: value for key, value in locator_args.items() if key != "args"}
     method = {
@@ -410,6 +470,8 @@ def _resolve_locator_recipe(recipe: LocatorRecipe, pages: dict[str, object]) -> 
     }.get(recipe.locator_kind, "locator")
     try:
         resolved = getattr(locator, method)(*positional, **keywords)
+        if filter_kwargs:
+            resolved = resolved.filter(**filter_kwargs)
         if recipe.ordinal_op == "first":
             resolved = resolved.first
         elif recipe.ordinal_op == "last":
@@ -546,6 +608,22 @@ class LiveCaptureSession:
     def __init__(self, output_root: str | Path) -> None:
         self.output_root = Path(output_root)
         self.series_branches_root = self.output_root / "series_branches"
+        self._series_cfg: dict[str, object] = {}
+
+    def _ensure_series_cfg(self, page: object) -> None:
+        """Load the per-viewer series discovery config once, when the page has a URL.
+
+        Caches the first successful load in ``self._series_cfg`` so repeated
+        per-action hooks do not re-read the YAML on every call. An empty result
+        (unknown viewer / config failure) is deliberately not cached as
+        "definitive" — nothing is cached at all for those, so a later call on a
+        page with a real URL re-tries the match.
+        """
+        if self._series_cfg:
+            return
+        if not getattr(page, "url", None):
+            return
+        self._series_cfg = _series_viewer_config_for(page)
 
     def _capture(
         self,
@@ -556,6 +634,7 @@ class LiveCaptureSession:
         marker_label: str = "",
     ) -> None:
         capture_root = self.output_root / "snapshots" / action_id / phase
+        self._ensure_series_cfg(page)
         if phase == "after":
             page.wait_for_timeout(150)
         context_pages = list(getattr(getattr(page, "context", None), "pages", []) or [page])
@@ -572,7 +651,11 @@ class LiveCaptureSession:
             target_document = documents[0]
             active_page_id = next((entry.page_id for entry, (_, candidate) in zip(pages, named_pages) if candidate is page), documents[0].page_id)
             if target_locator is not None:
-                frame_owner = target_locator.evaluate("""element => {
+                # The recorded locator may match several elements (e.g. a series
+                # list with many items); the frame-owner probe only needs one, so
+                # resolve `.first` — a strict-mode evaluate on a multi-match
+                # locator would otherwise raise and silently drop the snapshot.
+                frame_owner = target_locator.first.evaluate("""element => {
                     const owner = window.frameElement;
                     return owner ? {id: owner.id || null, name: owner.name || null} : null;
                 }""")
@@ -586,7 +669,17 @@ class LiveCaptureSession:
                     if len(frame_documents) == 1:
                         target_document = frame_documents[0]
             if target_document is documents[0]:
-                region = capture_marker_interaction_region(page, marker_label, target_document.document_id, target_locator)
+                if marker_label == "序列选择":
+                    # Per-viewer row structure (item_selector / identity_attrs
+                    # from viewers.yaml) lets the top-page variant of the series
+                    # harvest enumerate real-site rows, not just hardcoded ones.
+                    region = capture_marker_interaction_region(
+                        page, marker_label, target_document.document_id, target_locator,
+                        item_selector=self._series_cfg.get("item_selector"),
+                        identity_attrs=self._series_cfg.get("identity_attrs"),
+                    )
+                else:
+                    region = capture_marker_interaction_region(page, marker_label, target_document.document_id, target_locator)
             elif marker_label in {"Meta 信息工具", "序列选择"}:
                 # Nested-frame markers are captured from the frame's own context,
                 # not the top page. Metadata panels have long used the owning
@@ -596,12 +689,22 @@ class LiveCaptureSession:
                 # frame that actually holds the list. Generic/layout/WLWW/canvas
                 # markers keep the existing else behavior.
                 owning_document = target_locator.locator("xpath=ancestor::html")
-                region = capture_marker_interaction_region(
-                    owning_document,
-                    marker_label,
-                    target_document.document_id,
-                    target_locator,
-                )
+                if marker_label == "序列选择":
+                    region = capture_marker_interaction_region(
+                        owning_document,
+                        marker_label,
+                        target_document.document_id,
+                        target_locator,
+                        item_selector=self._series_cfg.get("item_selector"),
+                        identity_attrs=self._series_cfg.get("identity_attrs"),
+                    )
+                else:
+                    region = capture_marker_interaction_region(
+                        owning_document,
+                        marker_label,
+                        target_document.document_id,
+                        target_locator,
+                    )
             else:
                 region = capture_interaction_region(target_locator.locator("xpath=.."), marker_region_type(marker_label), target_document.document_id)
             target_document.regions.append(region)
@@ -620,10 +723,12 @@ class LiveCaptureSession:
                 pass
 
     def before(self, action_id: str, page: object, locator_factory: object | None = None, marker_label: str = "") -> None:
+        self._ensure_series_cfg(page)
         wait_for_pre_action_state(page, marker_label, locator_factory)
         self._capture(action_id, "before", page, locator_factory, marker_label)
 
     def after(self, action_id: str, page: object, locator_factory: object | None = None, marker_label: str = "") -> None:
+        self._ensure_series_cfg(page)
         ensure_post_action_state(page, marker_label, locator_factory)
         self._capture(action_id, "after", page, locator_factory, marker_label)
 
@@ -643,6 +748,7 @@ class LiveCaptureSession:
         the instrumented replay subprocess and performs no implicit after-snapshot
         (that stays ``after()``'s single duty).
         """
+        self._ensure_series_cfg(page)
         replay_source = self.output_root / "instrumented_replay.py"
         try:
             if not replay_source.is_file():
@@ -684,7 +790,9 @@ class LiveCaptureSession:
         used; no ``contentDocument`` traversal.
         """
         descriptors, members, evidence = discover_series_candidates(
-            root, viewer_doc.document_id, max_scroll_steps=max_scroll_steps
+            root, viewer_doc.document_id, max_scroll_steps=max_scroll_steps,
+            item_selector=self._series_cfg.get("item_selector"),
+            identity_attrs=self._series_cfg.get("identity_attrs"),
         )
         root_snapshot = capture_locator_snapshot(root)
         viewer_doc.regions.append(InteractionRegion(
@@ -755,6 +863,8 @@ class LiveCaptureSession:
         (P1#5). Returns an outcome dataclass; raises ``HubUnrecoverableError``
         for hub-level failures so the caller can drive a controlled reload.
         """
+        self._ensure_series_cfg(page)
+        container = self._series_cfg.get("item_container_selector")
         session_dir = self.series_branches_root / _safe_series_key(descriptor)
         metadata_dir = session_dir / "metadata"
         session_dir.mkdir(parents=True, exist_ok=True)
@@ -789,7 +899,7 @@ class LiveCaptureSession:
                 # The series list / hub is unreachable: classify as hub-unrecoverable
                 # so finalize_series_branches can drive one controlled reload.
                 raise HubUnrecoverableError("series list locator unresolved")
-            root = _series_scope_root(series_locator)
+            root = _series_scope_root(series_locator, container)
             # P1#5: snapshot the hub/panel state once for this transaction so a
             # finally-restore always runs on every exit path.
             initial_hub = self._snapshot_hub_state(root, template, pages)
@@ -820,7 +930,7 @@ class LiveCaptureSession:
                 # First action produced no change evidence; re-resolve the root
                 # from the recipe and re-locate the row (the Viewer may have
                 # rebuilt its iframe / virtualized list) and retry activation once.
-                retry_root = self._reparse_series_root(recipe, page)
+                retry_root = self._reparse_series_root(recipe, page, container)
                 if retry_root is None:
                     raise HubUnrecoverableError("series root lost on retry")
                 row_locator, _steps = _locate_series_row(retry_root, descriptor, max_scroll_steps=max_series)
@@ -944,6 +1054,30 @@ class LiveCaptureSession:
 
         return factory
 
+    def _metadata_scope_factory(self, template: RecordingTemplate, pages: dict[str, object]):
+        """Resolve the latest still-attached Metadata-open locator.
+
+        Popover entries such as FTImage's ``Tags`` link are removed after the
+        click.  Prefer the final open step while it remains attached, then fall
+        back through earlier stable triggers in the same recorded chain.
+        """
+        factories = [self._meta_factory(action, pages) for action in template.metadata_open_actions]
+        factories = [factory for factory in factories if factory is not None]
+        if not factories:
+            return None
+
+        def factory():
+            for candidate_factory in reversed(factories):
+                candidate = candidate_factory()
+                try:
+                    if candidate is not None and candidate.count() > 0:
+                        return candidate
+                except Exception:
+                    continue
+            return None
+
+        return factory
+
     def _perform_activation(self, locator: object, activation: str) -> None:
         if activation == "dblclick":
             locator.dblclick()
@@ -978,7 +1112,7 @@ class LiveCaptureSession:
         stable_since: float | None = None
         while time.monotonic() < deadline:
             viewer_frame = _find_viewer_frame(page)  # fresh every poll
-            root = self._reparse_series_root(recipe, page)
+            root = self._reparse_series_root(recipe, page, self._series_cfg.get("item_container_selector"))
             if root is None:
                 stable_since = None
                 time.sleep(0.15)
@@ -1001,13 +1135,15 @@ class LiveCaptureSession:
         return row
 
     @staticmethod
-    def _reparse_series_root(recipe: LocatorRecipe | None, page: object) -> object | None:
+    def _reparse_series_root(recipe: LocatorRecipe | None, page: object, container_selector: str | None = None) -> object | None:
         """Re-resolve the scrollable series root from a stable LocatorRecipe.
 
         (P1#4) Resolves the series locator against the *latest* live pages/frame
         (never holding a pre-activation ``root_locator`` across polls), so an
         iframe / series-root replacement after activation is transparently
-        recovered. Returns ``None`` when the recipe cannot currently resolve.
+        recovered. ``container_selector`` (from the per-viewer config) is
+        forwarded to :func:`_series_scope_root`; ``None`` keeps the hardcoded
+        defaults. Returns ``None`` when the recipe cannot currently resolve.
         """
         if recipe is None:
             return None
@@ -1015,7 +1151,7 @@ class LiveCaptureSession:
         if series_locator is None:
             return None
         try:
-            return _series_scope_root(series_locator)
+            return _series_scope_root(series_locator, container_selector)
         except Exception:
             return None
 
@@ -1107,39 +1243,44 @@ class LiveCaptureSession:
         is honored: if the panel fails to hide within the bounded wait, the branch
         degrades to partial (an open panel would pollute the next branch).
         """
-        meta_open = template.metadata_open
         meta_close = template.metadata_close
-        open_factory = self._meta_factory(meta_open, pages)
+        open_factories = [self._meta_factory(action, pages) for action in template.metadata_open_actions]
+        open_factory = self._metadata_scope_factory(template, pages)
         close_factory = self._meta_factory(meta_close, pages)
         meta_dir = metadata_dir
         meta_dir.mkdir(parents=True, exist_ok=True)
         result: dict[str, object] = {"ok": False, "fail_stage": "open", "error_type": None, "uid_hash_prefix": None, "meta_open_dom": None}
 
         try:
-            if open_factory is None or close_factory is None:
+            if not open_factories or any(factory is None for factory in open_factories) or open_factory is None or close_factory is None:
                 result["fail_stage"] = "template"
                 result["error_type"] = "missing_metadata_locator"
                 return result
 
-            opened = open_factory()
-            if opened is None:
-                result["fail_stage"] = "open"
-                result["error_type"] = "resolve_failed"
-                return result
-            # P0#1/P1#5: remember the open-target DOM so the builder can render a
-            # real clickable Metadata trigger on the branch Viewer state.
-            try:
-                open_dom = capture_locator_snapshot(opened)
-                result["meta_open_dom"] = open_dom
-            except Exception:
-                open_dom = None
-            opened.click()
+            for index, step_factory in enumerate(open_factories):
+                opened = step_factory()
+                if opened is None:
+                    result["fail_stage"] = "open"
+                    result["error_type"] = "resolve_failed"
+                    return result
+                # Preserve the first visible trigger (for example FTImage's
+                # "更多") as the single offline Metadata transition target.
+                if index == 0:
+                    try:
+                        result["meta_open_dom"] = capture_locator_snapshot(opened)
+                    except Exception:
+                        pass
+                opened.click()
 
-            if not wait_for_metadata_panel_state(page, open_factory, timeout_s=per_series_timeout_s, stable_s=0.6):
+            stable = wait_for_metadata_panel_state(
+                page, open_factory, timeout_s=per_series_timeout_s, stable_s=0.6
+            )
+            rows, raw_outer_html, uid_hash = self._capture_metadata_panel(open_factory)
+            if not stable and not raw_outer_html:
                 result.update({"ok": False, "fail_stage": "stabilize", "error_type": "metadata_timeout"})
                 return result
-
-            rows, raw_outer_html, uid_hash = self._capture_metadata_panel(open_factory)
+            if not stable:
+                result["warning"] = "metadata_unstable_snapshot"
             # P1#8: run the unified HTML sanitizer before any persistence.
             outer_html = sanitize_html(raw_outer_html) if raw_outer_html else ""
             (meta_dir / "metadata_rows.json").write_text(
@@ -1153,7 +1294,13 @@ class LiveCaptureSession:
             )
             # P0#1: synthesize a Metadata region into the metadata document.
             if docs_out and outer_html:
-                self._attach_metadata_region(docs_out[0], outer_html)
+                panel_action = template.metadata_open_actions[-1]
+                owner_id = _document_id_for_recipe(panel_action.locator, pages_out, docs_out)
+                owner = next(
+                    (document for document in docs_out if document.document_id == owner_id),
+                    docs_out[0],
+                )
+                self._attach_metadata_region(owner, outer_html)
             self._write_topology(meta_dir, pages_out, docs_out)
 
             closed = close_factory()
@@ -1220,9 +1367,9 @@ class LiveCaptureSession:
         try:
             target = open_factory()
             scope = target.locator("xpath=ancestor::html")
-            import capture_snapshot as cs
-            candidates = cs._MARKER_REGION_CANDIDATES["Meta 信息工具"][1]
+            candidates = _MARKER_REGION_CANDIDATES["Meta 信息工具"][1]
             outer_html = ""
+            panel_text = ""
             for selector in candidates:
                 matches = scope.locator(selector)
                 for index in range(matches.count()):
@@ -1230,17 +1377,19 @@ class LiveCaptureSession:
                     try:
                         if not candidate.is_visible():
                             continue
-                        tag = candidate.evaluate("el => el.tagName.toLowerCase()")
-                        if tag in {"a", "button", "i", "input", "select", "span", "svg", "textarea"}:
+                        payload = candidate.evaluate(
+                            "el => ({tag: el.tagName.toLowerCase(), text: (el.innerText || el.textContent || '').trim()})"
+                        )
+                        if not _metadata_candidate_allowed(selector, payload["text"], payload["tag"]):
                             continue
                         outer_html = candidate.evaluate("el => el.outerHTML")
+                        panel_text = payload["text"]
                         break
                     except Exception:
                         continue
                 if outer_html:
                     break
-            text = (scope.inner_text() if hasattr(scope, "inner_text") else "") or ""
-            rows = self._parse_metadata_rows(text, outer_html)
+            rows = self._parse_metadata_rows(panel_text, outer_html)
             uid = self._find_uid(rows, outer_html)
             uid_hash = metadata_uid_sha256_prefix(uid) if uid else None
             return rows, outer_html, uid_hash
@@ -1303,6 +1452,9 @@ class LiveCaptureSession:
         total_timeout_s = float(config.get("total_series_timeout_s") or 900) if config else 900.0
         max_series = int(config.get("max_series") or 40) if config else 40
 
+        self._ensure_series_cfg(page)
+        container = self._series_cfg.get("item_container_selector")
+
         # P1#7: emit only safe discovery/phase events (branch id / ordinal /
         # counts / status / stage). Raw series_key / UID / patient text never
         # reach the event stream.
@@ -1314,7 +1466,7 @@ class LiveCaptureSession:
             series_locator = _resolve_locator_recipe(template.series_action.locator, pages)
             if series_locator is None:
                 raise HubUnrecoverableError("series list locator unresolved at discovery")
-            root = _series_scope_root(series_locator)
+            root = _series_scope_root(series_locator, container)
             doc_id = "d_series_hub"
             initial_state = self._snapshot_hub_state(root, template, pages)
             # Started just before discovery/iteration so the total-time budget is
@@ -1323,10 +1475,21 @@ class LiveCaptureSession:
 
             try:
                 descriptors, _members, evidence = discover_series_candidates(
-                    root, doc_id, max_scroll_steps=max_series, max_duration_s=min(10.0, total_timeout_s)
+                    root, doc_id, max_scroll_steps=max_series, max_duration_s=min(10.0, total_timeout_s),
+                    item_selector=self._series_cfg.get("item_selector"),
+                    identity_attrs=self._series_cfg.get("identity_attrs"),
                 )
             except Exception:
                 descriptors, evidence = [], SeriesCollectionEvidence("scroll_harvest", False, 0, 0, 0, False, "series_discovery_failed", 0)
+            recorded_activation = (
+                template.series_action.action_type
+                if template.series_action.action_type in {"click", "dblclick"}
+                else "click"
+            )
+            descriptors = [
+                replace(descriptor, activation=descriptor.activation or recorded_activation)
+                for descriptor in descriptors
+            ]
             # P1#6: discovered is the discovery's absolute count; every descriptor
             # must receive a terminal status (captured/partial/failed/skipped).
             discovered = len(descriptors)
@@ -1384,7 +1547,7 @@ class LiveCaptureSession:
                         pages = _live_pages_map(page)
                         series_locator = _resolve_locator_recipe(template.series_action.locator, pages)
                         if series_locator is not None:
-                            root = _series_scope_root(series_locator)
+                            root = _series_scope_root(series_locator, container)
                         try:
                             outcome = self.capture_one_series(page, descriptor, template, pages, config)
                             consecutive_hub_failures = 0
@@ -1647,7 +1810,11 @@ class LiveCaptureSession:
     def _snapshot_hub_state(self, root: object, template: RecordingTemplate, pages: dict[str, object]) -> dict[str, object]:
         selected_series_key: str | None = None
         try:
-            descriptors, _members, _ev = discover_series_candidates(root, "d_hub_state", max_scroll_steps=5, max_duration_s=2.0)
+            descriptors, _members, _ev = discover_series_candidates(
+                root, "d_hub_state", max_scroll_steps=5, max_duration_s=2.0,
+                item_selector=self._series_cfg.get("item_selector"),
+                identity_attrs=self._series_cfg.get("identity_attrs"),
+            )
             selected = next((d for d in descriptors if d.selected), None)
             selected_series_key = selected.series_key if selected else None
         except Exception:
@@ -1657,7 +1824,7 @@ class LiveCaptureSession:
             scroll_top = root.evaluate("el => el.scrollTop")
         except Exception:
             pass
-        meta_open = self._meta_factory(template.metadata_open, pages)
+        meta_open = self._metadata_scope_factory(template, pages)
         panel_open = False
         if meta_open is not None:
             panel_open = metadata_panel_signature(meta_open) is not None
@@ -1717,7 +1884,11 @@ class LiveCaptureSession:
 
         if initial.get("selected_series_key"):
             try:
-                descriptors, _members, _ev = discover_series_candidates(root, "d_hub_restore", max_scroll_steps=8, max_duration_s=3.0)
+                descriptors, _members, _ev = discover_series_candidates(
+                    root, "d_hub_restore", max_scroll_steps=8, max_duration_s=3.0,
+                    item_selector=self._series_cfg.get("item_selector"),
+                    identity_attrs=self._series_cfg.get("identity_attrs"),
+                )
                 target = next((d for d in descriptors if d.series_key == initial["selected_series_key"]), None)
                 if target is None:
                     problems.append("selection_lost")
@@ -1750,16 +1921,18 @@ class LiveCaptureSession:
         open for the next branch). Returns ``True`` when the desired end state is
         reached (or no Metadata trigger is present); ``False`` on failure.
         """
-        meta_open = self._meta_factory(template.metadata_open, pages)
+        meta_open = self._metadata_scope_factory(template, pages)
         if meta_open is None:
             return True
         try:
-            opened = meta_open()
-            if opened is None:
-                return False
             currently_open = metadata_panel_signature(meta_open) is not None
             if want_open and not currently_open:
-                opened.click()
+                for action in template.metadata_open_actions:
+                    step = self._meta_factory(action, pages)
+                    opened = step() if step is not None else None
+                    if opened is None:
+                        return False
+                    opened.click()
             elif not want_open and currently_open:
                 close = self._meta_factory(template.metadata_close, pages)
                 if close is not None:
@@ -1767,7 +1940,7 @@ class LiveCaptureSession:
                     if candidate is not None:
                         candidate.click()
             if want_open:
-                return metadata_panel_signature(meta_open) is not None
+                return wait_for_metadata_panel_state(page, meta_open, timeout_s=2.0, stable_s=0.2)
             # Closing: wait (bounded) for the panel to actually hide.
             return self._wait_for_metadata_hidden(page, meta_open, timeout_s=2.0)
         except Exception:
@@ -1789,6 +1962,14 @@ class RecordingTemplate:
     series_action: ActionTarget | None
     metadata_open: ActionTarget | None
     metadata_close: ActionTarget | None
+    metadata_open_sequence: tuple[ActionTarget, ...] = ()
+
+    @property
+    def metadata_open_actions(self) -> tuple[ActionTarget, ...]:
+        """All recorded actions required to reveal the Metadata panel."""
+        if self.metadata_open_sequence:
+            return self.metadata_open_sequence
+        return (self.metadata_open,) if self.metadata_open is not None else ()
 
     @property
     def complete(self) -> bool:
@@ -1820,9 +2001,10 @@ def classify_recording_template(plan: ActionPlan) -> RecordingTemplate:
                 series = action
             elif normalized == normalize_label("Meta 信息工具"):
                 meta_actions.append(action)
-    open_action = meta_actions[0] if meta_actions else None
+    open_actions = tuple(meta_actions[:-1] if len(meta_actions) >= 2 else meta_actions)
+    open_action = open_actions[0] if open_actions else None
     close_action = meta_actions[-1] if len(meta_actions) >= 2 else None
-    return RecordingTemplate(series, open_action, close_action)
+    return RecordingTemplate(series, open_action, close_action, open_actions)
 
 
 _LIVE_SESSION: LiveCaptureSession | None = None
@@ -2465,7 +2647,7 @@ def _build_branches_into_flow(
 
     series_branches: list[SeriesBranch] = []
     next_ordinal = len(states)
-    active_page_var = "page"
+    active_page_var = branch_selector.page_var if branch_selector is not None else "page"
 
     for snapshot in snapshots:
         branch_id = snapshot.branch_id

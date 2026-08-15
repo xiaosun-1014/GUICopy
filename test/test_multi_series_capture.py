@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
+from unittest.mock import patch
 
 from playwright.sync_api import sync_playwright
 
@@ -227,6 +228,47 @@ class MultiSeriesCaptureTests(unittest.TestCase):
             summary = {o.ordinal: o.capture_status for o in outcomes}
 
         self.assertEqual(sorted(summary), [0, 1, 2])
+
+    def test_missing_dom_activation_inherits_recorded_dblclick(self):
+        source = _TEMPLATE_SOURCE.replace('.first.click()', '.first.dblclick()')
+        template = classify_recording_template(parse_action_plan(source))
+        descriptor = SeriesDescriptor(
+            series_key="uid-1", label="Series A", ordinal=0, document_id="d_series_hub",
+            member_id="d_series_hub_series_000", stable_attributes={"data-series": "uid-1"},
+            selected=False, explicit_frame_count=None, inferred_frame_count=None,
+            activation=None,
+        )
+        evidence = batch.SeriesCollectionEvidence(
+            "scroll_harvest", False, 1, 1, 0, True, None, 1
+        )
+
+        with tempfile.TemporaryDirectory() as tmp, sync_playwright() as playwright:
+            session = LiveCaptureSession(Path(tmp))
+            browser = playwright.chromium.launch()
+            page = browser.new_page()
+            page.set_content(HUB_FIXTURE)
+            captured = []
+
+            def capture(_page, current, _template, _pages, _config):
+                captured.append(current)
+                return batch.CaptureBranchOutcome(
+                    branch_id="b000_test", series_key=current.series_key,
+                    label=current.label, ordinal=current.ordinal,
+                    document_id=current.document_id, source_member_id=current.member_id,
+                    activation=current.activation or "click", capture_status="captured",
+                    fail_stage=None, error_type=None, warning=None,
+                )
+
+            with patch.object(batch, "discover_series_candidates", return_value=([descriptor], [], evidence)), \
+                    patch.object(session, "capture_one_series", side_effect=capture):
+                session.finalize_series_branches(
+                    page, template,
+                    config={"expand_all_series": True, "per_series_timeout_s": 1,
+                            "total_series_timeout_s": 10, "max_series": 1},
+                )
+            browser.close()
+
+        self.assertEqual(captured[0].activation, "dblclick")
 
     def test_exploration_restores_original_scroll_and_selection(self):
         with tempfile.TemporaryDirectory() as tmp, sync_playwright() as playwright:

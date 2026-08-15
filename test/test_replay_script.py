@@ -27,6 +27,17 @@ def run():
 run()
 '''
 
+MULTI_STEP_METADATA_SOURCE = '''from playwright.sync_api import sync_playwright
+
+def run(page):
+    # [MARKER: 序列选择]
+    page.locator("#series").click()
+    # [MARKER: Meta 信息工具]
+    page.locator("#more").click()
+    page.get_by_role("link").filter(has_text="Tags").click()
+    page.locator("#meta-close").click()
+'''
+
 EXPANSION_CONFIG = {
     "expand_all_series": True,
     "max_series": 40,
@@ -44,6 +55,22 @@ class ExpansionHookInjectionTests(unittest.TestCase):
         self.assertEqual(template.series_action.action_id, "a_000_001")
         self.assertEqual(template.metadata_open.action_id, "a_001_001")
         self.assertEqual(template.metadata_close.action_id, "a_002_001")
+
+    def test_template_classification_preserves_multi_step_metadata_open(self):
+        plan = parse_action_plan(MULTI_STEP_METADATA_SOURCE)
+        template = classify_recording_template(plan)
+
+        self.assertTrue(template.complete)
+        self.assertEqual(template.metadata_open.action_id, "a_001_001")
+        self.assertEqual(
+            [action.action_id for action in template.metadata_open_actions],
+            ["a_001_001", "a_001_002"],
+        )
+        final_open = template.metadata_open_actions[-1]
+        self.assertEqual(final_open.action_id, "a_001_002")
+        self.assertEqual(final_open.locator.locator_args["args"], ["link"])
+        self.assertEqual(final_open.locator.locator_args["_filter"], {"has_text": "Tags"})
+        self.assertEqual(template.metadata_close.action_id, "a_001_003")
 
     def test_expansion_hook_imported_only_when_enabled(self):
         instrumented = instrument_marked_actions(EXPANSION_SOURCE, expansion_config=EXPANSION_CONFIG)

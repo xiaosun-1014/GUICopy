@@ -22,7 +22,7 @@ _SERIES_IDENTITY_ATTRS = ("data-series-uid", "data-series", "data-uid", "value",
 # *served* HTML surface. Routing uses the injected ``data-replica-series-key``
 # slug, so these are safe to drop from the rendered member markup while the
 # complete (sanitized-for-executables) Metadata panel remains intact.
-_SERIES_IDENTITY_REDACT_ATTRS = ("data-series-uid", "data-uid")
+_SERIES_IDENTITY_REDACT_ATTRS = (*_SERIES_IDENTITY_ATTRS, "title")
 
 
 def _redact_series_identity_attrs(outer_html: str) -> str:
@@ -36,6 +36,39 @@ def _redact_series_identity_attrs(outer_html: str) -> str:
     for name in _SERIES_IDENTITY_REDACT_ATTRS:
         outer_html = re.sub(rf'\s{name}=("[^"]*"|\'[^\']*\')', "", outer_html, flags=re.IGNORECASE)
     return outer_html
+
+
+def _redact_series_snapshot_markup(
+    snapshot: DomNodeSnapshot,
+    markup: str,
+    replacement: str = "redacted-series",
+) -> str:
+    """Redact identity attributes and any repeated identity value in a subtree."""
+    markup = _redact_series_identity_attrs(markup)
+    raw_values = {
+        snapshot.attributes.get(name, "")
+        for name in _SERIES_IDENTITY_REDACT_ATTRS
+    }
+    for raw_value in sorted((value for value in raw_values if value), key=len, reverse=True):
+        markup = markup.replace(html.escape(raw_value, quote=True), replacement)
+        markup = markup.replace(raw_value, replacement)
+    return markup
+
+
+def _redact_known_series_identities(
+    markup: str,
+    series_route_by_identity: dict[str, dict[str, object]] | None,
+) -> str:
+    """Replace every captured raw series identity with its public route slug."""
+    for raw_value, route in sorted(
+        (series_route_by_identity or {}).items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        if not raw_value:
+            continue
+        replacement = str(route.get("slug") or "redacted-series")
+        markup = markup.replace(html.escape(raw_value, quote=True), replacement)
+        markup = markup.replace(raw_value, replacement)
+    return markup
 
 
 def _member_series_key(dom: DomNodeSnapshot) -> str | None:
@@ -233,9 +266,10 @@ def _series_member_html(
     attributes += f' aria-selected="{"true" if selected else "false"}"'
     if disabled:
         attributes += ' aria-disabled="true"'
-    # Raw identity attributes (data-series-uid / data-uid) never reach the served
-    # surface; the slug is what routes offline (P1#8 closure).
-    src = _redact_series_identity_attrs(snapshot.outer_html)
+    # Raw identity attributes never reach the served subtree. Some viewers copy
+    # the SeriesInstanceUID into every descendant ``id`` and patient identity
+    # into ``title``; neither is needed because the public slug routes offline.
+    src = _redact_series_snapshot_markup(snapshot, snapshot.outer_html, series_key)
     return src.replace(f"<{snapshot.tag_name}", f"<{snapshot.tag_name}{attributes}", 1)
 
 
@@ -441,10 +475,13 @@ def _render_document(
                 continue
             input_mode = target.dom.tag_name in {"input", "textarea"}
             snapshot = target.dom if input_mode else region_by_id.get(target.dom.attributes.get("id", ""), target.dom)
-            parts.append(_positioned_html(
+            target_markup = _positioned_html(
                 snapshot,
                 target.action_id,
                 input_mode,
+            )
+            parts.append(_redact_known_series_identities(
+                target_markup, series_route_by_identity
             ))
             rendered_nodes.add((snapshot.outer_html, snapshot.rect.x, snapshot.rect.y, snapshot.rect.width, snapshot.rect.height))
             if snapshot.attributes.get("id"):
@@ -490,14 +527,22 @@ def _render_document(
                         disabled_route = bool(identity_route.get("disabled"))
             if series_key is not None:
                 route = (series_route or {}).get(series_key, {})
-                parts.append(_series_member_html(
+                member_markup = _series_member_html(
                     member.dom,
                     series_key,
                     selected=bool(series_key == selected_series_key),
                     disabled=disabled_route or bool(route.get("disabled")),
+                )
+                parts.append(_redact_known_series_identities(
+                    member_markup, series_route_by_identity
                 ))
             else:
-                parts.append(_positioned_html(member.dom))
+                positioned = _positioned_html(member.dom)
+                if region.region_type == "series":
+                    positioned = _redact_series_snapshot_markup(member.dom, positioned)
+                parts.append(_redact_known_series_identities(
+                    positioned, series_route_by_identity
+                ))
             rendered_nodes.add(member_key)
             if member.dom.attributes.get("id"):
                 rendered_element_ids.add(member.dom.attributes["id"])
