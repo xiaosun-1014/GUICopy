@@ -187,6 +187,64 @@ D:/Anaconda/envs/codegen-marker/python.exe "out\{医院}\runs\{run_id}\replica\s
 
 ---
 
+## 7b. 多序列探索（自动采集全部序列）
+
+> 只需人工录制**一个**序列的完整模板（`选择一个序列 → Meta 打开 → Meta 关闭`），当
+> `expand_all_series=true` 时，管道会在同一已登录浏览器会话内自动发现并按序采集其它序列，
+> 使离线 Replica 每个成功序列都可点击。
+
+### 配置项与预算默认值
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `expand_all_series` | `false` | 默认关闭（旧行为不变）；开启需模板完整（含序列选择 + Meta 打开 + Meta 关闭），否则 preflight 报错 |
+| `max_series` | `40` | 最多采集条数（硬上限） |
+| `per_series_timeout_s` | `20` | 单序列切换就绪 / Metadata 稳定超时（秒） |
+| `total_series_timeout_s` | `900` | 整次探索总时间预算（秒） |
+| `viewer_capture_mode` | `first_stable_frame` | MVP 唯一实现值 |
+
+命令行（`capture-build` / `capture-only` / `live` 均支持）：
+
+```bash
+D:/Anaconda/envs/codegen-marker/python.exe pipeline_orchestrator.py `
+  --hospital {医院} `
+  --script "D:\00-Project\04-codegencopy\out\{医院}\processed_script_{医院}.py" `
+  --annotations "D:\00-Project\04-codegencopy\out\{医院}\replica_annotations.json" `
+  --output-root out --auth-mode scripted --operation capture-build `
+  --expand-all-series --max-series 40 --per-series-timeout 20 --total-series-timeout 900
+```
+
+### 预算 / 速率 / 终态语义
+
+- **串行、不并行**：同一 Page 上一序列一序列地来；每次切换后等「组合证据」稳定（selected 态 /
+  名称匹配 / canvas hash 变化 / DOM 稳定 / 截图非空），不以固定 sleep 当作就绪。
+- 达到 `total_series_timeout_s` 即停止，剩余标 `skipped_budget`/partial；`max_series` 为硬上限。
+- 单序列超时只降级该条（Viewer 成但 Metadata 没稳定 → `partial`，非 failed）；不影响其它序列。
+- 单序列只存一张稳定 Viewer 截图；重复视觉资产按 SHA-256 去重（`assets/by-hash/`）。
+
+### 产物与断点边界
+
+- 探索证据在 `out/{医院}/runs/{run_id}/capture/series_branches/{safe_series_key}/`，
+  `safe_series_key` 是内部 hash slug（不含原始 UID / 患者名 / 检查号）；`series_capture_manifest.json`
+  记录每 branch 终态与守恒计数。
+- MVP **只支持整个 exploration 重跑**，不做 branch 级 resume；不跨患者 / 检查复用 snapshot。
+- 序列列表 hub 连续无法恢复时允许**一次**受控 reload/bootstrap 恢复，恢复会留审计
+  `reloaded: true` / `series_reload_recovered_once`；再失败即停止并标 partial/failed。
+
+### 患者数据保护
+
+- 日志、事件、公开报告**不含**患者姓名 / 检查号 / 原始 UID / Metadata 原文；URL / token 沿用
+  `sanitize_html()` / `redact_url` 脱敏。capture 原始产物、截图与 metadata 属敏感医疗数据，
+  已在 `out/`、`capture/`、`spy/`、`out/**/series_branches/` 等 `.gitignore` 规则覆盖内，不上传公共仓库。
+- **served Replica 的 Metadata 面板属受限敏感产物**：它按产品目标原样展示完整的（已剔除可执行 /
+  credential / remote 属性）Metadata DOM，其可见文本可能含患者 / 序列身份值。因此隐私边界为：
+  所有 **route / build 报告 / event / log / 其余 served 面**一律只用 `series_key_slug()` / SHA-256 哈希，
+  绝不出现原始 UID / 患者派生 key；Metadata 面板文本是该边界的**明确豁免项**，作为本地受限产物保留完整。
+  校验 `pipeline_validation.validate_series_privacy` 会自动扫描 route/event/log 与 served（非 Metadata）面，
+  并核对 Metadata 面板仍完整可读。
+
+---
+
 ## 8. 建议的执行顺序
 
 1. **ft**（最熟、链路已验证）先录+跑通，确认整套流程 OK（若只需看复刻，用"只复刻"方式，不烧 API）。
