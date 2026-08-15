@@ -10,5 +10,6 @@
 | [three-stage-workflow.md](three-stage-workflow.md) | 三阶段工作流与调试原则 |
 | [loop-stop-hook-json-validation.md](loop-stop-hook-json-validation.md) | /loop Stop hook 报 JSON validation failed 的根因与规避 |
 | [sdd-closeout-experience.md](sdd-closeout-experience.md) | SDD 计划收尾执行经验（re-review → 关 task → final review triage → push） |
+| [metadata-panel-sibling-controls-regression.md](metadata-panel-sibling-controls-regression.md) | metadata 面板兄弟控件离线回放回归（5c2e2d4 + b637886 叠加）定位与修复 |
 
 > 这些记忆文件的纯文本内容也被整合在 [CLAUDE.md](../CLAUDE.md) 中供 agent 自动加载。

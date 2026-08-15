@@ -10,6 +10,7 @@
   - `loop-stop-hook-json-validation.md` — `/loop` Stop hook 报 "JSON validation failed" 的根因与规避
   - `sdd-closeout-experience.md` — SDD 计划收尾执行经验（re-review → 关 task → final review triage → push）
   - `codex-windows-sandbox-1385.md` — cc 调 codex 报 `CreateProcessWithLogonW 1385` 的根因与修复（`~/.codex/config.toml` 的 `windows.sandbox=elevated` 在本机不可用，改 `unelevated` 并重启会话）
+  - `metadata-panel-sibling-controls-regression.md` — metadata 面板兄弟控件离线回放回归（5c2e2d4 + b637886 叠加）定位与修复；教训：**环境可跑浏览器就一定要跑浏览器套件**，两处独立改动可能叠加成回归
 - **本文件（CLAUDE.md）** — 项目核心上下文，整合所有记忆的要点
 
 不再使用系统级（AppData）记忆存储。如需添加或更新记忆，直接编辑 `memory/` 下的对应文件，并同步更新 CLAUDE.md 中的相关章节。
