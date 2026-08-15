@@ -209,6 +209,65 @@ class BuildReplicaTests(unittest.TestCase):
 
             self.assertEqual(rendered.count('id="patient-name"'), 1)
 
+    def test_metadata_panel_keeps_side_controls_reachable_and_panel_once(self):
+        # Regression: capture_marker_panel_region 命中面板后，面板外的兄弟交互控件
+        # （WL/WW 输入、确认按钮、canvas 等）仍应作为普通成员渲染并可点击，
+        # 离线回放才能继续；面板 root 已逐字包含的内容不得重复渲染。
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir()
+            (root / "assets" / "main.png").write_bytes(b"png")
+            panel = DomNodeSnapshot(
+                "div", "Patient Name", {"id": "tagsBox"},
+                Rect(40, 50, 300, 120, "page_viewport_css"),
+                '<div id="tagsBox"><div id="patient-name">Patient Name</div></div>',
+                {"display": "block"},
+            )
+            confirm = DomNodeSnapshot(
+                "button", "确定", {"id": "confirm"},
+                Rect(50, 200, 60, 24, "page_viewport_css"),
+                '<button id="confirm">确定</button>', {"display": "block"},
+            )
+            canvas = DomNodeSnapshot(
+                "canvas", "", {"id": "overlaycanvas-0_0"},
+                Rect(20, 60, 100, 80, "page_viewport_css"),
+                '<canvas id="overlaycanvas-0_0" width="100" height="80"></canvas>', {"display": "block"},
+            )
+            region = InteractionRegion(
+                "r_meta", "metadata", "d_main", panel,
+                [
+                    RegionMember("in_panel", "div", panel),
+                    RegionMember("side_confirm", "button", confirm),
+                    RegionMember("side_canvas", "canvas", canvas),
+                ],
+                None,
+            )
+            document = ReplicaDocument(
+                "d_main", "p_main", "page", "main", None, None, None, None,
+                {"width": 800, "height": 600}, 1, "css", 0, 0,
+                "assets/main.png", "main", 3, regions=[region],
+            )
+            flow = ReplicaFlow(
+                1, "meta", "recorded.py", "hash", "now", {"width": 800, "height": 600},
+                BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000",
+                [ReplicaState(
+                    "s_000", 0, "", "page",
+                    [ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)],
+                    [document], [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry"),
+                )], [],
+            )
+
+            output = root / "replica"
+            build_replica(flow, root, output)
+            rendered = (output / "index.html").read_text(encoding="utf-8")
+
+            # 面板 root 只渲染一次（不因 in_panel member 重复）。
+            self.assertEqual(rendered.count('id="tagsBox"'), 1)
+            self.assertEqual(rendered.count('id="patient-name"'), 1)
+            # 面板外兄弟控件照常渲染为 overlay。
+            self.assertIn('id="confirm"', rendered)
+            self.assertIn('id="overlaycanvas-0_0"', rendered)
+
     def test_metadata_close_action_is_embedded_in_original_dom_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

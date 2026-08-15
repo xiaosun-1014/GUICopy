@@ -490,12 +490,34 @@ def capture_marker_panel_region(
     if rect["width"] > 0 and rect["height"] > 0 and result["html"].count("<") > 2000:
         return None
     root = capture_locator_snapshot(root_locator, "page_viewport_css")
+    # The panel root is rendered verbatim as a scrollable region (complete
+    # outerHTML). Around it the page may still show sibling interactive
+    # controls (WL/WW inputs, confirm button, canvas, series toolbar) that the
+    # offline replay must keep reachable — collect them as members, excluding
+    # anything already inside the panel root so it is not duplicated.
+    members: list[RegionMember] = []
+    raw_root_html = result.get("html", "")
+    controls = scope.locator("button, input, select, textarea, canvas, [role], [data-testid], [id], [class]")
+    for index in range(controls.count()):
+        locator = controls.nth(index)
+        try:
+            raw_html = locator.evaluate("element => element.outerHTML") or ""
+            if not raw_html:
+                continue
+            if raw_root_html and (
+                raw_html in raw_root_html or raw_root_html in raw_html
+            ):
+                continue
+            snapshot = capture_locator_snapshot(locator, "region_content_css")
+        except Exception:
+            continue
+        members.append(RegionMember(f"{document_id}_metadata_sibling_{index:03d}", snapshot.tag_name, snapshot))
     return InteractionRegion(
         f"{document_id}_metadata",
         "metadata",
         document_id,
         root,
-        [],
+        members,
         None,
     )
 

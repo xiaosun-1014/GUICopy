@@ -339,8 +339,8 @@ def _render_document(
         ".replica-bg{display:block;width:100%;height:100%;object-fit:fill}"
         ".overlay{position:absolute;inset:0}.overlay>*{box-sizing:border-box}"
         ".overlay>[data-replica-overlay]{opacity:0}.overlay>[data-replica-action]{z-index:1}"
-        ".overlay>[data-replica-overlay]:not([data-replica-action]):not([data-replica-input]):not([data-replica-series-key]):not([role]){pointer-events:none}"
-        ".overlay>[data-replica-action],.overlay>[data-replica-input],.overlay>[data-replica-series-key],.overlay>[data-replica-overlay][role]{pointer-events:auto}"
+        ".overlay>[data-replica-overlay]:not([data-replica-action]):not([data-replica-input]):not([data-replica-series-key]):not([role]):not(button):not(input):not(select):not(textarea):not(canvas):not(a){pointer-events:none}"
+        ".overlay>[data-replica-action],.overlay>[data-replica-input],.overlay>[data-replica-series-key],.overlay>[data-replica-overlay][role],.overlay>[data-replica-overlay][data-testid],.overlay>[data-replica-overlay]button,.overlay>[data-replica-overlay]input,.overlay>[data-replica-overlay]select,.overlay>[data-replica-overlay]textarea,.overlay>[data-replica-overlay]canvas,.overlay>[data-replica-overlay]a{pointer-events:auto}"
         ".overlay>[data-replica-input]{opacity:1;caret-color:rgb(255,255,255)}"
         ".replica-metadata{background:rgb(3,6,9);color:rgb(209,228,255);"
         "font:14px/1.35 'Helvetica Neue',Helvetica,'Microsoft YaHei',Arial,sans-serif;"
@@ -450,13 +450,25 @@ def _render_document(
             if snapshot.attributes.get("id"):
                 rendered_element_ids.add(snapshot.attributes["id"])
     for region in document.regions:
-        if _is_metadata_panel(region):
-            continue
+        metadata_panel_html_for_region = (
+            metadata_panel_html.get(region.region_id)
+            if _is_metadata_panel(region)
+            else None
+        )
         for member in region.members:
             if member.dom.attributes.get("id") in rendered_element_ids:
                 continue
             if any(f'id="{element_id}"' in member.dom.outer_html for element_id in rendered_element_ids):
                 continue
+            if metadata_panel_html_for_region is not None and member.dom.outer_html:
+                # Sibling controls around a metadata panel are captured as
+                # members (WL/WW inputs, confirm button, canvas); anything the
+                # panel root already contains verbatim must not be duplicated.
+                if (
+                    member.dom.outer_html in metadata_panel_html_for_region
+                    or metadata_panel_html_for_region in member.dom.outer_html
+                ):
+                    continue
             member_key = (member.dom.outer_html, member.dom.rect.x, member.dom.rect.y, member.dom.rect.width, member.dom.rect.height)
             if member_key in rendered_nodes:
                 continue
