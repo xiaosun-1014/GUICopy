@@ -289,6 +289,34 @@ class ReplicaRegionTests(unittest.TestCase):
         self.assertIn("Scout", text)
         self.assertNotIn("Interfering", text)
 
+    def test_activation_path_locate_series_row_uses_configured_item_selector(self):
+        # C1 回归锁：激活路径 _locate_series_row / _reparse_target_row 必须接入
+        # item_selector。ft 序列行是 a:has(span.total)，默认 _SERIES_ITEM_SELECTOR
+        # （option/[data-series]/[role=option]/.series-item/li）一个都不匹配；
+        # 若激活路径仍用默认选择器，FT 批量复刻会是「发现成功、激活全失败」。
+        from batch_capture_replicate import LiveCaptureSession, _locate_series_row
+        fixture = Path(__file__).parent / "fixtures" / "multi_series" / "ft_series_list.html"
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page()
+            page.goto(fixture.as_uri())
+            root = page.locator("[class*=os-viewport]").first
+            descriptors, _, _ = discover_series_candidates(
+                root, "ft", item_selector="a:has(span.total)", identity_attrs=[]
+            )
+            target = descriptors[0]
+            # 不传 item_selector（C1 bug 状态）→ 定位不到行，激活必失败
+            row_default, _ = _locate_series_row(root, target)
+            self.assertIsNone(row_default)
+            # 传配置的 item_selector → 能重新定位（主激活 + 轮询读取两条路都靠它）
+            row, _ = _locate_series_row(root, target, item_selector="a:has(span.total)")
+            self.assertIsNotNone(row)
+            row_reparse = LiveCaptureSession._reparse_target_row(
+                root, target, item_selector="a:has(span.total)"
+            )
+            self.assertIsNotNone(row_reparse)
+            browser.close()
+
     # ---- _series_viewer_config_for URL matching (batch_capture_replicate) ----
 
     def test_series_viewer_config_matches_known_viewer_urls(self):

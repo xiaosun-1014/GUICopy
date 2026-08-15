@@ -120,7 +120,11 @@
 | `meta_panel.open_button_names`（uicloud: `DICOM信息 F2` / `DICOM信息`） | 真实站能点开的按钮名（U5） |
 | `meta_panel.close_button_selectors`（当前 `[]`） | **spike 重点**：真实 close 选择器（U5） |
 | `meta_panel.tag_row_format` / `tag_pattern` | 面板 DOM 结构是否匹配（U4） |
-| `sequence_select.item_container_selectors`（uicloud: `.series-item` 等） | 真实 item 容器（U6） |
+> ⚠️ **字段更正**：`sequence_select.item_container_selectors`（**复数**）在任何 `.py` 中零消费（死字段，含 uicloud/cxhospital 旧条目里的）。实际被 `batch_capture_replicate._series_viewer_config_for` 读取的契约是下列 **单数** 字段：
+
+| `sequence_select.item_container_selector`（单数；uicloud: `.series-item` 等） | 真实滚动容器（U6）——ft 为 `div.os-viewport`、zs 为 `#HLeftThumnail` |
+| `sequence_select.item_selector`（可空） | 真实序列行选择器（U6）——ft 为 `a:has(span.total)`、zs 为 `li.ui-draggable` |
+| `sequence_select.identity_attrs`（可空） | 序列身份稳定属性（身份可区分性）——ft 为 `[]`（文本 fallback）、zs 为 `["id"]` |
 | `sequence_select.text_pattern` | 帧数文本匹配正则是否命中（U3/U6） |
 | `sequence_select.canvas_selectors` | 画布选择器（U3 的 canvas hash 证据用） |
 | （新增字段，若整体结构不匹配） | 按「新增 viewer 模板」流程补一份，先本地 fixture 验证再回填 |
@@ -143,7 +147,7 @@ out/{hospital}/multi_series_spike/
 
 - [ ] 截图一律 `.jpeg`（本机 `.png` 会被加密改写，Read 报错）。
 - [ ] 图片/JSON 在保存前手动清除患者姓名、检查号、UID、token 痕迹。
-- [ ] 该目录已有 `.gitignore` 覆盖（`out/` 整体 + `/out/**/series_branches/`，见根 `.gitignore` 35–40 行），**绝不提交**。
+- [ ] 该目录已有 `.gitignore` 覆盖（`out/` 第 30 行 + `/out/**/series_branches/` 第 40 行，另有 `out/*/runs/` 第 64 行），**绝不提交**。
 
 ---
 

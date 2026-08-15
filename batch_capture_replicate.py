@@ -554,12 +554,17 @@ def _locate_series_row(
     root_locator: object,
     descriptor: SeriesDescriptor,
     max_scroll_steps: int = 40,
+    item_selector: str | None = None,
 ) -> tuple[object | None, int]:
     """Re-locate the target series row after virtual-list scrolling.
 
     Re-parses the item locator on demand and scrolls through the list (restoring
     the original scroll position on every exit) until a row whose stable
     attributes / normalized text match the descriptor resolves and is visible.
+    ``item_selector`` overrides the default row selector; the activation path
+    must pass the configured per-viewer selector or rows like FTImage's
+    ``a:has(span.total)`` are never found (the default ``option, [...], li``
+    does not match them).
     Returns ``(locator_or_None, scroll_steps_taken)``.
     """
     try:
@@ -567,7 +572,7 @@ def _locate_series_row(
     except Exception:
         return None, 0
     try:
-        items = root_locator.locator(_SERIES_ITEM_SELECTOR)
+        items = root_locator.locator(item_selector or _SERIES_ITEM_SELECTOR)
         try:
             root_locator.evaluate("element => element.scrollTop = 0")
         except Exception:
@@ -909,7 +914,10 @@ class LiveCaptureSession:
             previous_canvas_hash = canvas_hash(viewer_frame)
 
             status["fail_stage"] = "locate"
-            row_locator, _steps = _locate_series_row(root, descriptor, max_scroll_steps=max_series)
+            row_locator, _steps = _locate_series_row(
+                root, descriptor, max_scroll_steps=max_series,
+                item_selector=self._series_cfg.get("item_selector"),
+            )
             if row_locator is None:
                 raise HubUnrecoverableError("target series row not found in hub")
 
@@ -933,7 +941,10 @@ class LiveCaptureSession:
                 retry_root = self._reparse_series_root(recipe, page, container)
                 if retry_root is None:
                     raise HubUnrecoverableError("series root lost on retry")
-                row_locator, _steps = _locate_series_row(retry_root, descriptor, max_scroll_steps=max_series)
+                row_locator, _steps = _locate_series_row(
+                    retry_root, descriptor, max_scroll_steps=max_series,
+                    item_selector=self._series_cfg.get("item_selector"),
+                )
                 if row_locator is None:
                     raise HubUnrecoverableError("target series row lost on retry")
                 self._perform_activation(row_locator, activation)
@@ -1117,7 +1128,7 @@ class LiveCaptureSession:
                 stable_since = None
                 time.sleep(0.15)
                 continue
-            row = self._reparse_target_row(root, descriptor)
+            row = self._reparse_target_row(root, descriptor, item_selector=self._series_cfg.get("item_selector"))
             evidence = self._collect_evidence(row, descriptor, viewer_frame, previous_canvas_hash)
             if _evidence_satisfied(evidence):
                 stable_since = stable_since or time.monotonic()
@@ -1129,9 +1140,13 @@ class LiveCaptureSession:
         return False
 
     @staticmethod
-    def _reparse_target_row(root_locator: object, descriptor: SeriesDescriptor) -> object | None:
+    def _reparse_target_row(
+        root_locator: object,
+        descriptor: SeriesDescriptor,
+        item_selector: str | None = None,
+    ) -> object | None:
         """Re-locate the target series row from its stable descriptor (P1#4)."""
-        row, _steps = _locate_series_row(root_locator, descriptor)
+        row, _steps = _locate_series_row(root_locator, descriptor, item_selector=item_selector)
         return row
 
     @staticmethod
@@ -1280,6 +1295,12 @@ class LiveCaptureSession:
                 result.update({"ok": False, "fail_stage": "stabilize", "error_type": "metadata_timeout"})
                 return result
             if not stable:
+                if uid_hash is None:
+                    # Content captured but carries no series-identity evidence;
+                    # it may be a stale/partial panel from another series. Do not
+                    # claim per-series metadata we cannot attribute to this branch.
+                    result.update({"ok": False, "fail_stage": "stabilize", "error_type": "metadata_unstable_no_uid"})
+                    return result
                 result["warning"] = "metadata_unstable_snapshot"
             # P1#8: run the unified HTML sanitizer before any persistence.
             outer_html = sanitize_html(raw_outer_html) if raw_outer_html else ""
@@ -1893,7 +1914,10 @@ class LiveCaptureSession:
                 if target is None:
                     problems.append("selection_lost")
                 else:
-                    row, _steps = _locate_series_row(root, target, max_scroll_steps=12)
+                    row, _steps = _locate_series_row(
+                        root, target, max_scroll_steps=12,
+                        item_selector=self._series_cfg.get("item_selector"),
+                    )
                     if row is None:
                         problems.append("selection_unlocatable")
                     else:

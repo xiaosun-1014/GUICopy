@@ -24,6 +24,13 @@ _SERIES_IDENTITY_ATTRS = ("data-series-uid", "data-series", "data-uid", "value",
 # complete (sanitized-for-executables) Metadata panel remains intact.
 _SERIES_IDENTITY_REDACT_ATTRS = (*_SERIES_IDENTITY_ATTRS, "title")
 
+# Identity values shorter than this are not safe to replace globally: a short
+# value ("1", "202") would appear all over markup text / CSS, and replacing
+# every occurrence silently corrupts the served page's text and styles. Real
+# identity values (UIDs, unique series descriptions) are far longer and remain
+# fully redacted; short values are left in place as the safe trade-off.
+_REDACT_MIN_IDENTITY_LEN = 8
+
 
 def _redact_series_identity_attrs(outer_html: str) -> str:
     """Remove raw identity attributes (e.g. ``data-series-uid``) from served HTML.
@@ -50,6 +57,8 @@ def _redact_series_snapshot_markup(
         for name in _SERIES_IDENTITY_REDACT_ATTRS
     }
     for raw_value in sorted((value for value in raw_values if value), key=len, reverse=True):
+        if len(raw_value) < _REDACT_MIN_IDENTITY_LEN:
+            continue
         markup = markup.replace(html.escape(raw_value, quote=True), replacement)
         markup = markup.replace(raw_value, replacement)
     return markup
@@ -63,7 +72,7 @@ def _redact_known_series_identities(
     for raw_value, route in sorted(
         (series_route_by_identity or {}).items(), key=lambda item: len(item[0]), reverse=True
     ):
-        if not raw_value:
+        if not raw_value or len(raw_value) < _REDACT_MIN_IDENTITY_LEN:
             continue
         replacement = str(route.get("slug") or "redacted-series")
         markup = markup.replace(html.escape(raw_value, quote=True), replacement)

@@ -65,7 +65,9 @@ SERIES_FIXTURE = """
     g.fillStyle = '#ffffff'; g.fillRect(10,10,20,20);
     document.getElementById('current-series').textContent = item.textContent.trim();
     document.querySelector('[data-meta-series]').textContent =
-        'SeriesNumber: ' + uid.split('.').pop() + ' / uid=' + uid;
+        'SeriesNumber: ' + uid.split('.').pop() + ' / uid=' + uid +
+        ' / SeriesInstanceUID: ' + uid +
+        ' / SeriesDescription: ' + item.textContent.trim();
   }
   document.querySelectorAll('.item').forEach(function(el){
     el.addEventListener('click', function(){ selectItem(el); });
@@ -239,6 +241,28 @@ class CaptureAndBuildSeriesContractTests(unittest.TestCase):
             # No raw series identity in the branch directory name (safe slug only).
             for _, _, branch_dir in captured:
                 self.assertNotIn("1.2.3", branch_dir.name, "raw UID must not enter the branch dir name")
+
+            # ---- 1b. per-series Metadata 互异（验收判据：≥2 分支互不相同） ----
+            # 每个分支的 metadata_rows.json 必须携带它自己的 uid 身份；两个分支
+            # 的内容与 uid 指纹都不能相同，否则「点 B → Meta 是 B」不成立。
+            metadata_rows_by_key = {
+                descriptor["series_key"]: _read_json(branch_dir / "metadata" / "metadata_rows.json")
+                for _status, descriptor, branch_dir in captured
+            }
+            self.assertGreaterEqual(
+                len(metadata_rows_by_key), 2,
+                "per-series metadata distinctness needs at least 2 captured branches",
+            )
+            keys = sorted(metadata_rows_by_key)
+            self.assertNotEqual(
+                metadata_rows_by_key[keys[0]], metadata_rows_by_key[keys[1]],
+                "metadata_rows.json must differ across captured series",
+            )
+            self.assertNotEqual(
+                metadata_rows_by_key[keys[0]].get("uid_sha256_prefix"),
+                metadata_rows_by_key[keys[1]].get("uid_sha256_prefix"),
+                "per-series uid identity must differ across branches",
+            )
 
             # ---- 2. The REAL v2 manifest round-trips and validates. ----
             flow = read_manifest(capture_root / "manifest.json", capture_root, verify_source_hash=True)

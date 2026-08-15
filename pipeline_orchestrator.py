@@ -158,7 +158,12 @@ def _scrub_run_query_secrets_after_capture(layout: RunLayout) -> int:
     for path in sorted(layout.root.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in text_suffixes:
             continue
-        text = path.read_text(encoding="utf-8", errors="replace")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            # Never rewrite artifacts that are not UTF-8 (e.g. GBK): replacing
+            # undecodable bytes would corrupt the file irreversibly.
+            continue
         scrubbed = strip_known_query_secrets(text)
         if scrubbed != text:
             path.write_text(scrubbed, encoding="utf-8", newline="\n")

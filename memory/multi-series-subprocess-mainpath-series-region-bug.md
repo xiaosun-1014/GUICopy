@@ -16,7 +16,7 @@ metadata:
 
 ## 根因
 
-`LiveCaptureSession.before("a_000_001", …, '序列选择')` → `_capture()` 第 574–578 行：
+`LiveCaptureSession.before("a_000_001", …, '序列选择')` → `_capture()` 第 663 行（修复后行号；修复前 574–578）：
 
 ```python
 frame_owner = target_locator.evaluate(...)   # 多元素 locator → strict mode violation
