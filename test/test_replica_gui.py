@@ -9,7 +9,7 @@ from unittest.mock import patch
 from PyQt6.QtWidgets import QApplication
 
 from batch_capture_replicate import validate_annotations
-from main_gui import MainWindow, build_annotations_from_source, build_replica_annotations, export_preflight_errors, normalize_ftimage_codegen, rebuild_display_state_from_source, replica_python_executable, write_source_text
+from main_gui import MainWindow, build_annotations_from_source, build_replica_annotations, export_preflight_errors, normalize_ftimage_codegen, preserve_entry_url, rebuild_display_state_from_source, replica_python_executable, write_source_text
 from markers import DEFAULT_MARKERS
 
 
@@ -109,6 +109,35 @@ page.get_by_role("link").filter(has_text=re.compile(r"^$")).click()
         self.assertIn('page.locator("#moreBox a.tool.tool-tags").click()', normalized)
         self.assertIn('page.locator("#tagsBox a.close").click()', normalized)
         self.assertNotIn('page.locator("a.tool.tool-tags").click()', normalized)
+
+    def test_preserve_entry_url_replaces_only_first_page_navigation(self):
+        source = '''page.goto("https://example.test/redirected")
+page.goto("https://example.test/user-navigation")
+'''
+
+        preserved = preserve_entry_url(
+            source,
+            "https://example.test/#/shared?code=abc123",
+        )
+
+        self.assertIn(
+            'page.goto("https://example.test/#/shared?code=abc123")',
+            preserved,
+        )
+        self.assertIn(
+            'page.goto("https://example.test/user-navigation")',
+            preserved,
+        )
+
+    def test_codegen_updates_keep_recording_entry_url(self):
+        self.window._entry_url = "https://example.test/#/shared?code=abc123"
+
+        self.window._on_code_ready(
+            'def run():\n    page.goto("https://example.test/internal")\n'
+        )
+
+        self.assertIn(self.window._entry_url, self.window._latest_code)
+        self.assertNotIn("https://example.test/internal", self.window._latest_code)
 
     def test_gui_defaults_to_ftimage_recording_inputs(self):
         expected_output = Path(__file__).resolve().parents[1] / "out" / "ftimage" / "processed_script_ftimage.py"
@@ -327,6 +356,101 @@ page.locator("#two").click()
             [marker["marker_id"] for marker in annotations["markers"]],
             ["marker-1", "marker-2"],
         )
+
+
+class SeriesExpansionGuiTests(unittest.TestCase):
+    """Phase 8: opt-in all-series discovery config surface in the GUI."""
+
+    def setUp(self):
+        self.window = MainWindow()
+
+    def tearDown(self):
+        self.window.close()
+
+    def test_series_expansion_defaults_off_with_budget_disabled(self):
+        self.assertFalse(self.window.expand_all_series_chk.isChecked())
+        self.assertFalse(self.window.max_series_spin.isEnabled())
+        self.assertFalse(self.window.per_series_timeout_spin.isEnabled())
+        self.assertFalse(self.window.total_series_timeout_spin.isEnabled())
+
+    def test_capture_mode_only_offers_implemented_first_stable_frame(self):
+        self.assertEqual(self.window.viewer_capture_mode_combo.count(), 1)
+        self.assertEqual(
+            self.window.viewer_capture_mode_combo.itemData(0), "first_stable_frame"
+        )
+
+    def test_checking_expansion_enables_budget_controls(self):
+        self.window.expand_all_series_chk.setChecked(True)
+        self.assertTrue(self.window.max_series_spin.isEnabled())
+        self.assertTrue(self.window.per_series_timeout_spin.isEnabled())
+        self.assertTrue(self.window.total_series_timeout_spin.isEnabled())
+
+    def test_series_config_args_empty_when_disabled(self):
+        self.assertEqual(self.window.series_config_args(), [])
+
+    def test_series_config_args_carry_budget_when_enabled(self):
+        self.window.expand_all_series_chk.setChecked(True)
+        self.window.max_series_spin.setValue(7)
+        self.window.per_series_timeout_spin.setValue(30)
+        self.window.total_series_timeout_spin.setValue(600)
+        args = self.window.series_config_args()
+        self.assertEqual(args[0], "--expand-all-series")
+        self.assertIn("--max-series", args)
+        self.assertIn("7", args)
+        self.assertIn("--per-series-timeout", args)
+        self.assertIn("30", args)
+        self.assertIn("--total-series-timeout", args)
+        self.assertIn("600", args)
+        self.assertIn("--viewer-capture-mode", args)
+        self.assertIn("first_stable_frame", args)
+
+    def test_series_event_updates_tracker_and_status_label(self):
+        self.window._on_series_event({
+            "event": "series_discovered",
+            "payload": {"event": "series_discovered", "reached_end": True,
+                        "discovered": 2},
+        })
+        self.window._on_series_event({
+            "event": "series_capture_completed",
+            "payload": {"event": "series_capture_completed",
+                        "branch_id": "b0", "ordinal": 0},
+        })
+        self.window._on_series_event({
+            "event": "series_capture_partial",
+            "payload": {"event": "series_capture_partial",
+                        "branch_id": "b1", "ordinal": 1},
+        })
+        counts = self.window._series_tracker.counts()
+        self.assertEqual(counts["discovered"], 2)
+        self.assertEqual(counts["captured"], 1)
+        self.assertEqual(counts["partial"], 1)
+        label = self.window.series_status_label.text()
+        self.assertIn("发现 2", label)
+        self.assertIn("成功 1", label)
+        self.assertIn("部分 1", label)
+
+    def test_handle_pipeline_event_feeds_forwarded_series_event(self):
+        # A forwarded child event has top-level event series_* plus payload; the
+        # GUI tracker must read the payload fields.
+        self.window._handle_pipeline_event({
+            "event": "series_discovered",
+            "payload": {"event": "series_discovered", "reached_end": True,
+                        "discovered": 3},
+        })
+        self.assertEqual(
+            self.window._series_tracker.coverage()["discovered"], 3
+        )
+
+    def test_disable_series_resets_tracker(self):
+        self.window._on_series_event({
+            "event": "series_discovered",
+            "payload": {"event": "series_discovered", "reached_end": True,
+                        "discovered": 5},
+        })
+        self.assertNotEqual(self.window._series_tracker.counts()["discovered"], 0)
+        self.window.expand_all_series_chk.setChecked(False)  # was already off; force resync
+        self.window._sync_series_controls()
+        self.assertEqual(self.window._series_tracker.counts()["discovered"], 0)
 
 
 if __name__ == "__main__":

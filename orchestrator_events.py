@@ -47,6 +47,38 @@ CHILD_TERMINAL_RENAMES = {
     "fatal": "capture_fatal",
 }
 
+# 全序列探索（series expansion）进度事件全集（Phase 8）。
+#
+# 命名空间约定：这些名字【有意不】加入 `ORCHESTRATOR_EVENT_NAMES`。理由：
+# `ORCHESTRATOR_EVENT_NAMES` 是「child 不得撞名」的保留表，撞名会被
+# `_renamed_child_name` 加 `capture_` 前缀。series 事件由 live-capture 子进程
+# （batch_capture_replicate.py）在 stdout 发出、经 orchestrator 转发，我们希望
+# 顶层 `event` 保持干净的 `series_*` 名字（GUI 据此展示 discovered/captured/
+# partial/failed），因此它们必须保持【不与】`ORCHESTRATOR_EVENT_NAMES` 与
+# `RESERVED_TERMINAL_NAMES` 冲突（见 test_orchestrator_events 的断言），从而
+# 不经改名原样透传。
+SERIES_EVENT_NAMES = frozenset(
+    {
+        "series_discovery_started",
+        "series_discovered",
+        "series_capture_started",
+        "series_capture_completed",
+        "series_capture_partial",
+        "series_capture_failed",
+        "series_expansion_completed",
+    }
+)
+
+# series_capture_* 事件映射到 branch 终态（GUI 统计口径：captured/partial/failed）。
+# `series_expansion_completed` 是「探索阶段」的 phase 级终态（表示探索结束），
+# 但【不是】D4 意义上的业务终态：pipeline 的主终态始终由顶层 `completed` 承载，
+# 因此它不进入 `RESERVED_TERMINAL_NAMES`，也不触发 `TerminalGuard`。
+SERIES_BRANCH_STATUS = {
+    "series_capture_completed": "captured",
+    "series_capture_partial": "partial",
+    "series_capture_failed": "failed",
+}
+
 # payload 转发时顶层 source 的前缀（§4，如 "subprocess:batch_capture_replicate"）。
 SUBPROCESS_SOURCE_PREFIX = "subprocess:"
 
@@ -173,6 +205,131 @@ class MarkerTracker:
     def overwrite(self, summary: dict) -> None:
         """用 `summary` 计数覆盖当前统计（§5.5，权威快照，非累加）。"""
         self._override = {status: summary.get(status, 0) for status in MARKER_STATUSES}
+
+
+# ═══════════════════════════════════════════════════
+# 4b. SeriesTracker — series expansion 进度聚合（Phase 8）
+# ═══════════════════════════════════════════════════
+
+# series 覆盖率状态（报告 / 编排层口径，独立于 PipelineStatus）。
+SERIES_COVERAGE_STATUSES = ("complete", "partial", "failed", "not_requested")
+
+
+class SeriesTracker:
+    """聚合 series expansion 事件并计算覆盖率（complete/partial/failed）。
+
+    只蓄积**安全字段**：branch id、ordinal、status 和失败 stage；绝不保存患者
+    姓名、检查号、UID 或完整 Metadata 原文（§8 / Phase 8 反模式守卫）。
+
+    事件来源可以是：
+    - GUI 收到的顶层 `series_*` 事件（`event` 键即 series 名字），或
+    - 编排层从 child payload（`payload["event"]`）路由进来的原始事件。
+    两种输入都要求 `event.get("event")` 是 SERIES_EVENT_NAMES 中的名字。
+    """
+
+    def __init__(self) -> None:
+        self._active = False          # 看到任一 series 事件即置 True
+        self._infra_failed = False    # 探索基础设施失败
+        self._reached_end: Optional[bool] = None
+        self._ordinal = 0             # 最近一次 series_discovered 的计数
+        self._warning: Optional[str] = None
+        self._expansion_completed = False
+        self._branches: Dict[str, Dict] = {}
+
+    def note(self, event: dict) -> None:
+        kind = event.get("event")
+        if kind not in SERIES_EVENT_NAMES:
+            return
+        self._active = True
+        if kind == "series_discovery_started":
+            return
+        if kind == "series_discovered":
+            self._reached_end = bool(event.get("reached_end"))
+            self._ordinal = max(self._ordinal, int(event.get("discovered") or 0))
+            warn = event.get("warning")
+            if warn:
+                self._warning = str(warn)
+            return
+        if kind == "series_capture_started":
+            return
+        if kind in SERIES_BRANCH_STATUS:
+            branch_id = event.get("branch_id")
+            if branch_id is None:
+                return
+            status = SERIES_BRANCH_STATUS[kind]
+            self._branches[str(branch_id)] = self._safe_branch(
+                event, str(branch_id), status
+            )
+            if kind == "series_capture_failed" and str(event.get("error_type") or "").lower().startswith(("infra", "infrastructure")):
+                self._infra_failed = True
+            return
+        if kind == "series_expansion_completed":
+            self._expansion_completed = True
+            return
+
+    @staticmethod
+    def _safe_branch(event: dict, branch_id: str, status: str) -> Dict:
+        """从事件抽取安全 branch 摘要：只保留 branch_id/ordinal/status/stage。"""
+        return {
+            "branch_id": branch_id,
+            "ordinal": int(event.get("ordinal") or 0),
+            "status": status,
+            "stage": str(event.get("error_type") or event.get("stage") or ""),
+        }
+
+    def counts(self) -> Dict[str, int]:
+        """discovered / captured / partial / failed 统计口径（GUI 显示用）。"""
+        captured = sum(1 for b in self._branches.values() if b["status"] == "captured")
+        partial = sum(1 for b in self._branches.values() if b["status"] == "partial")
+        failed = sum(1 for b in self._branches.values() if b["status"] == "failed")
+        return {
+            "discovered": self._ordinal,
+            "captured": captured,
+            "partial": partial,
+            "failed": failed,
+        }
+
+    def coverage(self) -> Dict:
+        """计算 series 覆盖率语义（Task 8.3）。
+
+        - complete：列表确认到底（reached_end=true）且无 partial/failed。
+        - failed：没有任何可用 viewer branch（discovered==0）或探索基础设施失败。
+        - partial：列表未确认到底、某 branch partial/failed、预算耗尽或恢复失败。
+        - not_requested：未发生任何探索（expand off 或子进程未发出系列事件）。
+        """
+        counts = self.counts()
+        discovered = counts["discovered"]
+        captured = counts["captured"]
+        partial = counts["partial"]
+        failed = counts["failed"]
+        reached_end = self._reached_end
+
+        if not self._active:
+            status = "not_requested"
+        elif self._infra_failed or discovered == 0:
+            status = "failed"
+        elif reached_end and (partial == 0 and failed == 0 and captured > 0):
+            status = "complete"
+        else:
+            status = "partial"
+
+        branches = [
+            {"branch_id": b["branch_id"], "ordinal": b["ordinal"],
+             "status": b["status"], "stage": b["stage"]}
+            for b in self._branches.values()
+        ]
+        return {
+            "enabled": self._active,
+            "status": status,
+            "discovered": discovered,
+            "captured": captured,
+            "partial": partial,
+            "failed": failed,
+            "reached_end": bool(reached_end),
+            "expansion_completed": self._expansion_completed,
+            "warning": self._warning,
+            "branches": branches,
+        }
 
 
 # ═══════════════════════════════════════════════════

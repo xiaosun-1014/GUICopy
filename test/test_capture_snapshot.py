@@ -58,6 +58,17 @@ class CaptureSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot.rect.coordinate_space, "page_viewport_css")
         self.assertIn("查看影像", snapshot.text)
 
+    def test_capture_locator_snapshot_preserves_live_input_value(self):
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page()
+            page.set_content('<input id="wl" value="40">')
+            page.locator("#wl").fill("125")
+            snapshot = capture_locator_snapshot(page.locator("#wl"))
+            browser.close()
+
+        self.assertEqual(snapshot.attributes["value"], "125")
+
     def test_capture_interaction_region_keeps_controls_for_adapter_access(self):
         fixture = Path(__file__).parent / "fixtures" / "replica_flow" / "report.html"
         with sync_playwright() as playwright:
@@ -138,6 +149,22 @@ class CaptureSnapshotTests(unittest.TestCase):
         self.assertIn("Study Information", region.root.outer_html)
         # The panel root resolved to tagsBox (id matches [id*='tags']).
         self.assertIn('id="tagsBox"', region.root.outer_html)
+
+    def test_metadata_panel_rejects_tags_icon_and_patient_summary(self):
+        markup = """
+        <i class="icon icon-tags"></i>
+        <aside id="patientInfo" class="patientInfo">Patient summary</aside>
+        """
+        from capture_snapshot import _MARKER_REGION_CANDIDATES
+        candidates = _MARKER_REGION_CANDIDATES["Meta 信息工具"][1]
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page(viewport={"width": 800, "height": 600})
+            page.set_content(markup)
+            region = capture_marker_panel_region(page, candidates, "d_main")
+            browser.close()
+
+        self.assertIsNone(region)
 
 
 if __name__ == "__main__":

@@ -24,7 +24,9 @@ from typing import Callable, Iterable, Optional
 
 from batch_capture_replicate import build_from_manifest, capture_to_manifest
 from orchestrator_events import (
+    SERIES_EVENT_NAMES,
     MarkerTracker,
+    SeriesTracker,
     TerminalGuard,
     normalize_child_event,
     ready_event,
@@ -301,6 +303,14 @@ def run_capture(
         "--auth-mode", config.auth_mode,
         "--capture-timeout", str(config.capture_timeout_s),
     ]
+    if config.expand_all_series:
+        args += [
+            "--expand-all-series",
+            "--max-series", str(config.max_series),
+            "--per-series-timeout", str(config.per_series_timeout_s),
+            "--total-series-timeout", str(config.total_series_timeout_s),
+            "--viewer-capture-mode", str(config.viewer_capture_mode),
+        ]
     if config.auth_mode == "storage-state" and config.storage_state is not None:
         args += ["--storage-state", str(config.storage_state)]
     try:
@@ -333,10 +343,31 @@ def run_capture(
         return StageResult(
             PipelineStage.LIVE_CAPTURE, PipelineStatus.FAILED, category, hint
         )
+    # Phase 8: honest series-coverage degradation. If series exploration was
+    # requested but came back partial/failed, the main recording path and the
+    # replica are still usable, so we keep the manifest artifact and continue;
+    # only the stage status is downgraded to PARTIAL (never deleting the main
+    # recording path nor forcing a hard FAILED for an otherwise-healthy run).
+    coverage = controller.series_tracker.coverage()
+    metrics: dict = {}
+    status = PipelineStatus.SUCCESS
+    message = ""
+    error_category: str | None = None
+    if coverage is not None and coverage.get("enabled"):
+        metrics["series_coverage"] = coverage
+        if coverage.get("status") in ("partial", "failed"):
+            status = PipelineStatus.PARTIAL
+            message = f"series_coverage:{coverage.get('status')}"
+            error_category = (
+                "capture_failure" if coverage.get("status") == "failed" else None
+            )
     return StageResult(
         PipelineStage.LIVE_CAPTURE,
-        PipelineStatus.SUCCESS,
+        status,
+        error_category,
+        message,
         artifacts={"manifest_path": str(manifest_path)},
+        metrics=metrics,
     )
 
 
@@ -559,6 +590,8 @@ class PipelineController:
         self.last_error_stage: str | None = None
         self._guard = TerminalGuard()
         self._markers = MarkerTracker()
+        # Phase 8: series expansion progress + coverage aggregation.
+        self.series_tracker = SeriesTracker()
         self.artifacts: dict[str, str] = {}
 
         if run_id is None:
@@ -609,6 +642,12 @@ class PipelineController:
         payload = event.get("payload")
         if isinstance(payload, dict):
             self._route_child_marker(payload)
+            self._route_child_series(payload)
+        else:
+            # Orchestrator-origin payloads (non-forwarded) usually carry the kind
+            # at top level; route them too so direct series events are tracked.
+            if event.get("event") in SERIES_EVENT_NAMES:
+                self.series_tracker.note(event)
         self.emit(event)
         self.store.emit(event)
 
@@ -657,6 +696,17 @@ class PipelineController:
         }
         self.emit(released)
         self.store.emit(released)
+
+    def _route_child_series(self, child: dict) -> None:
+        """Feed a child series event (payload dict) into the controller tracker.
+
+        ``child`` is the raw child payload whose ``event`` is a ``series_*`` name.
+        The tracker only keeps safe fields (branch id / ordinal / status / stage),
+        never patient text or full metadata.
+        """
+        if child.get("event") not in SERIES_EVENT_NAMES:
+            return
+        self.series_tracker.note(child)
 
     def _track_markers(self, marker_names: Iterable[str]) -> None:
         """Record the known marker names so ``summary`` counts are meaningful."""
@@ -975,6 +1025,11 @@ def _cli_config(args) -> PipelineConfig:
         retry_count=args.retry,
         capture_timeout_s=args.capture_timeout,
         auth_timeout_s=args.auth_timeout,
+        expand_all_series=args.expand_all_series,
+        max_series=args.max_series,
+        per_series_timeout_s=args.per_series_timeout,
+        total_series_timeout_s=args.total_series_timeout,
+        viewer_capture_mode=args.viewer_capture_mode,
     )
 
 
@@ -1017,6 +1072,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry", type=int, default=3)
     parser.add_argument("--capture-timeout", type=int, default=900)
     parser.add_argument("--auth-timeout", type=int, default=300)
+    parser.add_argument("--expand-all-series", action="store_true")
+    parser.add_argument("--max-series", type=int, default=40)
+    parser.add_argument("--per-series-timeout", type=int, default=20)
+    parser.add_argument("--total-series-timeout", type=int, default=900)
+    parser.add_argument("--viewer-capture-mode", default="first_stable_frame")
     parser.add_argument(
         "--operation",
         choices=["full", "adapter-only", "replica-build", "offline-validation",

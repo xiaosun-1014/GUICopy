@@ -7,18 +7,66 @@ import io
 import json
 import subprocess
 import time
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import batch_capture_replicate as replica_batch
 from batch_capture_replicate import LiveCaptureSession, await_interactive_auth, build_flow_from_snapshots, build_from_manifest, capture_and_build, capture_to_manifest, classify_capture_error, instrument_marked_actions, merge_annotation_uuids, run_live_capture, validate_annotations
 from playwright.sync_api import sync_playwright
 from replay_helpers import sha256_file, write_manifest
-from replica_models import BootstrapPlan, CaptureTimingProfile, ReplicaFlow, ReplicaState, StateEvidence
+from replica_models import BootstrapPlan, CaptureTimingProfile, ReplicaFlow, ReplicaState, ReplicaTransition, StateEvidence
 from replay_helpers import read_manifest
 from rewrite_script import parse_action_plan
 
 
 class BatchCaptureReplicateTests(unittest.TestCase):
+    def test_popup_entry_skips_a_small_shell_for_the_next_complete_state(self):
+        transition = SimpleNamespace(mode="popup", to_state_id="s_001")
+        frame = lambda size: SimpleNamespace(parent_document_id="root", screenshot_size_bytes=size)
+        states = [
+            SimpleNamespace(state_id="s_000", transitions=[transition], documents=[]),
+            SimpleNamespace(state_id="s_001", transitions=[], documents=[frame(10_000)]),
+            SimpleNamespace(state_id="s_002", transitions=[], documents=[frame(200_000)]),
+        ]
+
+        replica_batch._skip_popup_shell_state(states)
+
+        self.assertEqual(transition.to_state_id, "s_002")
+
+    def test_popup_entry_does_not_skip_loaded_four_view_layout(self):
+        shell_target = SimpleNamespace(action_id="open_layout", marker_id="layout")
+        option_target = SimpleNamespace(action_id="choose_layout", marker_id="layout")
+        entry = SimpleNamespace(
+            state_id="s_000",
+            transitions=[ReplicaTransition(
+                "t_open_viewer", "open_viewer", "s_000", "s_001", "page", "page1", "popup",
+            )],
+            documents=[],
+        )
+        shell = SimpleNamespace(
+            state_id="s_001",
+            transitions=[ReplicaTransition(
+                "t_open_layout", "open_layout", "s_001", "s_002", "page1", "page1", "same_page",
+            )],
+            documents=[SimpleNamespace(parent_document_id="root", screenshot_size_bytes=410_000, targets=[shell_target])],
+        )
+        menu = SimpleNamespace(
+            state_id="s_002",
+            transitions=[ReplicaTransition(
+                "t_choose_layout", "choose_layout", "s_002", "s_003", "page1", "page1", "same_page",
+            )],
+            documents=[SimpleNamespace(parent_document_id="root", screenshot_size_bytes=700_000, targets=[shell_target, option_target])],
+        )
+        closed = SimpleNamespace(
+            state_id="s_003", transitions=[],
+            documents=[SimpleNamespace(parent_document_id="root", screenshot_size_bytes=570_000, targets=[shell_target, option_target])],
+        )
+
+        replica_batch._skip_popup_shell_state([entry, shell, menu, closed])
+
+        self.assertEqual(entry.transitions[0].to_state_id, "s_001")
+        self.assertEqual(shell.transitions[0].to_state_id, "s_002")
+
     def test_offline_build_emits_json_progress_and_entrypoint(self):
         flow = ReplicaFlow(1, "empty", "recorded.py", "hash", "now", {"width": 1, "height": 1}, BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000", [ReplicaState("s_000", 0, "", "page", [], [], [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry"))], [])
         with tempfile.TemporaryDirectory() as tmp:
@@ -360,6 +408,105 @@ def run(page):
             self.assertTrue(page.locator("#reportContainer .report-footer").is_visible())
             browser.close()
 
+    def test_pre_action_waits_until_target_is_actionable(self):
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page()
+            page.set_content(
+                '<button id="open-viewer">Open viewer</button>'
+                '<div id="loading" style="position:fixed;inset:0;z-index:10">Loading</div>'
+            )
+            page.evaluate(
+                """() => setTimeout(() => {
+                    document.querySelector("#loading").remove();
+                }, 400)"""
+            )
+
+            started = time.monotonic()
+            replica_batch.wait_for_pre_action_state(
+                page,
+                "报告截图",
+                lambda: page.locator("#open-viewer"),
+            )
+            elapsed = time.monotonic() - started
+
+            self.assertGreaterEqual(elapsed, 0.3)
+            self.assertEqual(page.locator("#loading").count(), 0)
+            browser.close()
+
+    def test_report_post_action_waits_for_popup_frame_content(self):
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page()
+            page.set_content('<button id="open">Open</button>')
+            with page.expect_popup() as popup_info:
+                page.evaluate("window.open('about:blank')")
+            popup = popup_info.value
+            popup.set_content(
+                '<div id="loading">正在运行...</div>'
+                '<iframe id="viewer"></iframe>'
+            )
+            popup.evaluate(
+                """() => setTimeout(() => {
+                    const doc = document.querySelector('#viewer').contentDocument;
+                    doc.body.innerHTML = '<canvas width="200" height="100"></canvas>';
+                    const canvas = doc.querySelector('canvas');
+                    canvas.getContext('2d').fillRect(0, 0, 200, 100);
+                    const ctx = canvas.getContext('2d');
+                    ctx.fillStyle = 'white';
+                    ctx.fillRect(50, 20, 100, 60);
+                }, 200)"""
+            )
+
+            started = time.monotonic()
+            replica_batch.ensure_post_action_state(
+                page,
+                "报告截图",
+                timeout_s=2.0,
+                stable_s=0.2,
+            )
+            elapsed = time.monotonic() - started
+
+            self.assertGreaterEqual(elapsed, 0.8)
+            self.assertEqual(popup.frames[1].locator("canvas").count(), 1)
+            browser.close()
+
+    def test_report_post_action_does_not_accept_a_black_canvas(self):
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page()
+            with page.expect_popup() as popup_info:
+                page.evaluate("window.open('about:blank')")
+            popup = popup_info.value
+            popup.set_content(
+                '<div>正在运行...</div><iframe id="viewer"></iframe>'
+            )
+            popup.evaluate(
+                """() => {
+                    const doc = document.querySelector('#viewer').contentDocument;
+                    doc.body.innerHTML = '<canvas width="200" height="100"></canvas>';
+                    doc.querySelector('canvas').getContext('2d').fillRect(0, 0, 200, 100);
+                }"""
+            )
+
+            self.assertFalse(replica_batch._wait_for_report_popup_state(
+                page, timeout_s=0.4, stable_s=0.1,
+            ))
+            browser.close()
+
+    def test_report_post_action_rejects_a_blank_popup(self):
+        with patch.object(
+            replica_batch,
+            "_wait_for_report_popup_state",
+            return_value=False,
+        ) as wait:
+            with self.assertRaisesRegex(TimeoutError, "non-blank"):
+                replica_batch.ensure_post_action_state(
+                    object(),
+                    "报告截图",
+                )
+        self.assertEqual(wait.call_args.kwargs["timeout_s"], 60.0)
+
     def test_live_capture_session_records_popup_pages_created_by_action(self):
         fixture = Path(__file__).parent / "fixtures" / "replica_flow" / "host.html"
         with tempfile.TemporaryDirectory() as tmp, sync_playwright() as playwright:
@@ -396,6 +543,61 @@ def run(page):
             topology = (Path(tmp) / "snapshots" / "a_001_001" / "after" / "topology.json").read_text(encoding="utf-8")
 
         self.assertIn('\"id\": \"series-thick\"', topology)
+
+    def test_nested_frame_series_uses_scroll_harvest(self):
+        # A 序列选择 series list living in the INNERMOST of two nested iframes must
+        # be routed through the marker-aware series harvest (scroll collection),
+        # not the generic parent-region capture. Regression for the routing bug
+        # where nested non-metadata markers fell into the generic else branch.
+        #
+        # The nested iframes are built via set_content (same-origin) so Playwright's
+        # ``window.frameElement`` resolution used by ``_capture()`` frame routing
+        # works (file:// iframes are cross-origin and yield null there).
+        inner_html = """<section id="series" class="series-list" style="height:64px;overflow:auto">
+          <div class="item" data-series="SERIES-1" data-series-uid="uid-1" style="height:24px">Coronal 1.0 400amp</div>
+          <div class="item" data-series="SERIES-2" data-series-uid="uid-2" style="height:24px">Axial 5.0 80amp</div>
+          <div class="item" data-series="SERIES-3" data-series-uid="uid-3" style="height:24px">Sagittal 2.0 120amp</div>
+        </section>"""
+        with tempfile.TemporaryDirectory() as tmp, sync_playwright() as playwright:
+            session = LiveCaptureSession(Path(tmp))
+            browser = playwright.chromium.launch()
+            page = browser.new_page(viewport={"width": 800, "height": 600})
+            page.set_content('<iframe id="outer" name="outerFrame" style="width:400px;height:300px"></iframe>')
+            page.frames[-1].set_content('<iframe id="series-frame" name="seriesFrame" style="width:300px;height:200px"></iframe>')
+            inner = page.frames[-1]
+            inner.set_content(inner_html)
+            series_root = inner.locator("#series")
+            # Scroll the series container to a valid midway position so restore is
+            # observable (max scrollTop == clientHeight-scrollHeight == 8 here).
+            series_root.evaluate("element => element.scrollTop = 4")
+            target = inner.locator("[data-series='SERIES-2']")
+
+            session.before("a_series_001", page, lambda: target, "序列选择")
+
+            # scrollTop must be restored to its original value after the capture.
+            restored = series_root.evaluate("element => element.scrollTop")
+            topology = json.loads(
+                (Path(tmp) / "snapshots" / "a_series_001" / "before" / "topology.json").read_text(encoding="utf-8")
+            )
+            browser.close()
+
+        self.assertEqual(restored, 4)
+        # The innermost frame document (frame_id "series-frame" / name "seriesFrame")
+        # is the one holding the series list.
+        innermost = next(
+            document for document in topology["documents"]
+            if document.get("frame_id") == "series-frame" or document.get("frame_name") == "seriesFrame"
+        )
+        series_regions = [r for r in innermost["regions"] if r["region_type"] == "series"]
+        self.assertEqual(len(series_regions), 1)
+        region = series_regions[0]
+        # The nested 序列选择 marker must carry SeriesCollectionEvidence, i.e. it
+        # went through the scroll harvest (the generic parent-region path yields
+        # series_collection=None and fails this assertion).
+        self.assertIsNotNone(region["series_collection"])
+        self.assertEqual(region["series_collection"]["collected_count"], 3)
+        collected = {member["dom"]["attributes"].get("data-series") for member in region["members"]}
+        self.assertEqual(collected, {"SERIES-1", "SERIES-2", "SERIES-3"})
 
     def test_subprocess_runner_executes_instrumented_local_script_once(self):
         source = '''from playwright.sync_api import sync_playwright\n\ndef run():\n    with sync_playwright() as playwright:\n        browser = playwright.chromium.launch()\n        page = browser.new_page()\n        page.set_content('<button id="go">Go</button>')\n        # [MARKER: Meta 信息工具]\n        page.locator("#go").click()\n        browser.close()\n\nrun()\n'''
@@ -503,6 +705,39 @@ run()
         self.assertEqual(classify_capture_error(RuntimeError("authentication_cancelled")), "authentication")
         self.assertEqual(classify_capture_error(RuntimeError("locator strict mode violation")), "selector_failure")
         self.assertEqual(classify_capture_error(RuntimeError("net::ERR_CONNECTION_REFUSED")), "network")
+
+    # --- Phase 4: independent expansion hook runtime ---
+
+    def test_expand_series_hook_is_a_safe_noop_when_disabled(self):
+        # With a wired session but expansion disabled, the hook must not call
+        # the session entry at all.
+        session = Mock()
+        with patch.object(replica_batch, "_EXPANSION_CONFIG", {"expand_all_series": False}), \
+             patch.object(replica_batch, "_LIVE_SESSION", session):
+            replica_batch.capture_hook_expand_series(object(), lambda: None, "a_000_001", "a_002_001")
+        session.expand_series.assert_not_called()
+
+    def test_expand_series_hook_is_a_safe_noop_without_session(self):
+        with patch.object(replica_batch, "_EXPANSION_CONFIG", {"expand_all_series": True}), \
+             patch.object(replica_batch, "_LIVE_SESSION", None):
+            replica_batch.capture_hook_expand_series(object(), lambda: None, "a_000_001", "a_002_001")
+        # no exception raised
+
+    def test_expand_series_hook_delegates_to_session_entry_when_enabled(self):
+        session = Mock()
+        with patch.object(replica_batch, "_EXPANSION_CONFIG", {"expand_all_series": True, "max_series": 40}), \
+             patch.object(replica_batch, "_LIVE_SESSION", session):
+            replica_batch.capture_hook_expand_series(object(), lambda: None, "a_000_001", "a_002_001")
+        session.expand_series.assert_called_once()
+        self.assertEqual(session.expand_series.call_args.args[2], "a_000_001")
+        self.assertEqual(session.expand_series.call_args.args[3], "a_002_001")
+
+    def test_session_expand_series_is_a_callable_noop_placeholder(self):
+        # The Phase 4 session-side entry is intentionally a side-effect-free stub
+        # (Phase 5 installs the explorer body). It must be safely callable.
+        session = LiveCaptureSession("out")
+        session.expand_series(object(), lambda: None, "a_000_001", "a_002_001")
+        # no exception, no output written
 
     # --- Task 5: batch_capture annotations UUID writeback ---
 
@@ -729,6 +964,183 @@ run()
 
             with self.assertRaisesRegex(ValueError, "hash"):
                 build_from_manifest(manifest, flow_root, output, source_path=source)
+
+    # --- Phase 6: merge branch snapshots into a schema-v2 flow ---
+
+    @staticmethod
+    def _template_source():
+        return '''from playwright.sync_api import sync_playwright
+
+
+def run(page):
+    # [MARKER: 序列选择]
+    page.locator("#series a").first.click()
+    # [MARKER: Meta 信息工具]
+    page.locator("#meta-open").click()
+    page.locator("#meta-close").click()
+'''
+
+    @staticmethod
+    def _branch_doc(document_id="d_p_000_root"):
+        return {
+            "document_id": document_id, "page_id": "p_000", "page_var": "page",
+            "page_kind": "main", "parent_document_id": None, "frame_selector": None,
+            "frame_id": None, "frame_name": None, "viewport": {"width": 800, "height": 600},
+            "device_scale_factor": 1.0, "screenshot_scale": "css",
+            "scroll_x": 0.0, "scroll_y": 0.0, "screenshot_asset_relpath": "",
+            "screenshot_sha256": "h", "screenshot_size_bytes": 100,
+        }
+
+    def _write_branch(self, root, branch_id, series_key, ordinal, status, with_metadata=False):
+        branch_dir = root / "series_branches" / branch_id
+        viewer_dir = branch_dir / "viewer"
+        viewer_dir.mkdir(parents=True, exist_ok=True)
+        descriptor = {
+            "series_key": series_key, "label": f"Series {ordinal}", "ordinal": ordinal,
+            "document_id": "d_series_hub", "member_id": f"d_series_hub_series_{ordinal:03d}",
+            "stable_attributes": {"data-series": series_key}, "selected": False,
+            "explicit_frame_count": None, "inferred_frame_count": None, "activation": "click",
+        }
+        (branch_dir / "descriptor.json").write_text(json.dumps(descriptor), encoding="utf-8")
+        (viewer_dir / "topology.json").write_text(
+            json.dumps({"pages": [], "documents": [self._branch_doc(f"d_p_000_root_{branch_id}")]}),
+            encoding="utf-8",
+        )
+        status_payload = {
+            "branch_id": branch_id, "series_key_sha256": "x", "ordinal": ordinal,
+            "capture_status": status, "fail_stage": ("metadata" if status == "partial" else None),
+            "error_type": None, "warning": ("series_capture_partial" if status == "partial" else None),
+            "activation": "click", "metadata_captured": with_metadata,
+        }
+        if with_metadata:
+            meta_dir = branch_dir / "metadata"
+            meta_dir.mkdir(parents=True, exist_ok=True)
+            (meta_dir / "topology.json").write_text(
+                json.dumps({"pages": [], "documents": [self._branch_doc(f"d_p_000_root_meta_{branch_id}")]}),
+                encoding="utf-8",
+            )
+            # The writer/capture path is ``metadata/metadata_rows.json`` (see
+            # _capture_metadata_transaction); the loader reads it from there.
+            (meta_dir / "metadata_rows.json").write_text(
+                json.dumps({"rows": [{"row": "Series Number: 1"}], "outer_html": "", "uid_sha256_prefix": "abc"}),
+                encoding="utf-8",
+            )
+        (branch_dir / "status.json").write_text(json.dumps(status_payload), encoding="utf-8")
+
+    def test_branch_merge_preserves_entry_and_creates_unique_states(self):
+        from rewrite_script import parse_action_plan
+        from replica_models import ReplicaState, StateEvidence
+        plan = parse_action_plan(self._template_source())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_branch(root, "b000_abcd", "uid-a", 0, "captured", with_metadata=True)
+            self._write_branch(root, "b001_efgh", "uid-b", 1, "captured", with_metadata=False)
+            self._write_branch(root, "b002_ijkl", "uid-c", 2, "failed", with_metadata=False)
+            entry = ReplicaState("s_000", 0, "", "page", [], [], [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry"))
+            states = [entry]
+            warnings = []
+            branches, expansion = replica_batch._build_branches_into_flow(states, root, plan, warnings)
+
+        # Original entry state is preserved and untouched.
+        self.assertEqual(states[0].state_id, "s_000")
+        # Unique viewer states exist for each captured branch.
+        viewer_ids = [b.viewer_state_id for b in branches if b.capture_status == "captured"]
+        self.assertEqual(len(viewer_ids), 2)
+        self.assertEqual(len(set(viewer_ids)), 2)
+        captured = {b.series_key: b for b in branches if b.capture_status == "captured"}
+        # Metadata-open trigger lives on the viewer state with a transition to metadata.
+        viewer_state_a = next(s for s in states if s.state_id == captured["uid-a"].viewer_state_id)
+        self.assertTrue(any(t.to_state_id == captured["uid-a"].metadata_state_id for t in viewer_state_a.transitions))
+        self.assertTrue(any("meta_open" in t.transition_id for t in viewer_state_a.transitions))
+        self.assertTrue(any("meta_open" in t.action_id for doc in viewer_state_a.documents for t in doc.targets if "meta_open" in t.action_id))
+        # Metadata-close transition returns explicitly to the same branch viewer.
+        meta_state_a = next(s for s in states if s.state_id == captured["uid-a"].metadata_state_id)
+        self.assertEqual(meta_state_a.transitions[0].to_state_id, captured["uid-a"].viewer_state_id)
+        self.assertEqual(captured["uid-a"].return_state_id, captured["uid-a"].viewer_state_id)
+        # Failed branch stays in series_branches but references no state.
+        failed = next(b for b in branches if b.capture_status == "failed")
+        self.assertEqual(failed.series_key, "uid-c")
+        self.assertIsNone(failed.viewer_state_id)
+        self.assertIsNone(failed.metadata_state_id)
+        self.assertIsNotNone(failed.warning)
+        # Expansion evidence conserves counts.
+        self.assertEqual(expansion.discovered_count, 3)
+        self.assertEqual(expansion.captured_count, 2)
+        self.assertEqual(expansion.failed_count, 1)
+
+    def test_branch_merge_metadata_success_has_unique_metadata_state(self):
+        from rewrite_script import parse_action_plan
+        from replica_models import ReplicaState, StateEvidence
+        plan = parse_action_plan(self._template_source())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_branch(root, "b000_abcd", "uid-a", 0, "captured", with_metadata=True)
+            self._write_branch(root, "b001_efgh", "uid-b", 1, "captured", with_metadata=False)
+            states = [ReplicaState("s_000", 0, "", "page", [], [], [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry"))]
+            branches, _expansion = replica_batch._build_branches_into_flow(states, root, plan, [])
+
+        captured = {b.series_key: b for b in branches if b.capture_status == "captured"}
+        # Metadata-successful branch has its own metadata state; other has none.
+        self.assertIsNotNone(captured["uid-a"].metadata_state_id)
+        self.assertIsNone(captured["uid-b"].metadata_state_id)
+        meta_ids = [b.metadata_state_id for b in branches if b.metadata_state_id]
+        self.assertEqual(len(meta_ids), 1)
+        self.assertEqual(len(set(meta_ids)), 1)
+
+    def test_branch_merge_partial_still_produces_viewer_state(self):
+        from rewrite_script import parse_action_plan
+        from replica_models import ReplicaState, StateEvidence
+        plan = parse_action_plan(self._template_source())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Partial: metadata failed but the viewer itself succeeded.
+            self._write_branch(root, "b000_abcd", "uid-a", 0, "partial", with_metadata=False)
+            states = [ReplicaState("s_000", 0, "", "page", [], [], [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry"))]
+            branches, expansion = replica_batch._build_branches_into_flow(states, root, plan, [])
+
+        branch = branches[0]
+        self.assertEqual(branch.capture_status, "partial")
+        self.assertIsNotNone(branch.viewer_state_id)
+        self.assertIsNone(branch.metadata_state_id)
+        self.assertEqual(expansion.partial_count, 1)
+        # The partial branch's viewer state is a real state in the flow.
+        self.assertTrue(any(s.state_id == branch.viewer_state_id for s in states))
+
+    def test_load_series_branch_snapshots_reads_dirs_and_dedupes_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_branch(root, "b000_abcd", "uid-a", 0, "captured", with_metadata=True)
+            snapshots, warnings, expansion = replica_batch._load_series_branch_snapshots(root)
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0].capture_status, "captured")
+        self.assertEqual(snapshots[0].source_member_id, "d_series_hub_series_000")
+        self.assertTrue(snapshots[0].viewer_documents)
+        self.assertTrue(snapshots[0].metadata_documents)
+        self.assertEqual(snapshots[0].metadata_rows, [{"row": "Series Number: 1"}])
+        self.assertIsNone(expansion)
+
+    def test_expand_series_reconstructs_template_and_delegates_when_source_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            replay = output / "instrumented_replay.py"
+            replay.write_text(self._template_source(), encoding="utf-8")
+            session = LiveCaptureSession(output)
+            with patch.object(session, "finalize_series_branches") as finalize:
+                session.expand_series(object(), lambda: None, "a_000_001", "a_002_001")
+            self.assertEqual(finalize.call_count, 1)
+            template = finalize.call_args.args[1]
+            self.assertTrue(template.complete)
+            self.assertIsNotNone(template.series_action)
+            self.assertIsNotNone(template.metadata_open)
+            self.assertIsNotNone(template.metadata_close)
+
+    def test_expand_series_is_noop_without_replay_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = LiveCaptureSession(Path(tmp))
+            with patch.object(session, "finalize_series_branches") as finalize:
+                session.expand_series(object(), lambda: None)
+            finalize.assert_not_called()
 
 
 if __name__ == "__main__":

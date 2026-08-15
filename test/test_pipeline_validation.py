@@ -15,25 +15,38 @@ from pipeline_validation import (
     validate_manifest,
     validate_privacy,
     validate_replica,
+    validate_series_privacy,
 )
 from replica_models import (
     ActionTarget,
     BootstrapPlan,
     CaptureTimingProfile,
     DomNodeSnapshot,
+    InteractionRegion,
     LocatorRecipe,
     Rect,
+    RegionMember,
     ReplicaDocument,
     ReplicaFlow,
     ReplicaPage,
     ReplicaState,
     ReplicaTransition,
+    SeriesBranch,
+    SeriesExpansionEvidence,
     StateEvidence,
 )
 from replay_helpers import write_manifest
 
 
-def _document(document_id, targets=()):
+def _node():
+    return DomNodeSnapshot(
+        "div", "", {},
+        Rect(0, 0, 0, 0, "page_viewport_css"),
+        "<div></div>", {"display": "block"},
+    )
+
+
+def _document(document_id, targets=(), regions=()):
     return ReplicaDocument(
         document_id=document_id,
         page_id="p_main",
@@ -52,21 +65,37 @@ def _document(document_id, targets=()):
         screenshot_sha256=document_id,
         screenshot_size_bytes=3,
         targets=list(targets),
-        regions=[],
+        regions=list(regions),
     )
 
 
-def _entry_state(targets=(), transitions=(), state_id="s_000"):
+def _entry_state(targets=(), transitions=(), state_id="s_000", regions=()):
     return ReplicaState(
         state_id=state_id,
         ordinal=0,
         source_url="https://example.test/",
         active_page_var="page",
         pages=[ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)],
-        documents=[_document("d_main", targets)],
+        documents=[_document("d_main", targets, regions)],
         transitions=list(transitions),
         evidence=StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry"),
     )
+
+
+def _series_state(state_id, member_id):
+    """A branch viewer state carrying one ``series`` region whose only member is
+    ``member_id``, so a branch whose source resolves to it passes the
+    source_member resolution check."""
+    member = RegionMember(member_id=member_id, semantic_type="series_item", dom=_node())
+    region = InteractionRegion(
+        region_id=f"r_{state_id}",
+        region_type="series",
+        document_id="d_main",
+        root=_node(),
+        members=[member],
+        series_collection=None,
+    )
+    return _entry_state(state_id=state_id, regions=[region])
 
 
 def _base_flow(states=None, warnings=(), source_script_sha256="abc123"):
@@ -96,6 +125,58 @@ def _ascii_locator(expression, **kwargs):
         ordinal_op=kwargs.get("ordinal_op"),
         ordinal_value=kwargs.get("ordinal_value"),
     )
+
+
+def _branch(branch_id, series_key, ordinal, **kwargs) -> SeriesBranch:
+    return SeriesBranch(
+        branch_id=branch_id,
+        series_key=series_key,
+        label="Series %d" % ordinal,
+        ordinal=ordinal,
+        document_id="d_main",
+        source_member_id="m_%s" % series_key,
+        selector=None,
+        activation=kwargs.get("activation", "click"),
+        viewer_state_id=kwargs.get("viewer_state_id"),
+        metadata_state_id=kwargs.get("metadata_state_id"),
+        return_state_id=kwargs.get("return_state_id"),
+        capture_status=kwargs.get("capture_status", "captured"),
+        warning=kwargs.get("warning"),
+    )
+
+
+def _expansion(**kwargs) -> SeriesExpansionEvidence:
+    return SeriesExpansionEvidence(
+        discovered_count=kwargs.get("discovered_count", 2),
+        captured_count=kwargs.get("captured_count", 2),
+        partial_count=kwargs.get("partial_count", 0),
+        failed_count=kwargs.get("failed_count", 0),
+        reached_end=kwargs.get("reached_end", True),
+        total_duration_ms=kwargs.get("total_duration_ms", 1000),
+        warning=kwargs.get("warning"),
+    )
+
+
+def _series_flow(branches=None, expansion=None, warnings=(), extra_states=()):
+    """Build a v2 flow carrying per-series viewer/metadata states.
+
+    The two viewer states carry a ``series`` region whose only member matches
+    the default ``source_member_id`` (``m_series-1`` / ``m_series-2``) so a
+    well-formed branch's source resolves, mirroring the real capture contract.
+    """
+    viewer_a = _series_state("s_viewer_a", "m_series-1")
+    meta_a = _entry_state(state_id="s_meta_a")
+    viewer_b = _series_state("s_viewer_b", "m_series-2")
+    meta_b = _entry_state(state_id="s_meta_b")
+    states = [viewer_a, meta_a, viewer_b, meta_b, *extra_states]
+    flow = _base_flow(states=states, warnings=warnings)
+    flow.schema_version = 2
+    flow.entry_state_id = states[0].state_id
+    if branches is not None:
+        flow.series_branches = branches
+    if expansion is not None:
+        flow.series_expansion = expansion
+    return flow
 
 
 class ManifestValidationTests(unittest.TestCase):
@@ -136,6 +217,268 @@ class ManifestValidationTests(unittest.TestCase):
             result = validate_manifest(flow, root)
         self.assertEqual(result.status, "failed")
         self.assertIn("iframe_parent_missing", result.errors)
+
+
+class SeriesBranchValidationTests(unittest.TestCase):
+    def _validate(self, flow):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir()
+            (root / "assets" / "d_main.png").write_bytes(b"png")
+            return validate_manifest(flow, root)
+
+    def _two_captured_branches(self):
+        return [
+            _branch(
+                "b_a", "series-1", 0,
+                viewer_state_id="s_viewer_a",
+                metadata_state_id="s_meta_a",
+                return_state_id="s_viewer_a",
+            ),
+            _branch(
+                "b_b", "series-2", 1,
+                viewer_state_id="s_viewer_b",
+                metadata_state_id="s_meta_b",
+                return_state_id="s_viewer_b",
+            ),
+        ]
+
+    def test_valid_two_branch_flow_passes_and_emits_metrics(self):
+        flow = _series_flow(
+            branches=self._two_captured_branches(),
+            expansion=_expansion(discovered_count=2, captured_count=2),
+        )
+        # No recorded source script on disk: avoid the unrelated
+        # source_script_missing warning so we can assert a clean success.
+        flow.source_script_relpath = ""
+        result = self._validate(flow)
+        self.assertEqual(result.status, "success", result.errors)
+        self.assertEqual(result.metrics["series_discovered"], 2)
+        self.assertEqual(result.metrics["series_captured"], 2)
+        self.assertEqual(result.metrics["series_partial"], 0)
+        self.assertEqual(result.metrics["series_failed"], 0)
+
+    def test_duplicate_series_key_is_rejected(self):
+        flow = _series_flow(
+            branches=[
+                _branch("b_a", "series-1", 0, viewer_state_id="s_viewer_a"),
+                _branch("b_b", "series-1", 1, viewer_state_id="s_viewer_b"),
+            ],
+            expansion=_expansion(discovered_count=2, captured_count=2),
+        )
+        result = self._validate(flow)
+        self.assertIn("duplicate_series_key", result.errors)
+
+    def test_missing_viewer_state_is_rejected(self):
+        flow = _series_flow(
+            branches=[_branch("b_a", "series-1", 0, viewer_state_id="s_NOPE")],
+            expansion=_expansion(discovered_count=1, captured_count=1),
+        )
+        result = self._validate(flow)
+        self.assertTrue(any("series_viewer_state_missing" in e for e in result.errors), result.errors)
+
+    def test_missing_metadata_state_is_rejected(self):
+        flow = _series_flow(
+            branches=[
+                _branch(
+                    "b_a", "series-1", 0,
+                    viewer_state_id="s_viewer_a",
+                    metadata_state_id="s_NOPE",
+                    return_state_id="s_viewer_a",
+                )
+            ],
+            expansion=_expansion(discovered_count=1, captured_count=1),
+        )
+        result = self._validate(flow)
+        self.assertTrue(any("series_metadata_state_missing" in e for e in result.errors), result.errors)
+
+    def test_missing_return_state_is_rejected(self):
+        flow = _series_flow(
+            branches=[
+                _branch(
+                    "b_a", "series-1", 0,
+                    viewer_state_id="s_viewer_a",
+                    metadata_state_id="s_meta_a",
+                    return_state_id="s_NOPE",
+                )
+            ],
+            expansion=_expansion(discovered_count=1, captured_count=1),
+        )
+        result = self._validate(flow)
+        self.assertTrue(any("series_return_state_missing" in e for e in result.errors), result.errors)
+
+    def test_metadata_return_must_equal_viewer_state(self):
+        flow = _series_flow(
+            branches=[
+                _branch(
+                    "b_a", "series-1", 0,
+                    viewer_state_id="s_viewer_a",
+                    metadata_state_id="s_meta_a",
+                    return_state_id="s_viewer_b",
+                )
+            ],
+            expansion=_expansion(discovered_count=1, captured_count=1),
+        )
+        result = self._validate(flow)
+        self.assertTrue(any("series_metadata_return_mismatch" in e for e in result.errors), result.errors)
+
+    def test_illegal_capture_status_is_rejected(self):
+        flow = _series_flow(
+            branches=[
+                _branch("b_a", "series-1", 0, viewer_state_id="s_viewer_a", capture_status="wat")
+            ],
+            expansion=_expansion(discovered_count=1, captured_count=1),
+        )
+        result = self._validate(flow)
+        self.assertTrue(any("series_illegal_capture_status" in e for e in result.errors), result.errors)
+
+    def test_captured_branch_must_have_viewer_state(self):
+        flow = _series_flow(
+            branches=[_branch("b_a", "series-1", 0, viewer_state_id=None)],
+            expansion=_expansion(discovered_count=1, captured_count=1),
+        )
+        result = self._validate(flow)
+        self.assertTrue(any("series_captured_missing_viewer_state" in e for e in result.errors), result.errors)
+
+    def test_failed_branch_must_carry_warning_or_reason(self):
+        flow = _series_flow(
+            branches=[_branch("b_a", "series-1", 0, capture_status="failed", warning=None)],
+            expansion=_expansion(discovered_count=1, captured_count=0, failed_count=1),
+        )
+        result = self._validate(flow)
+        self.assertTrue(any("series_failed_missing_reason" in e for e in result.errors), result.errors)
+
+    def test_failed_branch_may_omit_state_when_warning_present(self):
+        flow = _series_flow(
+            branches=[
+                _branch("b_a", "series-1", 0, capture_status="failed", warning="timeout", viewer_state_id=None)
+            ],
+            expansion=_expansion(discovered_count=1, captured_count=0, failed_count=1),
+        )
+        result = self._validate(flow)
+        self.assertNotIn("series_failed_missing_reason", result.errors)
+        self.assertNotIn("series_captured_missing_viewer_state", result.errors)
+
+    def test_counting_invariant_captured_plus_partial_plus_failed_eq_discovered(self):
+        flow = _series_flow(
+            branches=[
+                _branch(
+                    "b_a", "series-1", 0,
+                    viewer_state_id="s_viewer_a",
+                    metadata_state_id="s_meta_a",
+                    return_state_id="s_viewer_a",
+                ),
+                _branch("b_b", "series-2", 1, capture_status="failed", warning="timeout"),
+            ],
+            expansion=_expansion(discovered_count=2, captured_count=1, failed_count=1),
+        )
+        flow.source_script_relpath = ""
+        result = self._validate(flow)
+        self.assertEqual(result.status, "success", result.errors)
+
+        bad = _series_flow(
+            branches=[
+                _branch("b_a", "series-1", 0, viewer_state_id="s_viewer_a"),
+                _branch("b_b", "series-2", 1, capture_status="failed", warning="timeout"),
+            ],
+            expansion=_expansion(discovered_count=2, captured_count=1, failed_count=2),
+        )
+        result = self._validate(bad)
+        self.assertTrue(any("series_count_mismatch" in e for e in result.errors), result.errors)
+
+    def test_unreached_end_requires_virtualization_warning(self):
+        flow = _series_flow(
+            branches=self._two_captured_branches(),
+            expansion=_expansion(discovered_count=2, captured_count=2, reached_end=False, warning=None),
+            warnings=[],
+        )
+        result = self._validate(flow)
+        self.assertTrue(any("series_virtualized_partial" in e for e in result.errors), result.errors)
+
+        ok = _series_flow(
+            branches=self._two_captured_branches(),
+            expansion=_expansion(
+                discovered_count=2, captured_count=2, reached_end=False,
+                warning="series_virtualized_partial",
+            ),
+            warnings=[],
+        )
+        result = self._validate(ok)
+        self.assertNotIn("series_virtualized_partial", result.errors)
+
+    def test_v1_flow_witout_series_data_is_untouched(self):
+        # A v1 flow without series fields must not trigger series validations.
+        flow = _base_flow()
+        flow.schema_version = 1
+        flow.source_script_relpath = ""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir()
+            (root / "assets" / "d_main.png").write_bytes(b"png")
+            result = validate_manifest(flow, root)
+        self.assertEqual(result.status, "success", result.errors)
+        self.assertNotIn("series_discovered", result.metrics)
+
+    def test_v1_flow_with_series_data_is_rejected(self):
+        # A v1 manifest claiming series branches must be rejected: the data can
+        # never legitimately exist at v1 and would be dropped on read.
+        flow = _base_flow()
+        flow.schema_version = 1
+        flow.series_branches = [_branch("b_a", "series-1", 0, viewer_state_id="s_viewer_a")]
+        result = self._validate(flow)
+        self.assertIn("series_requires_schema_v2", result.errors)
+
+    def test_duplicate_branch_id_is_rejected(self):
+        flow = _series_flow(
+            branches=[
+                _branch("dup", "series-1", 0, viewer_state_id="s_viewer_a"),
+                _branch("dup", "series-2", 1, viewer_state_id="s_viewer_b"),
+            ],
+            expansion=_expansion(discovered_count=2, captured_count=2),
+        )
+        result = self._validate(flow)
+        self.assertIn("duplicate_branch_id", result.errors)
+
+    def test_source_member_must_resolve_to_series_region_member(self):
+        # Branch claims series-2 but points at viewer_a whose series region only
+        # contains the m_series-1 member: the source cannot be routed.
+        flow = _series_flow(
+            branches=[_branch("b_a", "series-2", 0, viewer_state_id="s_viewer_a")],
+            expansion=_expansion(discovered_count=1, captured_count=1),
+        )
+        result = self._validate(flow)
+        self.assertIn("series_source_member_unresolved", result.errors)
+
+    def test_partial_branch_must_have_viewer_state(self):
+        flow = _series_flow(
+            branches=[
+                _branch("b_a", "series-1", 0, capture_status="partial", viewer_state_id=None)
+            ],
+            expansion=_expansion(discovered_count=1, captured_count=0, partial_count=1),
+        )
+        result = self._validate(flow)
+        self.assertIn("series_partial_missing_viewer_state", result.errors)
+
+    def test_captured_branch_requires_metadata_and_return(self):
+        flow = _series_flow(
+            branches=[_branch("b_a", "series-1", 0, viewer_state_id="s_viewer_a")],
+            expansion=_expansion(discovered_count=1, captured_count=1),
+        )
+        result = self._validate(flow)
+        self.assertIn("series_captured_missing_metadata_state", result.errors)
+        self.assertIn("series_captured_missing_return_state", result.errors)
+
+    def test_metadata_state_requires_viewer_and_explicit_return(self):
+        # A metadata_state without its owning viewer is invalid even though the
+        # metadata state id itself resolves.
+        flow = _series_flow(
+            branches=[
+                _branch("b_a", "series-1", 0, metadata_state_id="s_meta_a", viewer_state_id=None)
+            ],
+            expansion=_expansion(discovered_count=1, captured_count=1),
+        )
+        result = self._validate(flow)
+        self.assertIn("series_metadata_state_requires_viewer", result.errors)
 
 
 class LocatorRiskTests(unittest.TestCase):
@@ -367,6 +710,68 @@ class PrivacyValidationTests(unittest.TestCase):
             result = validate_privacy(root)
             combined = "\n".join([*result.errors, *result.warnings, json.dumps(result.metrics)])
             self.assertNotIn("hopefully-not-reported-12345", combined)
+
+
+class SeriesPrivacyValidationTests(unittest.TestCase):
+    """P1#8 closure: raw series identity must never reach route/event/log/served
+    (non-metadata) surfaces, while the served Metadata panel text (a limited
+    sensitive artifact) stays intact and readable."""
+
+    _RAW = "1.2.840.113619.2.55.3.12345.6789"
+
+    def _served_dir(self, tmp, *, uid_in_metadata=True, uid_in_route_json=False, uid_in_entry=True, uid_in_log=False):
+        root = Path(tmp) / "replica"
+        root.mkdir(parents=True, exist_ok=True)
+        slug = "aabbccddeeff"
+        metadata_html = (
+            '<div class="replica-metadata" data-replica-panel-region="r">'
+            '<div class="content">'
+            f'<div>Series Instance UID: {self._RAW}</div>'
+            '<div>SeriesNumber: 1</div>'
+            "</div></div>"
+        ) if uid_in_metadata else '<div class="replica-metadata"><div class="content">SeriesNumber: 1</div></div>'
+        entry_html = f'<div data-replica-series-key="{slug}">Series A</div>'
+        if uid_in_entry:
+            entry_html += f'<div>raw-holder {self._RAW}</div>'
+        (root / "index.html").write_text(entry_html + metadata_html, encoding="utf-8")
+        route_json = {"series": {slug: {"viewerUrl": "x"}}}
+        if uid_in_route_json:
+            route_json["series"][self._RAW] = {"disabled": True}
+        (root / "route_map.json").write_text(json.dumps(route_json), encoding="utf-8")
+        return root
+
+    def test_clean_served_dir_passes_and_panel_readable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._served_dir(tmp, uid_in_entry=False)  # UID only inside the metadata panel
+            result = validate_series_privacy(root, {self._RAW})
+            self.assertEqual(result.status, "success", f"{result.errors} {result.warnings}")
+        self.assertGreaterEqual(result.metrics["metadata_panel_blocks"], 1)
+
+    def test_raw_uid_outside_metadata_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._served_dir(tmp, uid_in_metadata=False, uid_in_entry=True, uid_in_route_json=False)
+            result = validate_series_privacy(root, {self._RAW})
+            self.assertEqual(result.status, "failed")
+            self.assertTrue(any(e.startswith("raw_series_identity_in_served_html") for e in result.errors))
+            # The metadata panel itself is untouched by the scan boundary.
+            self.assertGreaterEqual(result.metrics["metadata_panel_blocks"], 1)
+
+    def test_raw_uid_in_route_map_json_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._served_dir(tmp, uid_in_metadata=False, uid_in_route_json=True)
+            result = validate_series_privacy(root, {self._RAW})
+            self.assertEqual(result.status, "failed")
+            self.assertTrue(any(e.startswith("raw_series_identity_in_artifact") for e in result.errors))
+
+    def test_metadata_panel_text_still_readable_after_sanitize(self):
+        # The boundary keeps the full (executable-stripped) panel readable; the
+        # readable-text check must report the UID-bearing series row present.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._served_dir(tmp, uid_in_metadata=True)
+            html = (root / "index.html").read_text(encoding="utf-8")
+            self.assertTrue(html.count("Series Instance UID") >= 1)
+            # Executable/token attributes are gone (sanitizer contract), text remains.
+            self.assertNotIn("<script", html.lower())
 
 
 class CapabilitiesTests(unittest.TestCase):

@@ -28,6 +28,20 @@ def redact_url(url: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, redacted_query, ""))
 
 
+def series_key_slug(series_key: str, salt: str = "") -> str:
+    """Deterministic, non-reversible public slug for a series key.
+
+    The raw ``series_key`` may carry a real SeriesInstanceUID or
+    patient-derived text, so it must never be written verbatim into served
+    replica HTML (``data-replica-series-key`` / route maps), logs, reports, or
+    manifest routes. This returns a short SHA-256 prefix that is stable across
+    builds of the same replica and whose collisions are negligible for the
+    bounded (<= max_series) set of keys in a single flow.
+    """
+    digest = hashlib.sha256(f"{salt}::{series_key}".encode("utf-8")).hexdigest()
+    return digest[:12]
+
+
 # Keys that carry high-confidence credential material in URL query strings.
 KNOWN_QUERY_SECRET_KEYS = {
     "token", "access_token", "refresh_token", "auth", "authtoken",

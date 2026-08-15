@@ -152,6 +152,28 @@ class RegionMember:
 
 
 @dataclass
+class SeriesDescriptor:
+    """Stable, locator-free description of one discovered series candidate.
+
+    Deliberately stores only stable descriptions -- never Locators, element
+    handles, or absolute coordinates -- so a descriptor stays meaningful after
+    a virtualized list has scrolled and reused its DOM nodes. ``member_id``
+    links the descriptor to its contributing ``RegionMember``.
+    """
+
+    series_key: str
+    label: str
+    ordinal: int
+    document_id: str
+    member_id: str
+    stable_attributes: dict[str, str] = field(default_factory=dict)
+    selected: bool = False
+    explicit_frame_count: int | None = None
+    inferred_frame_count: int | None = None
+    activation: str | None = None  # "click" | "dblclick" | None
+
+
+@dataclass
 class SeriesCollectionEvidence:
     collection_mode: str
     virtualized: bool
@@ -159,6 +181,44 @@ class SeriesCollectionEvidence:
     collected_count: int
     harvest_steps: int
     reached_end: bool
+    warning: str | None
+    discovered_count: int = 0
+
+
+@dataclass
+class SeriesBranch:
+    """One discoverable series and its captured viewer/metadata branch route.
+
+    A branch routes from a source series member to a per-series Viewer state and
+    (optionally) a Metadata state. The Metadata close returns *explicitly* to
+    ``return_state_id`` -- it is never inferred from ordinal ordering.
+    """
+
+    branch_id: str
+    series_key: str
+    label: str
+    ordinal: int
+    document_id: str
+    source_member_id: str
+    selector: LocatorRecipe | None
+    activation: str  # "click" | "dblclick"
+    viewer_state_id: str | None
+    metadata_state_id: str | None
+    return_state_id: str | None
+    capture_status: str  # captured|partial|failed|skipped_budget|skipped_duplicate
+    warning: str | None
+
+
+@dataclass
+class SeriesExpansionEvidence:
+    """Aggregate completeness evidence for a multi-series discovery pass."""
+
+    discovered_count: int
+    captured_count: int
+    partial_count: int
+    failed_count: int
+    reached_end: bool
+    total_duration_ms: int
     warning: str | None
 
 
@@ -289,15 +349,35 @@ class ReplicaFlow:
     entry_state_id: str
     states: list[ReplicaState]
     warnings: list[str]
+    series_branches: list[SeriesBranch] = field(default_factory=list)
+    series_expansion: SeriesExpansionEvidence | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        # Guard the write path: a schema v1 manifest must never carry series
+        # data, because ``from_dict`` deliberately strips series fields when
+        # reading v1 (line ~368) -- writing v1 + series here would silently
+        # discard the branches/expansion on a later read. Fail loudly at write
+        # time instead of letting the reader drop fields.
+        if self.schema_version == 1 and (self.series_branches or self.series_expansion is not None):
+            raise ValueError(
+                "schema v1 manifests cannot carry series branches/expansion; "
+                "use schema_version=2 to persist multi-series data"
+            )
         return asdict(self)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "ReplicaFlow":
-        if value.get("schema_version") != 1:
+        version = value.get("schema_version")
+        if version not in (1, 2):
             raise ValueError("unsupported replica manifest schema version")
-        flow = _decode_dataclass(value, cls)
+        payload = dict(value)
+        if version == 1:
+            # v1 manifests never carried series data. Strip any fabricated
+            # family so the decode fills defaults (empty list / None) and never
+            # invents branch content for a legacy manifest.
+            payload.pop("series_branches", None)
+            payload.pop("series_expansion", None)
+        flow = _decode_dataclass(payload, cls)
         if flow.source_script_relpath.startswith(("/", "\\")) or ":" in flow.source_script_relpath:
             raise ValueError("source_script_relpath must be a relative path")
         return flow

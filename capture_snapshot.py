@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import hashlib
+import re
 import time
 from pathlib import Path
 from collections.abc import Callable, Mapping, Sequence
@@ -12,7 +13,7 @@ from typing import Any
 from PIL import Image, ImageChops, ImageFilter
 from lxml import html
 
-from replica_models import DiffMetrics, DomNodeSnapshot, InteractionRegion, Rect, RegionMember, ReplicaDocument, ReplicaPage, SelectorClosure, SeriesCollectionEvidence, StateDiffProfile, StateEvidence
+from replica_models import DiffMetrics, DomNodeSnapshot, InteractionRegion, Rect, RegionMember, ReplicaDocument, ReplicaPage, SelectorClosure, SeriesCollectionEvidence, SeriesDescriptor, StateDiffProfile, StateEvidence
 
 
 def _load_grayscale(png_bytes: bytes) -> Image.Image:
@@ -136,10 +137,14 @@ def capture_locator_snapshot(locator: Any, coordinate_space: str = "page_viewpor
         """element => {
             const rect = element.getBoundingClientRect();
             const style = getComputedStyle(element);
+            const attributes = Object.fromEntries(Array.from(element.attributes, attribute => [attribute.name, attribute.value]));
+            if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+                attributes.value = element.value;
+            }
             return {
                 tag_name: element.tagName.toLowerCase(),
                 text: (element.innerText || element.textContent || '').trim(),
-                attributes: Object.fromEntries(Array.from(element.attributes, attribute => [attribute.name, attribute.value])),
+                attributes,
                 rect: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
                 outer_html: element.outerHTML,
                 computed_style: {
@@ -184,21 +189,117 @@ def capture_interaction_region(root_locator: Any, region_type: str, document_id:
     return InteractionRegion(f"{document_id}_{region_type}", region_type, document_id, root, members, None)
 
 
-def capture_series_interaction_region(root_locator: Any, document_id: str, max_scroll_steps: int = 40) -> InteractionRegion:
-    """Harvest scrollable series rows, restoring the source scroll position afterward."""
-    root = capture_locator_snapshot(root_locator)
-    items = root_locator.locator("option, [data-series], [role='option'], .series-item, li")
+_SERIES_ITEM_SELECTOR = "option, [data-series], [role='option'], .series-item, li"
+# Highest-priority stable attribute wins; the first *non-empty* attribute on this
+# list (in order) is used as the identity of a series. Later attributes are kept
+# as descriptive stable_attributes but never as the primary identity.
+_SERIES_IDENTITY_ATTRS = ("data-series-uid", "data-series", "data-uid", "value", "id")
+_SERIES_FRAME_ATTRS = ("data-frame-count", "data-frames", "data-frame_total", "data-total-frames")
+
+
+def _normalize_series_text(text: str) -> str:
+    return " ".join((text or "").split()).lower()
+
+
+def _series_frame_count_from_text(text: str) -> int | None:
+    match = re.search(r"(\d{1,6})\s*(?:幅|帧|frames?|images?)\b", text or "", flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _series_stable_attributes(snapshot: DomNodeSnapshot) -> dict[str, str]:
+    stable: dict[str, str] = {}
+    for name in _SERIES_IDENTITY_ATTRS:
+        value = snapshot.attributes.get(name)
+        if value:
+            stable[name] = value
+    return stable
+
+
+def _series_identity(snapshot: DomNodeSnapshot) -> tuple[tuple[str, str], dict[str, str], str | None]:
+    """Return (identity_key, stable_attributes, key_basis).
+
+    ``identity_key`` drives cross-scroll dedup; distinct keys mean distinct
+    logical series. ``key_basis`` is the human-meaningful identity value used to
+    build ``series_key`` (None when only the text-fallback exists, so the caller
+    appends the document id + same-name occurrence index).
+    """
+    stable = _series_stable_attributes(snapshot)
+    for name in _SERIES_IDENTITY_ATTRS:
+        if name in stable:
+            return (f"attr:{name}", stable[name]), stable, stable[name]
+    norm = _normalize_series_text(snapshot.text)
+    return ("text", norm), stable, None
+
+
+def _series_selected(snapshot: DomNodeSnapshot) -> bool:
+    attributes = snapshot.attributes
+    if attributes.get("aria-selected", "").lower() == "true":
+        return True
+    if "selected" in attributes:
+        return True
+    if attributes.get("data-selected", "").lower() in ("true", "1", "selected"):
+        return True
+    return False
+
+
+def _series_explicit_frame_count(snapshot: DomNodeSnapshot) -> int | None:
+    for name in _SERIES_FRAME_ATTRS:
+        value = snapshot.attributes.get(name)
+        if value and value.strip().isdigit():
+            return int(value.strip())
+    return None
+
+
+def discover_series_candidates(
+    root_locator: Any,
+    document_id: str,
+    max_scroll_steps: int = 40,
+    max_duration_s: float = 10.0,
+) -> tuple[list[SeriesDescriptor], list[RegionMember], SeriesCollectionEvidence]:
+    """Deterministically enumerate scrollable series rows into stable descriptors.
+
+    This is the single scroll-harvest discovery algorithm shared by ordinary
+    snapshot capture and future auto-exploration. It restores the original
+    ``scrollTop`` on every exit path, dedups virtualized list nodes that are
+    reused across scroll positions, and never stores Locators, element handles
+    or absolute coordinates -- only stable descriptions.
+
+    Returns ``(descriptors, members, evidence)`` where each descriptor's
+    ``member_id`` matches the corresponding region member, so the discovered
+    count is directly auditable against the collected region members.
+    """
+    items = root_locator.locator(_SERIES_ITEM_SELECTOR)
     initial = root_locator.evaluate("element => ({top: element.scrollTop, height: element.clientHeight, scrollHeight: element.scrollHeight})")
-    collected: dict[tuple[str, str, str], RegionMember] = {}
+    discovered: dict[tuple[str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str]] = []
     reached_end = initial["scrollHeight"] <= initial["height"]
     steps = 0
+    deadline = time.monotonic() + max_duration_s
     try:
         while True:
             for index in range(items.count()):
                 snapshot = capture_locator_snapshot(items.nth(index), "region_content_css")
-                key = (snapshot.attributes.get("data-series", ""), snapshot.attributes.get("value", ""), snapshot.text)
-                collected.setdefault(key, RegionMember(f"{document_id}_series_{len(collected):03d}", snapshot.tag_name, snapshot))
-            if reached_end or steps >= max_scroll_steps:
+                identity_key, stable, _ = _series_identity(snapshot)
+                if identity_key not in discovered:
+                    discovered[identity_key] = {
+                        "snapshot": snapshot,
+                        "label": snapshot.text,
+                        "stable": stable,
+                        "selected": _series_selected(snapshot),
+                        "explicit_frames": _series_explicit_frame_count(snapshot),
+                        "activation": snapshot.attributes.get("data-activation") or None,
+                    }
+                    order.append(identity_key)
+                else:
+                    record = discovered[identity_key]
+                    # A later scroll window may expose the node in its selected
+                    # state or with more complete text; merge rather than discard.
+                    if _series_selected(snapshot):
+                        record["selected"] = True
+                    if not record["snapshot"].text and snapshot.text:
+                        record["snapshot"] = snapshot
+                        record["label"] = snapshot.text
+            if reached_end or steps >= max_scroll_steps or time.monotonic() >= deadline:
                 break
             previous = root_locator.evaluate("element => element.scrollTop")
             current = root_locator.evaluate("element => { element.scrollTop += Math.max(1, element.clientHeight); return element.scrollTop; }")
@@ -208,10 +309,55 @@ def capture_series_interaction_region(root_locator: Any, document_id: str, max_s
                 break
     finally:
         root_locator.evaluate("(element, top) => element.scrollTop = top", initial["top"])
+
     virtualized = initial["scrollHeight"] > initial["height"]
     warning = "series_virtualized_partial" if virtualized and not reached_end else None
-    evidence = SeriesCollectionEvidence("scroll_harvest", virtualized, items.count(), len(collected), steps, reached_end, warning)
-    return InteractionRegion(f"{document_id}_series", "series", document_id, root, list(collected.values()), evidence)
+
+    descriptors: list[SeriesDescriptor] = []
+    members: list[RegionMember] = []
+    same_name_index: dict[str, int] = {}
+    for position, identity_key in enumerate(order):
+        record = discovered[identity_key]
+        member_id = f"{document_id}_series_{len(members):03d}"
+        snapshot = record["snapshot"]
+        members.append(RegionMember(member_id, snapshot.tag_name, snapshot))
+        if record["stable"]:
+            series_key = next(record["stable"][name] for name in _SERIES_IDENTITY_ATTRS if name in record["stable"])
+        else:
+            norm = _normalize_series_text(snapshot.text)
+            occurrence = same_name_index.get(norm, 0)
+            same_name_index[norm] = occurrence + 1
+            series_key = f"{document_id}::{norm}::x{occurrence}"
+        descriptors.append(SeriesDescriptor(
+            series_key=series_key,
+            label=record["label"],
+            ordinal=position,
+            document_id=document_id,
+            member_id=member_id,
+            stable_attributes=record["stable"],
+            selected=record["selected"],
+            explicit_frame_count=record["explicit_frames"],
+            inferred_frame_count=_series_frame_count_from_text(snapshot.text),
+            activation=record["activation"],
+        ))
+
+    evidence = SeriesCollectionEvidence(
+        "scroll_harvest", virtualized, items.count(), len(descriptors), steps, reached_end, warning, len(descriptors)
+    )
+    return descriptors, members, evidence
+
+
+def capture_series_interaction_region(root_locator: Any, document_id: str, max_scroll_steps: int = 40) -> InteractionRegion:
+    """Harvest scrollable series rows as a region, restoring scroll position afterward.
+
+    Delegates to :func:`discover_series_candidates` (the single scroll-harvest
+    algorithm) and packages its region members into an ``InteractionRegion``.
+    """
+    _, members, evidence = discover_series_candidates(
+        root_locator, document_id, max_scroll_steps=max_scroll_steps
+    )
+    root = capture_locator_snapshot(root_locator)
+    return InteractionRegion(f"{document_id}_series", "series", document_id, root, members, evidence)
 
 
 _MARKER_REGION_CANDIDATES: dict[str, tuple[str, tuple[str, ...]]] = {
@@ -291,7 +437,29 @@ def capture_marker_panel_region(
             if not candidate.is_visible():
                 continue
             tag = candidate.evaluate("element => element.tagName.toLowerCase()")
-            if tag in {"a", "button", "input", "select", "textarea"}:
+            if tag in {"a", "button", "i", "input", "select", "span", "svg", "textarea"}:
+                continue
+            candidate_data = candidate.evaluate(
+                """element => {
+                    const rect = element.getBoundingClientRect();
+                    const identity = `${element.id || ''} ${element.className || ''}`.toLowerCase();
+                    return {
+                        area: rect.width * rect.height,
+                        text: (element.innerText || element.textContent || '').trim(),
+                        identity,
+                        role: (element.getAttribute('role') || '').toLowerCase(),
+                    };
+                }"""
+            )
+            is_named_panel = any(
+                token in candidate_data["identity"]
+                for token in ("tagsbox", "box-tags", "dicom", "metadata")
+            )
+            if (
+                not candidate_data["text"]
+                or candidate_data["area"] < 1000
+                or not (is_named_panel or candidate_data["role"] == "dialog")
+            ):
                 continue
             root_locator = candidate
             break
@@ -391,7 +559,7 @@ def capture_page_topology(
             box = frame_element.bounding_box()
             if not box:
                 continue
-            screenshot = page.screenshot(type="png", scale="css", clip=box)
+            screenshot = frame.locator("html").screenshot(type="png")
             document_id = f"d_{page_id}_f_{frame_index:03d}"
             relative_asset = Path("assets") / f"{document_id}.png"
             (asset_root / relative_asset).write_bytes(screenshot)

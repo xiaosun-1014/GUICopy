@@ -7,7 +7,9 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 from batch_capture_replicate import capture_and_build
+from build_replica import build_replica
 from replay_helpers import ReplicaServer
+from replay_helpers import series_key_slug
 
 
 class ReplicaEndToEndTests(unittest.TestCase):
@@ -88,6 +90,42 @@ run()
                 self.assertEqual(page.locator("#go").count(), 1)
                 page.locator("#go").click()
                 self.assertIn("states/s_001", page.url)
+                self.assertEqual(external_requests, [])
+                browser.close()
+
+    def test_multi_series_replica_navigates_offline_without_external_requests(self):
+        from test.test_replica_runtime import _build_series_flow, _write_assets
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_assets(root)
+            flow = _build_series_flow()
+            output = root / "replica"
+            build_replica(flow, root, output)
+            with ReplicaServer(output) as server, sync_playwright() as playwright:
+                browser = playwright.chromium.launch()
+                page = browser.new_page(viewport={"width": 300, "height": 200})
+                external_requests = []
+                page.on(
+                    "request",
+                    lambda request: external_requests.append(request.url)
+                    if not request.url.startswith("http://127.0.0.1")
+                    else None,
+                )
+                page.goto(server.url)
+                # A -> B -> Metadata(B) -> close(B) -> C, all offline.
+                page.locator(f'[data-replica-series-key="{series_key_slug("B")}"]').click()
+                page.wait_for_url("**/states/s_vb/index.html")
+                self.assertEqual(page.locator("#viewer-vb").inner_text(), "vb viewer unique")
+                page.locator('[data-testid="meta-open"]').click()
+                page.wait_for_url("**/states/s_mb/index.html")
+                self.assertEqual(page.locator("#m-tag-mb").inner_text(), "tag-B: value-B")
+                page.locator("[data-replica-back]").click()
+                page.wait_for_url("**/states/s_vb/index.html")
+                self.assertEqual(page.locator("#viewer-vb").inner_text(), "vb viewer unique")
+                page.locator(f'[data-replica-series-key="{series_key_slug("C")}"]').click()
+                page.wait_for_url("**/states/s_vc/index.html")
+                self.assertEqual(page.locator("#viewer-vc").inner_text(), "vc viewer unique")
                 self.assertEqual(external_requests, [])
                 browser.close()
 

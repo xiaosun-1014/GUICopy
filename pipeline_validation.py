@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +58,18 @@ def _result(errors, warnings, metrics) -> ValidationResult:
 # ---------------------------------------------------------------------------
 # Manifest integrity
 # ---------------------------------------------------------------------------
+
+
+def _source_member_resolves(viewer_state, source_member_id: str) -> bool:
+    """Return True if ``source_member_id`` appears among a ``series`` region
+    member in the branch's viewer state."""
+    for document in viewer_state.documents:
+        for region in document.regions:
+            if region.region_type != "series":
+                continue
+            if any(member.member_id == source_member_id for member in region.members):
+                return True
+    return False
 
 
 def validate_manifest(flow: ReplicaFlow, capture_root: Path) -> ValidationResult:
@@ -146,6 +159,86 @@ def validate_manifest(flow: ReplicaFlow, capture_root: Path) -> ValidationResult
                 errors.append("source_hash_mismatch")
         else:
             warnings.append("source_script_missing")
+
+    # Multi-series expansion (schema v2). Validate branch routes and aggregate
+    # completeness evidence only when the flow actually carries series data so
+    # legacy v1 manifests are completely untouched. Whenever series data is
+    # present the manifest must claim schema v2 -- a v1 manifest carrying series
+    # fields would silently discard them on read, so it is rejected up front.
+    if flow.series_branches or flow.series_expansion is not None:
+        if flow.schema_version != 2:
+            errors.append("series_requires_schema_v2")
+        seen_branch_ids: set[str] = set()
+        seen_series_keys: set[str] = set()
+        for branch in flow.series_branches:
+            if branch.branch_id in seen_branch_ids:
+                errors.append("duplicate_branch_id")
+            seen_branch_ids.add(branch.branch_id)
+            if branch.series_key in seen_series_keys:
+                errors.append("duplicate_series_key")
+            seen_series_keys.add(branch.series_key)
+            if branch.capture_status not in {
+                "captured", "partial", "failed", "skipped_budget", "skipped_duplicate",
+            }:
+                errors.append("series_illegal_capture_status")
+            if branch.viewer_state_id is not None and branch.viewer_state_id not in state_id_set:
+                errors.append("series_viewer_state_missing")
+            if branch.metadata_state_id is not None and branch.metadata_state_id not in state_id_set:
+                errors.append("series_metadata_state_missing")
+            if branch.return_state_id is not None and branch.return_state_id not in state_id_set:
+                errors.append("series_return_state_missing")
+            # Metadata close returns to the SAME viewer; never inferred from
+            # ordinal ordering.
+            if branch.metadata_state_id is not None and branch.return_state_id != branch.viewer_state_id:
+                errors.append("series_metadata_return_mismatch")
+            # A metadata state is meaningless without its owning viewer.
+            if branch.metadata_state_id is not None and branch.viewer_state_id is None:
+                errors.append("series_metadata_state_requires_viewer")
+            # captured/partial routes must be reachable through a real Viewer
+            # state; failed/skipped may omit it but must carry a reason.
+            if branch.capture_status in ("captured", "partial") and branch.viewer_state_id is None:
+                errors.append(
+                    "series_captured_missing_viewer_state"
+                    if branch.capture_status == "captured"
+                    else "series_partial_missing_viewer_state"
+                )
+            if branch.capture_status == "captured":
+                if branch.metadata_state_id is None:
+                    errors.append("series_captured_missing_metadata_state")
+                if branch.return_state_id is None:
+                    errors.append("series_captured_missing_return_state")
+            if branch.capture_status == "failed" and branch.warning in (None, ""):
+                errors.append("series_failed_missing_reason")
+            if branch.capture_status in ("skipped_budget", "skipped_duplicate") and branch.warning in (None, ""):
+                errors.append("series_skipped_missing_reason")
+            # The source series must actually resolve to a ``series`` region
+            # member inside the branch's viewer state -- a dangling
+            # source_member_id means the branch cannot be routed to its content.
+            if branch.viewer_state_id is not None and branch.viewer_state_id in state_id_set:
+                viewer_state = next(s for s in flow.states if s.state_id == branch.viewer_state_id)
+                if not _source_member_resolves(viewer_state, branch.source_member_id):
+                    errors.append("series_source_member_unresolved")
+
+        expansion = flow.series_expansion
+        if expansion is not None:
+            if (
+                expansion.captured_count + expansion.partial_count + expansion.failed_count
+                != expansion.discovered_count
+            ):
+                errors.append("series_count_mismatch")
+            if expansion.reached_end is False:
+                has_partial_warning = (
+                    expansion.warning == "series_virtualized_partial"
+                    or any("series_virtualized_partial" in w for w in flow.warnings)
+                )
+                if not has_partial_warning:
+                    errors.append("series_virtualized_partial")
+            metrics.update(
+                series_discovered=expansion.discovered_count,
+                series_captured=expansion.captured_count,
+                series_partial=expansion.partial_count,
+                series_failed=expansion.failed_count,
+            )
 
     metrics.update(
         state_count=len(flow.states),
@@ -456,6 +549,160 @@ def _looks_binary(path: Path) -> bool:
     except OSError:
         return True
     return b"\x00" in head
+
+
+_METADATA_PANEL_TAG = '<div class="replica-metadata"'
+_METADATA_PANEL_END = "</div>"
+
+
+def _strip_generated_metadata_blocks(text: str) -> str:
+    """Remove the served ``.replica-metadata`` panel blocks from generated HTML.
+
+    The offline Metadata panel is a **limited, sensitive artifact by design**:
+    it deliberately renders the complete (sanitized-for-executables) DICOM
+    Metadata DOM, whose text inherently includes patient- / series-identity
+    values. Privacy scanning therefore exempts exactly these blocks via their
+    generated container class, while every *other* served surface (series route
+    map, event/log JSON, route keys, entry overlay text) is scanned strictly.
+
+    ``<div ...>`` / ``</div>`` tags are matched by regex over actual tag
+    occurrences, so inline text (e.g. ``<div>Patient ...</div>``) never confuses
+    the div-nesting balance.
+    """
+    tag_re = re.compile(r"<div[\s>]|</div\s*>", re.IGNORECASE)
+    result = text
+    while True:
+        start = result.find(_METADATA_PANEL_TAG)
+        if start == -1:
+            return result
+        depth = 0
+        end = None
+        # Count div open/close tags from the block opener; the block is balanced
+        # by our container's own closing </div> (the builder emits a real,
+        # balanced div around the panel HTML).
+        for match in tag_re.finditer(result, start):
+            token = match.group(0)
+            if token.startswith("</"):
+                depth -= 1
+                if depth == 0:
+                    end = match.end()
+                    break
+            else:
+                depth += 1
+        if end is None:
+            # Unbalanced block (malformed panel); bail out rather than corrupt.
+            return result
+        result = result[:start] + result[end:]
+
+
+def _metadata_panel_readable_text(page_html: str) -> bool:
+    """Confirm a served ``.replica-metadata`` block still carries readable text
+    after generated output (executables/tokens already sanitized by capture)."""
+    stripped = _strip_generated_metadata_blocks(page_html)
+    if stripped == page_html:
+        # No block was present at all.
+        return False
+    text = "".join(re.sub(r"<[^>]+>", " ", page_html).split())
+    return bool(text.strip())
+
+
+def validate_series_privacy(
+    served_root: Path,
+    raw_series_keys: set[str],
+    event_log_text: str = "",
+) -> ValidationResult:
+    """(P1#8 closure) Scan the served/route/log surface for raw series identity.
+
+    Privacy boundary: ``route``/``event``/``log``/public-report surfaces must only
+    ever carry the ``series_key_slug``/hash — a raw UID / patient-derived key there
+    is an error. The served Metadata panel is a **limited sensitive artifact** (the
+    complete, executable-stripped Metadata DOM) and is intentionally exempt: its
+    blocks are stripped before scanning generated HTML. The route map JSON and any
+    supplied event/log text are never exempt.
+
+    Also asserts (as a warning) that a Metadata panel block exists and remains
+    readable (non-empty text) once present — proving the boundary keeps the panel
+    intact rather than redacting it away.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    metrics: dict[str, object] = {}
+    served_root = Path(served_root)
+    keys = [key for key in raw_series_keys if key]
+    if not keys:
+        return _result(errors, warnings, {"raw_series_keys": 0})
+
+    def _leaks(text: str) -> list[str]:
+        found = [key for key in keys if key in text]
+        return sorted(set(found))[:8]
+
+    # 1) route map / build report / log / event JSON: never exempt.
+    for path in sorted(served_root.rglob("*")):
+        if not path.is_file():
+            continue
+        name = path.name.lower()
+        if name in {"replica_runtime.js", "serve_replica.py", "replay_replica.py"}:
+            continue
+        if path.suffix == ".html":
+            continue  # handled in step 2 (metadata blocks exempted there)
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        leaks = _leaks(text)
+        if leaks:
+            errors.append(f"raw_series_identity_in_artifact:{path.relative_to(served_root)}")
+            metrics["leaked_keys"] = leaks
+            break
+
+    # 2) served HTML: strip metadata-panel blocks, then scan the rest strictly.
+    for path in sorted(served_root.rglob("*.html")):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        non_metadata = _strip_generated_metadata_blocks(text)
+        leaks = _leaks(non_metadata)
+        if leaks:
+            errors.append(f"raw_series_identity_in_served_html:{path.relative_to(served_root)}")
+            metrics["leaked_keys"] = leaks
+            break
+
+    # 3) event/log text (e.g. pipeline_events.jsonl): never exempt.
+    if event_log_text:
+        leaks = _leaks(event_log_text)
+        if leaks:
+            errors.append("raw_series_identity_in_log")
+            metrics["leaked_keys"] = leaks
+
+    # 4) the Metadata panel must still be present and readable (non-empty text):
+    #    stripping blocks for scanning must not have destroyed a real panel.
+    metadata_blocks = 0
+    for path in sorted(served_root.rglob("*.html")):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if _METADATA_PANEL_TAG in text:
+            metadata_blocks += 1
+            if not _metadata_panel_readable_text(text):
+                warnings.append("metadata_panel_empty:" + path.name)
+    metrics["metadata_panel_blocks"] = metadata_blocks
+    if metadata_blocks == 0:
+        warnings.append("metadata_panel_not_served")
+    return _result(errors, warnings, metrics)
+
+
+def _metadata_panel_readable_text(page_html: str) -> bool:
+    """Extract the text inside a served ``.replica-metadata`` block and confirm it
+    is non-empty after HTML tags are stripped (executables already sanitized)."""
+    start = page_html.find(_METADATA_PANEL_TAG)
+    if start == -1:
+        return False
+    end = page_html.find("</div>", start)
+    block = page_html[start:end] if end != -1 else page_html[start:]
+    text = "".join((re.sub(r"<[^>]+>", " ", block)).split())
+    return bool(text.strip())
 
 
 # ---------------------------------------------------------------------------

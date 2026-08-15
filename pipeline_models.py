@@ -58,6 +58,15 @@ class PipelineConfig:
     capture_timeout_s: int = 900
     auth_timeout_s: int = 300
     process_exit_grace_s: int = 5
+    # Opt-in all-series expansion (Phase 4). Defaults preserve old recording
+    # behavior: expansion is OFF unless ``expand_all_series`` is explicitly true.
+    expand_all_series: bool = False
+    max_series: int = 40
+    per_series_timeout_s: int = 20
+    # Worst-case budget is max_series * per_series_timeout_s (40 * 20 == 800);
+    # the total default of 900 keeps that product inside the cap.
+    total_series_timeout_s: int = 900
+    viewer_capture_mode: str = "first_stable_frame"
 
 
 @dataclass(frozen=True)

@@ -134,5 +134,74 @@ class WriteReportTests(unittest.TestCase):
             self.assertEqual(payload["status"], "partial")
 
 
+class SeriesCoverageReportTests(unittest.TestCase):
+    """Phase 8: the report carries series-coverage semantics with only safe
+    branch ids / stages — never patient text or full metadata."""
+
+    def test_report_includes_not_requested_coverage_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = create_run_layout(Path(tmp), "fixture", "run-sc-0")
+            results = [StageResult(PipelineStage.REPLICA_VALIDATION, PipelineStatus.SUCCESS)]
+            json_path, _ = write_pipeline_report(layout, BRIEF_CONFIG, results)
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            coverage = payload["series_coverage"]
+            self.assertEqual(coverage["status"], "not_requested")
+            self.assertEqual(coverage["discovered"], 0)
+            self.assertEqual(coverage["branches"], [])
+
+    @staticmethod
+    def _coverage_payload() -> dict:
+        return {
+            "enabled": True,
+            "status": "partial",
+            "discovered": 2,
+            "captured": 1,
+            "partial": 1,
+            "failed": 0,
+            "reached_end": True,
+            "expansion_completed": True,
+            "warning": None,
+            "branches": [
+                {"branch_id": "safe-br-0", "ordinal": 0, "status": "captured", "stage": ""},
+                {"branch_id": "safe-br-1", "ordinal": 1, "status": "partial",
+                 "stage": "metadata_timeout"},
+            ],
+        }
+
+    def test_report_carries_series_coverage_from_capture_stage_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = create_run_layout(Path(tmp), "fixture", "run-sc-1")
+            results = [
+                StageResult(
+                    PipelineStage.LIVE_CAPTURE,
+                    PipelineStatus.PARTIAL,
+                    metrics={"series_coverage": self._coverage_payload()},
+                ),
+            ]
+            json_path, _ = write_pipeline_report(layout, BRIEF_CONFIG, results)
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            coverage = payload["series_coverage"]
+            self.assertEqual(coverage["status"], "partial")
+            self.assertEqual(coverage["discovered"], 2)
+            self.assertEqual(coverage["captured"], 1)
+            self.assertEqual(coverage["partial"], 1)
+
+    def test_report_coverage_branches_expose_only_safe_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = create_run_layout(Path(tmp), "fixture", "run-sc-2")
+            results = [StageResult(
+                PipelineStage.LIVE_CAPTURE, PipelineStatus.PARTIAL,
+                metrics={"series_coverage": self._coverage_payload()},
+            )]
+            json_path, _ = write_pipeline_report(layout, BRIEF_CONFIG, results)
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            text = json.dumps(payload)
+            for branch in payload["series_coverage"]["branches"]:
+                self.assertEqual(set(branch), {"branch_id", "ordinal", "status", "stage"})
+            # No patient / UID / metadata body leaks into the report.
+            for sensitive in ("张三", "PatientName", "SeriesInstanceUID", "Accession"):
+                self.assertNotIn(sensitive, text)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,7 @@ from pipeline_orchestrator import (
     exit_code_for,
     main,
     resume_pipeline,
+    run_capture,
     run_pipeline,
 )
 from pipeline_io import create_run_layout
@@ -622,6 +623,145 @@ def _patches_for(config, layout, replica_validation=None, adapter_validation=Non
                   }))),
     ]
     return _PatchStack(patches)
+
+
+class SeriesExpansionOrchestratorTests(unittest.TestCase):
+    """Phase 8: child series events are routed into the controller tracker and
+    honestly downgrade the live-capture stage without dropping the main path."""
+
+    def _controller(self, tmp: str, events: list):
+        config = make_config(tmp)
+        return config, PipelineController(config, emit=events.append)
+
+    def _emit_series(self, controller, stream, stage="capturing_live"):
+        for child in stream:
+            controller._issue(
+                normalize_child_event(child, stage, controller.run_id)
+            )
+
+    def test_child_series_events_are_routed_into_tracker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            events = []
+            config, controller = self._controller(tmp, events)
+            self._emit_series(controller, [
+                {"event": "series_discovered", "reached_end": True, "discovered": 2},
+                {"event": "series_capture_completed", "branch_id": "b0", "ordinal": 0},
+                {"event": "series_capture_completed", "branch_id": "b1", "ordinal": 1},
+                {"event": "series_expansion_completed"},
+            ])
+            cov = controller.series_tracker.coverage()
+            self.assertEqual(cov["status"], "complete")
+            self.assertEqual(cov["captured"], 2)
+            self.assertEqual(cov["discovered"], 2)
+
+    def _fabricate_capture_success(self, config, controller, status, coverage):
+        """Run ``run_capture`` with a fabricated successful child result."""
+        manifest = controller.layout.capture_dir / "manifest.json"
+        manifest.write_text("{}", encoding="utf-8")
+        fake = type("FakeRes", (), {
+            "cancelled": False,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": json.dumps({
+                "event": "completed",
+                "entrypoint": str(manifest.name),
+            }),
+        })()
+        from unittest.mock import patch
+        with patch("pipeline_orchestrator._run_managed", return_value=fake):
+            return run_capture(config, controller.layout, controller), manifest
+
+    def test_capture_downgrades_to_partial_while_keeping_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            events = []
+            config, controller = self._controller(tmp, events)
+            self._emit_series(controller, [
+                {"event": "series_discovered", "reached_end": True, "discovered": 2},
+                {"event": "series_capture_completed", "branch_id": "b0", "ordinal": 0},
+                {"event": "series_capture_partial", "branch_id": "b1", "ordinal": 1,
+                 "error_type": "metadata_timeout"},
+                {"event": "series_expansion_completed"},
+            ])
+            result, manifest = self._fabricate_capture_success(
+                config, controller, PARTIAL,
+                controller.series_tracker.coverage(),
+            )
+            self.assertEqual(result.status, PARTIAL)
+            self.assertEqual(result.metrics["series_coverage"]["status"], "partial")
+            # honest degradation: manifest preserved so replica still builds
+            self.assertEqual(result.artifacts["manifest_path"], str(manifest))
+
+    def test_capture_stays_success_when_series_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            events = []
+            config, controller = self._controller(tmp, events)
+            self._emit_series(controller, [
+                {"event": "series_discovered", "reached_end": True, "discovered": 1},
+                {"event": "series_capture_completed", "branch_id": "b0", "ordinal": 0},
+                {"event": "series_expansion_completed"},
+            ])
+            result, _ = self._fabricate_capture_success(
+                config, controller, SUCCESS,
+                controller.series_tracker.coverage(),
+            )
+            self.assertEqual(result.status, SUCCESS)
+            self.assertEqual(result.metrics["series_coverage"]["status"], "complete")
+
+    def test_capture_no_series_leaves_status_success_without_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            events = []
+            config, controller = self._controller(tmp, events)
+            result, _ = self._fabricate_capture_success(
+                config, controller, SUCCESS, None,
+            )
+            self.assertEqual(result.status, SUCCESS)
+            self.assertNotIn("series_coverage", result.metrics or {})
+
+    def test_partial_series_capture_makes_overall_run_partial_but_builds(self):
+        """End-to-end: a partial series capture yields an overall PARTIAL run yet
+        still builds the replica (honest degradation, not a hard failure)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(tmp)
+            events: list[dict] = []
+
+            def series_partial_capture(_config, layout, controller):
+                controller._issue(
+                    normalize_child_event(
+                        {"event": "series_discovered", "reached_end": True,
+                         "discovered": 1},
+                        "capturing_live", controller.run_id,
+                    )
+                )
+                controller._issue(
+                    normalize_child_event(
+                        {"event": "series_capture_partial", "branch_id": "b0",
+                         "ordinal": 0, "error_type": "metadata_timeout"},
+                        "capturing_live", controller.run_id,
+                    )
+                )
+                manifest = layout.capture_dir / "manifest.json"
+                manifest.write_text("{}", encoding="utf-8")
+                return StageResult(
+                    PipelineStage.LIVE_CAPTURE, PARTIAL,
+                    artifacts={"manifest_path": str(manifest)},
+                    metrics={
+                        "series_coverage": controller.series_tracker.coverage()
+                    },
+                )
+
+            with _patches_for(config, config.output_root / "fixture" / "runs"):
+                with patch("pipeline_orchestrator.run_capture",
+                           side_effect=series_partial_capture):
+                    result = run_pipeline(config, emit=events.append)
+            self.assertEqual(result.status, PARTIAL)
+            # The replica still builds (REPLICA_BUILD stage ran & succeeded).
+            self.assertIn(
+                PipelineStage.REPLICA_BUILD, [s.stage for s in result.stages]
+            )
+            # The report carries the series coverage and honest partial status.
+            report = json.loads(result.layout.report_json.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "partial")
+            self.assertEqual(report["series_coverage"]["status"], "partial")
 
 
 if __name__ == "__main__":

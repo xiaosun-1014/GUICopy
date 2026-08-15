@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>Multi-series nested frames — innermost series list</title>
+<style>
+  body { font-family: sans-serif; margin: 8px; }
+  #series { height: 96px; width: 340px; overflow: auto; border: 1px solid #bbb; }
+  .item {
+    height: 24px; box-sizing: border-box; display: flex; align-items: center;
+    padding: 0 8px; border-bottom: 1px solid #eee; cursor: pointer;
+  }
+  .item[aria-selected="true"] { background: #dbe9ff; }
+  .series-frames { color: #666; margin-left: 6px; }
+  #viewer { margin-top: 10px; width: 340px; height: 90px; border: 2px solid #999;
+            display: flex; align-items: center; justify-content: center; }
+</style>
+</head>
+<body>
+  <p class="muted">Innermost document: series list (2 same-name + scroll-revealed Sagittal).</p>
+  <section id="series" class="series-list" role="listbox" aria-label="Series list">
+
+    <!-- Two SAME-NAME series, distinct data-series-uid. -->
+    <div class="item" role="option" data-series="Coronal MIP" data-series-uid="uid-1992"
+         data-frame-count="362" data-viewer-key="vw-coronal-a" data-bg="#cfe8cf"
+         data-series-number="101" data-series-description="Coronal MIP thin"
+         data-series-instance-uid="1.2.826.0.1.3680043.2001.1992"
+         aria-selected="true" onclick="selectSeries(this)">
+      <span class="series-name">Coronal MIP</span><span class="series-frames">1.0 362幅</span>
+    </div>
+    <div class="item" role="option" data-series="Coronal MIP" data-series-uid="uid-2047"
+         data-frame-count="180" data-viewer-key="vw-coronal-b" data-bg="#f5e6c8"
+         data-series-number="102" data-series-description="Coronal MIP thick"
+         data-series-instance-uid="1.2.826.0.1.3680043.2001.2047"
+         aria-selected="false" onclick="selectSeries(this)">
+      <span class="series-name">Coronal MIP</span><span class="series-frames">3.0 180幅</span>
+    </div>
+    <div class="item" role="option" data-series="Axial" data-series-uid="uid-3011"
+         data-frame-count="400" data-viewer-key="vw-axial" data-bg="#d8e2f0"
+         data-series-number="201" data-series-description="Axial soft tissue"
+         data-series-instance-uid="1.2.826.0.1.3680043.2001.3011"
+         aria-selected="false" onclick="selectSeries(this)">
+      <span class="series-name">Axial</span><span class="series-frames">0.8 400幅</span>
+    </div>
+    <div class="item" role="option" data-series="Thin 1.0" data-series-uid="uid-4105"
+         data-frame-count="500" data-viewer-key="vw-thin" data-bg="#e6d8f0"
+         data-series-number="301" data-series-description="Thin bone"
+         data-series-instance-uid="1.2.826.0.1.3680043.2001.4105"
+         aria-selected="false" onclick="selectSeries(this)">
+      <span class="series-name">Thin 1.0</span><span class="series-frames">1.0 500幅</span>
+    </div>
+    <!-- SCROLL-REVEALED. -->
+    <div class="item" role="option" data-series="Sagittal" data-series-uid="uid-5209"
+         data-frame-count="120" data-viewer-key="vw-sagittal" data-bg="#f0d8d8"
+         data-series-number="401" data-series-description="Sagittal reformat"
+         data-series-instance-uid="1.2.826.0.1.3680043.2001.5209"
+         aria-selected="false" onclick="selectSeries(this)">
+      <span class="series-name">Sagittal</span><span class="series-frames">2.0 120幅</span>
+    </div>
+
+  </section>
+  <div id="viewer" data-viewer-key="vw-coronal-a" style="background:#cfe8cf">Viewer: Coronal MIP (uid-1992)</div>
+
+  <script>
+    function selectSeries(el) {
+      document.querySelectorAll('#series .item').forEach(function (x) {
+        x.setAttribute('aria-selected', x === el ? 'true' : 'false');
+      });
+      var viewer = document.getElementById('viewer');
+      viewer.dataset.viewerKey = el.dataset.viewerKey;
+      viewer.style.background = el.dataset.bg;
+      viewer.textContent = 'Viewer: ' + el.dataset.series + ' (uid ' + el.dataset.seriesUid + ')';
+    }
+  </script>
+</body>
+</html>

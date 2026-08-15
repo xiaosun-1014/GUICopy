@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
+import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -13,21 +16,35 @@ import time
 import queue
 import threading
 from datetime import datetime, timezone
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from collections.abc import Callable
 from pathlib import Path
 
+from PIL import Image, ImageStat
+
 from build_replica import build_replica
-from capture_snapshot import _MARKER_REGION_CANDIDATES, capture_interaction_region, capture_locator_snapshot, capture_marker_interaction_region, capture_page_topology, capture_selector_closure, compute_image_diff, decide_state, marker_region_type
+from capture_readiness import canvas_hash, metadata_panel_signature, metadata_uid_sha256_prefix, screenshot_nonblank, viewer_dom_fingerprint, wait_for_metadata_panel_state
+from capture_snapshot import capture_interaction_region, capture_locator_snapshot, capture_marker_interaction_region, capture_page_topology, capture_selector_closure, compute_image_diff, decide_state, marker_region_type, discover_series_candidates, sanitize_html, _MARKER_REGION_CANDIDATES
 from process_runner import ManagedProcess
 from replay_helpers import read_manifest, sha256_file, write_manifest
 from rewrite_script import ActionPlan, parse_action_plan
-from replica_models import CaptureTimingProfile, DomNodeSnapshot, Rect, ReplicaDocument, ReplicaFlow, ReplicaPage, ReplicaState, ReplicaTransition, StateDiffProfile, StateEvidence
+from replica_models import ActionTarget, CaptureTimingProfile, DomNodeSnapshot, InteractionRegion, LocatorRecipe, Point, Rect, RegionMember, ReplicaDocument, ReplicaFlow, ReplicaPage, ReplicaState, ReplicaTransition, SeriesBranch, SeriesCollectionEvidence, SeriesDescriptor, SeriesExpansionEvidence, StateDiffProfile, StateEvidence
 from runtime_python import codegen_python_executable
 
 
-def wait_for_pre_action_state(page: object, marker_label: str) -> None:
-    """Wait for asynchronous report data that must settle before selecting a series."""
+def wait_for_pre_action_state(
+    page: object,
+    marker_label: str,
+    locator_factory: object | None = None,
+) -> None:
+    """Wait until the recorded target is actionable before capturing its input state."""
+    if marker_label == "报告截图" and locator_factory is not None:
+        try:
+            target = locator_factory()
+            target.wait_for(state="visible", timeout=30000)
+            target.click(trial=True, timeout=30000)
+        except Exception:
+            pass
     if marker_label != "序列选择":
         return
     try:
@@ -82,53 +99,90 @@ def wait_for_post_action_state(
     return False
 
 
-def _metadata_panel_signature(locator_factory: object) -> str | None:
-    try:
-        target = locator_factory()
-        scope = target.locator("xpath=ancestor::html")
-        candidates = _MARKER_REGION_CANDIDATES["Meta 信息工具"][1]
-        for selector in candidates:
-            matches = scope.locator(selector)
-            for index in range(matches.count()):
-                candidate = matches.nth(index)
-                if not candidate.is_visible():
-                    continue
-                payload = candidate.evaluate(
-                    """element => ({
-                        tag: element.tagName.toLowerCase(),
-                        text: (element.innerText || element.textContent || '').trim(),
-                        scrollHeight: element.scrollHeight,
-                    })"""
-                )
-                if payload["tag"] in {"a", "button", "input", "select", "textarea", "html", "body", "main"}:
-                    continue
-                return f'{payload["text"]}\0{payload["scrollHeight"]}'
-    except Exception:
-        return None
-    return None
-
-
-def _wait_for_metadata_panel_state(
+def _wait_for_report_popup_state(
     page: object,
-    locator_factory: object,
-    timeout_s: float,
-    stable_s: float,
+    timeout_s: float = 30.0,
+    stable_s: float = 1.0,
 ) -> bool:
+    """Wait for a newly opened viewer page to finish rendering its first image."""
+    try:
+        popup_pages = [candidate for candidate in page.context.pages if candidate is not page]
+    except Exception:
+        return False
+    if not popup_pages:
+        return True
     deadline = time.monotonic() + timeout_s
-    previous: str | None = None
+    warmup_s = min(20.0, timeout_s / 3.0)
+    viewer_seen_since: float | None = None
     stable_since: float | None = None
     while time.monotonic() < deadline:
-        signature = _metadata_panel_signature(locator_factory)
+        dom_ready = False
+        ready_frame = None
+        for popup in popup_pages:
+            try:
+                frames = popup.frames[1:]
+            except Exception:
+                continue
+            for frame in frames:
+                try:
+                    dom_ready = bool(frame.evaluate(
+                        """() => {
+                            const visibleArea = element => {
+                                const style = getComputedStyle(element);
+                                const rect = element.getBoundingClientRect();
+                                return style.display !== 'none' && style.visibility !== 'hidden'
+                                    ? rect.width * rect.height : 0;
+                            };
+                            const canvasReady = Array.from(document.querySelectorAll('canvas'))
+                                .some(element => visibleArea(element) >= 1000);
+                            const imageReady = Array.from(document.querySelectorAll('img, video'))
+                                .some(element => visibleArea(element) >= 10000);
+                            return document.readyState !== 'loading'
+                                && (canvasReady || imageReady);
+                        }"""
+                    ))
+                except Exception:
+                    dom_ready = False
+                if dom_ready:
+                    ready_frame = frame
+                    break
+            if dom_ready:
+                break
+        ready = False
+        if dom_ready and ready_frame is not None:
+            viewer_seen_since = viewer_seen_since or time.monotonic()
+            try:
+                canvases = ready_frame.locator("canvas")
+                largest = None
+                largest_area = 0.0
+                for index in range(canvases.count()):
+                    candidate = canvases.nth(index)
+                    box = candidate.bounding_box()
+                    area = (box or {}).get("width", 0) * (box or {}).get("height", 0)
+                    if area > largest_area:
+                        largest = candidate
+                        largest_area = area
+                target = largest if largest is not None else ready_frame.locator("html")
+                screenshot = target.screenshot(type="png")
+                with Image.open(io.BytesIO(screenshot)) as image:
+                    grayscale = image.convert("L").resize((160, 90))
+                    ready = ImageStat.Stat(grayscale).stddev[0] >= 2.0
+            except Exception:
+                ready = False
+        else:
+            viewer_seen_since = None
         now = time.monotonic()
-        if signature is None:
-            previous = None
+        warmed_up = (
+            viewer_seen_since is not None
+            and now - viewer_seen_since >= warmup_s
+        )
+        if ready and warmed_up:
+            stable_since = stable_since or now
+            if now - stable_since >= stable_s:
+                return True
+        else:
             stable_since = None
-        elif signature != previous:
-            previous = signature
-            stable_since = now
-        elif stable_since is not None and now - stable_since >= stable_s:
-            return True
-        page.wait_for_timeout(100)
+        page.wait_for_timeout(250)
     return False
 
 
@@ -140,6 +194,14 @@ def ensure_post_action_state(
     stable_s: float = 1.0,
 ) -> None:
     """Retry a series transition once when the recorded dblclick did not change UI state."""
+    if marker_label == "报告截图":
+        if not _wait_for_report_popup_state(
+            page,
+            timeout_s=max(timeout_s, 60.0),
+            stable_s=stable_s,
+        ):
+            raise TimeoutError("viewer popup did not render non-blank content")
+        return
     if marker_label == "Meta 信息工具":
         if not callable(locator_factory):
             return
@@ -148,7 +210,7 @@ def ensure_post_action_state(
                 return
         except Exception:
             return
-        if _wait_for_metadata_panel_state(page, locator_factory, timeout_s, stable_s):
+        if wait_for_metadata_panel_state(page, locator_factory, timeout_s, stable_s):
             return
         # The panel never stabilized (or its container is not matched by the
         # candidate selectors). Do NOT raise here: raising would abort the
@@ -167,11 +229,323 @@ def ensure_post_action_state(
     raise TimeoutError(f"post-action state did not stabilize for marker: {marker_label}")
 
 
+# ---------------------------------------------------------------------------
+# Phase 5/6: single-series transaction and all-series explorer
+# ---------------------------------------------------------------------------
+
+# Minimal, same-frame series-list item selector used for re-locating a target
+# row inside a (possibly virtualized) series list. Kept local so the explorer
+# does not depend on private selectors drifting out of capture_snapshot.
+_SERIES_ITEM_SELECTOR = "option, [data-series], [role='option'], .series-item, li"
+_SERIES_IDENTITY_ATTRS = ("data-series-uid", "data-series", "data-uid", "value", "id")
+
+
+class HubUnrecoverableError(RuntimeError):
+    """Raised when a series transaction cannot recover the series list hub."""
+
+
+@dataclass
+class CaptureBranchOutcome:
+    """Serializable outcome of one per-series transaction (safe, non-sensitive)."""
+
+    branch_id: str
+    series_key: str
+    label: str
+    ordinal: int
+    document_id: str
+    source_member_id: str
+    activation: str
+    capture_status: str  # captured|partial|failed|skipped_duplicate
+    fail_stage: str | None
+    error_type: str | None
+    warning: str | None
+    viewer_documents: int = 0
+    metadata_captured: bool = False
+    metadata_uid_hash_prefix: str | None = None
+
+
+@dataclass
+class SeriesBranchCapture:
+    """Loaded snapshot evidence for one branch, ready to merge into a flow."""
+
+    branch_id: str
+    series_key: str
+    label: str
+    ordinal: int
+    document_id: str
+    source_member_id: str
+    activation: str
+    capture_status: str
+    warning: str | None
+    viewer_pages: list[ReplicaPage]
+    viewer_documents: list[ReplicaDocument]
+    metadata_pages: list[ReplicaPage]
+    metadata_documents: list[ReplicaDocument]
+    metadata_rows: list[dict[str, object]]
+    meta_open_dom: DomNodeSnapshot | None = None
+
+
+def _normalize_series_text(text: str) -> str:
+    return " ".join(str(text).split()).lower()
+
+
+def _matches_descriptor(snapshot: DomNodeSnapshot, descriptor: SeriesDescriptor) -> bool:
+    """Return True when a re-parsed series row matches a stable descriptor."""
+    if descriptor.stable_attributes:
+        for name, value in descriptor.stable_attributes.items():
+            if snapshot.attributes.get(name) == value:
+                return True
+    if descriptor.label:
+        return _normalize_series_text(snapshot.text) == _normalize_series_text(descriptor.label)
+    return False
+
+
+def _series_descriptor_matches(source: SeriesDescriptor, target: SeriesDescriptor) -> bool:
+    """Match two descriptors by stable description (attribute identity or text).
+
+    Member ids differ across documents (discovery hub vs a branch viewer), so a
+    member id equality check would never match; the route binding instead relies
+    on the stable semantic identity of the series.
+    """
+    if source.stable_attributes and target.stable_attributes:
+        if any(source.stable_attributes.get(name) == value for name, value in target.stable_attributes.items()):
+            return True
+    if source.series_key and source.series_key == target.series_key:
+        return True
+    if source.label and target.label:
+        return _normalize_series_text(source.label) == _normalize_series_text(target.label)
+    return False
+
+
+def _evidence_satisfied(evidence: set[str]) -> bool:
+    """(P1#4) A selection is ready only when at least two *independent* evidence
+    types hold. ``screenshot_nonblank`` is deliberately excluded from the count:
+    a non-blank screenshot may just be the previous series, so it never counts
+    toward readiness on its own or as one of the two.
+    """
+    core = evidence - {"screenshot_nonblank"}
+    return len(core) >= 2
+
+
+def _safe_series_key(descriptor: SeriesDescriptor) -> str:
+    """Return a non-sensitive internal slug for the series branch directory.
+
+    The slug embeds only the ordinal and a short SHA-256 of the stable identity;
+    the raw SeriesInstanceUID / patient name / accession number never appear in
+    filenames or public logs.
+    """
+    digest = hashlib.sha256(f"{descriptor.document_id}::{descriptor.series_key}".encode("utf-8")).hexdigest()
+    return f"b{descriptor.ordinal:03d}_{digest[:12]}"
+
+
+_SERIES_EVENT_NAMES = frozenset({
+    "series_discovery_started",
+    "series_discovered",
+    "series_capture_started",
+    "series_capture_completed",
+    "series_capture_partial",
+    "series_capture_failed",
+    "series_expansion_completed",
+})
+
+
+def _emit_series_event(event: dict[str, object]) -> None:
+    """Emit a safe ``series_*`` event as one JSON line on stdout (P1#7).
+
+    The instrumented replay subprocess's stdout is parsed by ``ManagedProcess``
+    and every dict carrying an ``"event"`` key is forwarded to the orchestrator /
+    GUI via ``on_event``. Only non-sensitive branch id / ordinal / count /
+    status / stage fields are emitted; raw series_key / UID / patient text never
+    reach this channel. The event name must be one of
+    ``_SERIES_EVENT_NAMES`` (mirroring ``orchestrator_events.SERIES_EVENT_NAMES``).
+    """
+    event = dict(event)
+    event.setdefault("event", "")
+    if event.get("event") not in _SERIES_EVENT_NAMES:
+        return
+    print(json.dumps(event, ensure_ascii=False), flush=True)
+
+
+def _series_scope_root(target_locator: object) -> object:
+    """Return the scrollable series-list container that owns the target, same-frame.
+
+    Mirrors the marker-aware series-region root resolution (walking only the
+    target's own frame via ``ancestor::html`` — never a top-level DOM traversal
+    cross into a child iframe).
+    """
+    scope = target_locator.locator("xpath=ancestor::html")
+    for selector in _MARKER_REGION_CANDIDATES["序列选择"][1]:
+        matches = scope.locator(selector)
+        for index in range(matches.count()):
+            candidate = matches.nth(index)
+            try:
+                if candidate.is_visible():
+                    return candidate
+            except Exception:
+                continue
+    return scope.locator("body")
+
+
+def _resolve_locator_recipe(recipe: LocatorRecipe, pages: dict[str, object]) -> object | None:
+    """Re-resolve a serialized LocatorRecipe into a live Playwright Locator.
+
+    Almost never caches: each call returns a freshly resolved Locator bound to
+    the current live page/frame, so virtualized-list re-location stays valid.
+    """
+    page_obj = pages.get(recipe.page_var)
+    if page_obj is None:
+        return None
+    locator = page_obj
+    for hop in recipe.frame_chain:
+        try:
+            locator = locator.frame_locator(hop.selector)
+        except Exception:
+            return None
+    locator_args = dict(recipe.locator_args or {})
+    positional = list(locator_args.get("args", []))
+    keywords = {key: value for key, value in locator_args.items() if key != "args"}
+    method = {
+        "css": "locator", "role": "get_by_role", "text": "get_by_text",
+        "test_id": "get_by_test_id", "label": "get_by_label", "title": "get_by_title",
+    }.get(recipe.locator_kind, "locator")
+    try:
+        resolved = getattr(locator, method)(*positional, **keywords)
+        if recipe.ordinal_op == "first":
+            resolved = resolved.first
+        elif recipe.ordinal_op == "last":
+            resolved = resolved.last
+        elif recipe.ordinal_op == "nth":
+            resolved = resolved.nth(recipe.ordinal_value or 0)
+        return resolved
+    except Exception:
+        return None
+
+
+def _live_pages_map(page: object) -> dict[str, object]:
+    """Build ``{page_var: page}`` from the context, mirroring replay conventions."""
+    try:
+        context_pages = list(page.context.pages) if getattr(page, "context", None) else [page]
+    except Exception:
+        context_pages = [page]
+    return {("page" if index == 0 else f"page{index}"): candidate for index, candidate in enumerate(context_pages)}
+
+
+def _find_viewer_frame(page: object) -> object:
+    """Return the frame holding the largest/any canvas, else the main frame."""
+    try:
+        frames = list(page.frames)
+    except Exception:
+        return page
+    for frame in frames:
+        try:
+            if frame.locator("canvas").count() > 0:
+                return frame
+        except Exception:
+            continue
+    return frames[0] if frames else page
+
+
+_VIEWER_IDENTITY_SELECTORS = (
+    "#current-series",
+    "[data-current-series]",
+    ".series-current",
+    "[class*='current-series' i]",
+    "[class*='current_series' i]",
+    "[aria-current='true']",
+    "[class*='current' i]",
+)
+
+
+def _viewer_current_series_label(viewer_frame: object) -> str | None:
+    """Return the normalized label of the series the Viewer currently displays.
+
+    The readiness logic must compare the *viewer's* displayed identity to the
+    target descriptor, never the target row's own label (which is constant once
+    the locator resolves and would otherwise be a tautology). This looks for a
+    common "current series / selected series" indicator slot in the viewer frame;
+    returns ``None`` when no such slot is present or readable.
+    """
+    for selector in _VIEWER_IDENTITY_SELECTORS:
+        try:
+            matches = viewer_frame.locator(selector)
+            for index in range(min(matches.count(), 8)):
+                item = matches.nth(index)
+                text = (item.inner_text() or item.text_content() or "").strip()
+                if text:
+                    normalized = _normalize_series_text(text)
+                    if normalized and normalized not in {"", " ", "current", "series"}:
+                        return normalized
+        except Exception:
+            continue
+    return None
+
+
+def _capture_viewer_small_screenshot(frame: object) -> bytes | None:
+    """Return a compact PNG of the viewer frame for non-blank readiness checks."""
+    try:
+        return frame.locator("html").screenshot(type="png")
+    except Exception:
+        return None
+
+
+def _locate_series_row(
+    root_locator: object,
+    descriptor: SeriesDescriptor,
+    max_scroll_steps: int = 40,
+) -> tuple[object | None, int]:
+    """Re-locate the target series row after virtual-list scrolling.
+
+    Re-parses the item locator on demand and scrolls through the list (restoring
+    the original scroll position on every exit) until a row whose stable
+    attributes / normalized text match the descriptor resolves and is visible.
+    Returns ``(locator_or_None, scroll_steps_taken)``.
+    """
+    try:
+        initial_top = root_locator.evaluate("element => element.scrollTop")
+    except Exception:
+        return None, 0
+    try:
+        items = root_locator.locator(_SERIES_ITEM_SELECTOR)
+        try:
+            root_locator.evaluate("element => element.scrollTop = 0")
+        except Exception:
+            pass
+        for step in range(max_scroll_steps + 1):
+            try:
+                count = items.count()
+            except Exception:
+                count = 0
+            for index in range(count):
+                item = items.nth(index)
+                try:
+                    if not item.is_visible():
+                        continue
+                    snapshot = capture_locator_snapshot(item)
+                except Exception:
+                    continue
+                if _matches_descriptor(snapshot, descriptor):
+                    return item, step
+            try:
+                previous = root_locator.evaluate("element => element.scrollTop")
+                current = root_locator.evaluate("element => { element.scrollTop += Math.max(1, element.clientHeight); return element.scrollTop; }")
+            except Exception:
+                break
+            if current <= previous:
+                break
+        return None, max_scroll_steps
+    finally:
+        try:
+            root_locator.evaluate("(element, top) => element.scrollTop = top", initial_top)
+        except Exception:
+            pass
+
+
 class LiveCaptureSession:
     """Persist only marked-action page/frame snapshots during a live replay."""
 
     def __init__(self, output_root: str | Path) -> None:
         self.output_root = Path(output_root)
+        self.series_branches_root = self.output_root / "series_branches"
 
     def _capture(
         self,
@@ -213,7 +587,14 @@ class LiveCaptureSession:
                         target_document = frame_documents[0]
             if target_document is documents[0]:
                 region = capture_marker_interaction_region(page, marker_label, target_document.document_id, target_locator)
-            elif marker_label == "Meta 信息工具":
+            elif marker_label in {"Meta 信息工具", "序列选择"}:
+                # Nested-frame markers are captured from the frame's own context,
+                # not the top page. Metadata panels have long used the owning
+                # document (ancestor html rooted in the target's frame); series
+                # lists must route through the same marker-aware path so the
+                # 序列选择 scroll harvest runs inside the (possibly innermost)
+                # frame that actually holds the list. Generic/layout/WLWW/canvas
+                # markers keep the existing else behavior.
                 owning_document = target_locator.locator("xpath=ancestor::html")
                 region = capture_marker_interaction_region(
                     owning_document,
@@ -239,16 +620,1239 @@ class LiveCaptureSession:
                 pass
 
     def before(self, action_id: str, page: object, locator_factory: object | None = None, marker_label: str = "") -> None:
-        wait_for_pre_action_state(page, marker_label)
+        wait_for_pre_action_state(page, marker_label, locator_factory)
         self._capture(action_id, "before", page, locator_factory, marker_label)
 
     def after(self, action_id: str, page: object, locator_factory: object | None = None, marker_label: str = "") -> None:
         ensure_post_action_state(page, marker_label, locator_factory)
         self._capture(action_id, "after", page, locator_factory, marker_label)
 
+    def expand_series(
+        self,
+        page: object,
+        series_locator_factory: object | None = None,
+        series_action_id: str = "",
+        close_action_id: str = "",
+    ) -> None:
+        """Run the bounded all-series exploration when the template is complete.
+
+        This is the session-side expansion entry that ``capture_hook_expand_series``
+        delegates to. It reconstructs the recording template from the instrumented
+        replay source (the only stable source available inside the subprocess) and
+        delegates to ``finalize_series_branches``. It never touches the web outside
+        the instrumented replay subprocess and performs no implicit after-snapshot
+        (that stays ``after()``'s single duty).
+        """
+        replay_source = self.output_root / "instrumented_replay.py"
+        try:
+            if not replay_source.is_file():
+                return
+            plan = parse_action_plan(replay_source.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        template = classify_recording_template(plan)
+        if not template.complete:
+            return
+        # A failure here is recorded as an event by ``capture_hook_expand_series``;
+        # it never escapes the instrumented replay's action boundary.
+        self.finalize_series_branches(
+            page,
+            template,
+            series_action_id=series_action_id,
+            close_action_id=close_action_id,
+        )
+
+    def _capture_series_region(
+        self,
+        root: object,
+        viewer_doc: ReplicaDocument,
+        descriptor: SeriesDescriptor,
+        max_scroll_steps: int,
+    ) -> str:
+        """(P0#1/P0#3) Harvest the series region into ``viewer_doc`` and return
+        the member id that corresponds to ``descriptor`` in the viewer's own region.
+
+        Runs the same ``discover_series_candidates`` scroll harvest (the single
+        shared algorithm) against the recording template's series root, packages
+        the members + ``SeriesCollectionEvidence`` into a ``region_type="series"``
+        ``InteractionRegion``, and appends it to ``viewer_doc.regions`` so the
+        offline replica's Viewer page can enumerate/click the other sequences.
+
+        The returned member id is bound (not the discovery-local ``d_series_hub``
+        id) so the builder's ``source_member_id -> route`` lookup hits a real
+        member in this branch's own document. Only Frame/FrameLocator/Locator are
+        used; no ``contentDocument`` traversal.
+        """
+        descriptors, members, evidence = discover_series_candidates(
+            root, viewer_doc.document_id, max_scroll_steps=max_scroll_steps
+        )
+        root_snapshot = capture_locator_snapshot(root)
+        viewer_doc.regions.append(InteractionRegion(
+            f"{viewer_doc.document_id}_series", "series", viewer_doc.document_id,
+            root_snapshot, members, evidence,
+        ))
+        # Bind to the member that matches the descriptor by stable description
+        # (member ids differ across documents, so match on attributes/text).
+        for candidate in descriptors:
+            if _series_descriptor_matches(candidate, descriptor):
+                return candidate.member_id
+        # Fallback: reuse the descriptor's own (hub) member id; it will still be
+        # rendered by the generic member path even if route binding misses.
+        return descriptor.member_id
+
+    def _capture_viewer_topology(
+        self,
+        session_dir: Path,
+        page: object,
+        pages: dict[str, object],
+        root: object,
+        descriptor: SeriesDescriptor,
+        max_scroll_steps: int,
+    ) -> tuple[list[ReplicaPage], list[ReplicaDocument], str]:
+        """Capture viewer topology and stitch the series region into the entry doc.
+
+        Returns ``(pages_out, docs_out, source_member_id)``.
+        """
+        pages_out, docs_out = capture_page_topology(
+            [("page" if index == 0 else f"page{index}", candidate) for index, candidate in enumerate(pages.values())],
+            session_dir / "viewer",
+        )
+        source_member_id = descriptor.member_id
+        if docs_out:
+            try:
+                source_member_id = self._capture_series_region(
+                    root, docs_out[0], descriptor, max_scroll_steps=max_scroll_steps
+                )
+            except Exception:
+                source_member_id = descriptor.member_id
+        self._write_topology(session_dir / "viewer", pages_out, docs_out)
+        return pages_out, docs_out, source_member_id
+
+    @staticmethod
+    def _write_topology(topology_root: Path, pages: list[ReplicaPage], documents: list[ReplicaDocument]) -> None:
+        topology_root.mkdir(parents=True, exist_ok=True)
+        (topology_root / "topology.json").write_text(
+            json.dumps({"pages": [asdict(item) for item in pages], "documents": [asdict(item) for item in documents]},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def capture_one_series(
+        self,
+        page: object,
+        descriptor: SeriesDescriptor,
+        template: RecordingTemplate,
+        pages: dict[str, object],
+        config: dict[str, object] | None,
+    ) -> CaptureBranchOutcome:
+        """Capture one series branch as a bounded single-series transaction.
+
+        Re-parses Page/Frame and series locators on *every* call (no cached
+        Locator), re-locates the target row after virtual-list scrolling,
+        inherits the recorded click/dblclick, waits on a *combination* of
+        readiness evidence (never a fixed sleep alone), captures the Viewer and
+        Metadata snapshots, and restores scrollTop / hub state in ``finally``
+        (P1#5). Returns an outcome dataclass; raises ``HubUnrecoverableError``
+        for hub-level failures so the caller can drive a controlled reload.
+        """
+        session_dir = self.series_branches_root / _safe_series_key(descriptor)
+        metadata_dir = session_dir / "metadata"
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        per_series_timeout_s = float(config.get("per_series_timeout_s") or 20) if config else 20.0
+        max_series = int(config.get("max_series") or 40) if config else 40
+
+        (session_dir / "descriptor.json").write_text(
+            json.dumps(asdict(descriptor), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        status: dict[str, object] = {
+            "branch_id": _safe_series_key(descriptor),
+            "series_key_sha256": hashlib.sha256(
+                f"{descriptor.document_id}::{descriptor.series_key}".encode("utf-8")
+            ).hexdigest(),
+            "ordinal": descriptor.ordinal,
+            "capture_status": "failed",
+            "fail_stage": "init",
+            "error_type": None,
+            "activation": descriptor.activation or "click",
+        }
+        root: object | None = None
+        initial_hub: dict[str, object] | None = None
+        source_member_id = descriptor.member_id
+        try:
+            status["fail_stage"] = "reparse"
+            recipe = template.series_action.locator
+            series_locator = _resolve_locator_recipe(recipe, pages)
+            if series_locator is None:
+                # The series list / hub is unreachable: classify as hub-unrecoverable
+                # so finalize_series_branches can drive one controlled reload.
+                raise HubUnrecoverableError("series list locator unresolved")
+            root = _series_scope_root(series_locator)
+            # P1#5: snapshot the hub/panel state once for this transaction so a
+            # finally-restore always runs on every exit path.
+            initial_hub = self._snapshot_hub_state(root, template, pages)
+            # P1#4: resolve the viewer frame fresh for this transaction (no cache
+            # of a pre-activation Frame/Locator across polls).
+            viewer_frame = _find_viewer_frame(page)
+            previous_canvas_hash = canvas_hash(viewer_frame)
+
+            status["fail_stage"] = "locate"
+            row_locator, _steps = _locate_series_row(root, descriptor, max_scroll_steps=max_series)
+            if row_locator is None:
+                raise HubUnrecoverableError("target series row not found in hub")
+
+            status["fail_stage"] = "activate"
+            activation = descriptor.activation or "click"
+            self._perform_activation(row_locator, activation)
+
+            status["fail_stage"] = "readiness"
+            # P1#4: every poll re-resolves the series root from the stable recipe
+            # against the latest pages/frame (never a cached pre-activation
+            # root_locator), so an iframe/root replacement after activation is
+            # recovered rather than pinning a stale Locator.
+            ready = self._wait_for_series_ready(
+                page=page, recipe=recipe, descriptor=descriptor,
+                previous_canvas_hash=previous_canvas_hash, timeout_s=per_series_timeout_s,
+            )
+            if not ready:
+                # First action produced no change evidence; re-resolve the root
+                # from the recipe and re-locate the row (the Viewer may have
+                # rebuilt its iframe / virtualized list) and retry activation once.
+                retry_root = self._reparse_series_root(recipe, page)
+                if retry_root is None:
+                    raise HubUnrecoverableError("series root lost on retry")
+                row_locator, _steps = _locate_series_row(retry_root, descriptor, max_scroll_steps=max_series)
+                if row_locator is None:
+                    raise HubUnrecoverableError("target series row lost on retry")
+                self._perform_activation(row_locator, activation)
+                ready = self._wait_for_series_ready(
+                    page=page, recipe=recipe, descriptor=descriptor,
+                    previous_canvas_hash=previous_canvas_hash, timeout_s=per_series_timeout_s,
+                )
+
+            status["fail_stage"] = "viewer_capture"
+            pages_out, docs_out, source_member_id = self._capture_viewer_topology(
+                session_dir, page, pages, root, descriptor, max_scroll_steps=max_series
+            )
+
+            status["fail_stage"] = "metadata"
+            meta = self._capture_metadata_transaction(page, template, pages, metadata_dir, per_series_timeout_s, descriptor)
+            meta_open_dom = meta.get("meta_open_dom")
+            if meta_open_dom is not None:
+                (session_dir / "meta_open_target.json").write_text(
+                    json.dumps(asdict(meta_open_dom), ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+
+            if meta["ok"]:
+                status["metadata_captured"] = True
+                if meta.get("uid_hash_prefix"):
+                    status["metadata_uid_sha256_prefix"] = meta["uid_hash_prefix"]
+                status["capture_status"] = "captured"
+                status["fail_stage"] = None
+            else:
+                # Viewer already succeeded; metadata failure degrades to partial.
+                status["capture_status"] = "partial"
+                status["fail_stage"] = meta["fail_stage"]
+                status["error_type"] = meta["error_type"]
+
+            if not ready and status["capture_status"] == "captured":
+                # No independent change evidence but viewer captured: honest partial.
+                status["capture_status"] = "partial"
+                status["warning"] = "no_visual_change_evidence"
+
+            status["source_member_id"] = source_member_id
+            (session_dir / "status.json").write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+        except HubUnrecoverableError as error:
+            # P1#5: hub unrecoverable -> persist a terminal failed status and let
+            # finalize_series_branches drive the controlled reload.
+            status["capture_status"] = "failed"
+            status["fail_stage"] = status.get("fail_stage") or "hub_unrecoverable"
+            status["error_type"] = type(error).__name__
+            if not status.get("warning"):
+                status["warning"] = "series_hub_unrecoverable"
+            (session_dir / "status.json").write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+            raise
+        except Exception as error:
+            # Persist a terminal failed status even on an unexpected exception so
+            # the branch remains a first-class, auditable entry in the flow, then
+            # re-raise for the caller (finalize_series_branches) to isolate it.
+            status["capture_status"] = "failed"
+            status["fail_stage"] = status.get("fail_stage") or "transaction"
+            status["error_type"] = type(error).__name__
+            if not status.get("warning"):
+                status["warning"] = "series_capture_failed"
+            (session_dir / "status.json").write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+            raise
+        else:
+            # P1#5: per-branch restore + VERIFY on the clean (no-exception) path.
+            # A failed restoration (panel not hidden, hub inoperable, or
+            # selection/scroll not restored) is never swallowed: it degrades the
+            # branch to partial and is recorded in status before the outcome is
+            # built.
+            if root is not None and initial_hub is not None:
+                try:
+                    restore_ok, restore_problem = self._restore_hub_state(page, root, template, pages, initial_hub)
+                except Exception as error:
+                    restore_ok, restore_problem = False, type(error).__name__
+                if not restore_ok:
+                    status["capture_status"] = "partial"
+                    status["fail_stage"] = status.get("fail_stage") or "restore"
+                    status["error_type"] = status.get("error_type") or restore_problem
+                    if not status.get("warning"):
+                        status["warning"] = "hub_restore_failed"
+            (session_dir / "status.json").write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+            return self._outcome(descriptor, status)
+        finally:
+            # Safety net for exceptional exits (failed/partial raised paths):
+            # best-effort restoration, but never mask the original exception.
+            # A restore failure on an exceptional path is surfaced via a warning
+            # on the already-persisted status rather than silently swallowed.
+            if root is not None and initial_hub is not None:
+                try:
+                    restore_ok, restore_problem = self._restore_hub_state(page, root, template, pages, initial_hub)
+                    if not restore_ok and not status.get("warning"):
+                        status["warning"] = "hub_restore_failed"
+                except Exception:
+                    pass
+
+    def _outcome(self, descriptor: SeriesDescriptor, status: dict[str, object]) -> CaptureBranchOutcome:
+        return CaptureBranchOutcome(
+            branch_id=str(status.get("branch_id")),
+            series_key=descriptor.series_key,
+            label=descriptor.label,
+            ordinal=descriptor.ordinal,
+            document_id=descriptor.document_id,
+            source_member_id=str(status.get("source_member_id") or descriptor.member_id),
+            activation=descriptor.activation or "click",
+            capture_status=str(status.get("capture_status")),
+            fail_stage=status.get("fail_stage"),
+            error_type=status.get("error_type"),
+            warning=status.get("warning"),
+            metadata_captured=bool(status.get("metadata_captured")),
+            metadata_uid_hash_prefix=status.get("metadata_uid_sha256_prefix"),
+        )
+
+    def _meta_factory(self, action: ActionTarget | None, pages: dict[str, object]):
+        if action is None or action.locator is None:
+            return None
+        recipe = action.locator
+
+        def factory():
+            return _resolve_locator_recipe(recipe, pages)
+
+        return factory
+
+    def _perform_activation(self, locator: object, activation: str) -> None:
+        if activation == "dblclick":
+            locator.dblclick()
+        else:
+            try:
+                locator.click()
+            except Exception:
+                locator.dblclick()
+
+    def _wait_for_series_ready(
+        self,
+        page: object,
+        recipe: LocatorRecipe | None,
+        descriptor: SeriesDescriptor,
+        previous_canvas_hash: int | None,
+        timeout_s: float,
+        stable_s: float = 0.8,
+    ) -> bool:
+        """Return True once at least two independent readiness evidence types hold stable (P1#4).
+
+        On *every* poll the Viewer frame is re-found and the series root is
+        re-resolved from the stable LocatorRecipe against the latest live
+        pages/frame, then the target row is re-located from it (never a cached
+        Locator/Frame/ElementHandle), because the real Viewer may rebuild its
+        iframe or reuse virtualized list nodes after a transition. If the root
+        cannot momentarily resolve the ready window resets. A selection is
+        satisfied only when :func:`_evidence_satisfied` reports two core
+        evidence types held for ``stable_s``; a single
+        ``screenshot_nonblank`` or a target's own label never suffices.
+        """
+        deadline = time.monotonic() + timeout_s
+        stable_since: float | None = None
+        while time.monotonic() < deadline:
+            viewer_frame = _find_viewer_frame(page)  # fresh every poll
+            root = self._reparse_series_root(recipe, page)
+            if root is None:
+                stable_since = None
+                time.sleep(0.15)
+                continue
+            row = self._reparse_target_row(root, descriptor)
+            evidence = self._collect_evidence(row, descriptor, viewer_frame, previous_canvas_hash)
+            if _evidence_satisfied(evidence):
+                stable_since = stable_since or time.monotonic()
+                if time.monotonic() - stable_since >= stable_s:
+                    return True
+            else:
+                stable_since = None
+            time.sleep(0.15)
+        return False
+
+    @staticmethod
+    def _reparse_target_row(root_locator: object, descriptor: SeriesDescriptor) -> object | None:
+        """Re-locate the target series row from its stable descriptor (P1#4)."""
+        row, _steps = _locate_series_row(root_locator, descriptor)
+        return row
+
+    @staticmethod
+    def _reparse_series_root(recipe: LocatorRecipe | None, page: object) -> object | None:
+        """Re-resolve the scrollable series root from a stable LocatorRecipe.
+
+        (P1#4) Resolves the series locator against the *latest* live pages/frame
+        (never holding a pre-activation ``root_locator`` across polls), so an
+        iframe / series-root replacement after activation is transparently
+        recovered. Returns ``None`` when the recipe cannot currently resolve.
+        """
+        if recipe is None:
+            return None
+        series_locator = _resolve_locator_recipe(recipe, _live_pages_map(page))
+        if series_locator is None:
+            return None
+        try:
+            return _series_scope_root(series_locator)
+        except Exception:
+            return None
+
+    def _collect_evidence(
+        self,
+        target_locator: object,
+        descriptor: SeriesDescriptor,
+        viewer_frame: object,
+        previous_canvas_hash: int | None,
+    ) -> set[str]:
+        """Score the combination of series-selection readiness evidence (P1#4).
+
+        Evidence is classified so a selection is only declared once *two* change/
+        identity signals hold:
+        - ``selected``: the (re-parsed) target row reports aria-selected/selected
+          or active/current class — an identity signal.
+        - ``name_match``: the Viewer's *currently displayed* series identity
+          equals the target descriptor (never the row's own label, which is
+          constant after the locator resolves).
+        - ``canvas_changed``: the Viewer canvas fingerprint differs from the
+          pre-activation hash.
+        - ``dom_stable``: two consecutive Viewer DOM fingerprints are equal.
+        - ``screenshot_nonblank``: coarse non-blank check — recorded but never a
+          qualifying success signal (excluded by :func:`_evidence_satisfied`).
+        """
+        evidence: set[str] = set()
+        if target_locator is not None:
+            try:
+                state = target_locator.evaluate(
+                    """element => ({
+                        aria_selected: element.getAttribute('aria-selected'),
+                        selected_attr: element.hasAttribute('selected'),
+                        data_selected: element.getAttribute('data-selected'),
+                        active_class: /(^|\\s)(active|current|selected)(\\s|$)/.test(element.className || ''),
+                    })"""
+                )
+            except Exception:
+                state = None
+            if state:
+                if (
+                    str(state.get("aria_selected") or "").lower() == "true"
+                    or state.get("selected_attr")
+                    or str(state.get("data_selected") or "").lower() in ("true", "1", "selected")
+                ):
+                    evidence.add("selected")
+                elif state.get("active_class"):
+                    evidence.add("selected")
+
+        # Compare the Viewer's *current displayed* series identity to the target,
+        # not the target row's own (constant) label.
+        current_label = _viewer_current_series_label(viewer_frame)
+        if current_label and descriptor.label and current_label == _normalize_series_text(descriptor.label):
+            evidence.add("name_match")
+
+        current_hash = canvas_hash(viewer_frame)
+        if previous_canvas_hash is not None and current_hash is not None and current_hash != previous_canvas_hash:
+            evidence.add("canvas_changed")
+
+        first = viewer_dom_fingerprint(viewer_frame)
+        if first is not None:
+            # Take a second sample after a brief poll and compare the two
+            # fingerprints *for stability* (equal), not merely for non-emptiness.
+            time.sleep(0.2)
+            second = viewer_dom_fingerprint(viewer_frame)
+            if second is not None and second == first:
+                evidence.add("dom_stable")
+
+        small = _capture_viewer_small_screenshot(viewer_frame)
+        if screenshot_nonblank(small):
+            evidence.add("screenshot_nonblank")
+
+        return evidence
+
+    def _capture_metadata_transaction(
+        self,
+        page: object,
+        template: RecordingTemplate,
+        pages: dict[str, object],
+        metadata_dir: Path,
+        per_series_timeout_s: float,
+        descriptor: SeriesDescriptor,
+    ) -> dict[str, object]:
+        """Open Metadata, wait for a stable signature, capture + parse, then close.
+
+        The captured panel ``outerHTML`` is sanitized before it is persisted
+        (P1#8) and is also assembled into the metadata document as a
+        ``region_type="metadata"`` InteractionRegion (P0#1) so the offline replica
+        renders a complete scrollable Metadata panel. The Metadata *close* result
+        is honored: if the panel fails to hide within the bounded wait, the branch
+        degrades to partial (an open panel would pollute the next branch).
+        """
+        meta_open = template.metadata_open
+        meta_close = template.metadata_close
+        open_factory = self._meta_factory(meta_open, pages)
+        close_factory = self._meta_factory(meta_close, pages)
+        meta_dir = metadata_dir
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        result: dict[str, object] = {"ok": False, "fail_stage": "open", "error_type": None, "uid_hash_prefix": None, "meta_open_dom": None}
+
+        try:
+            if open_factory is None or close_factory is None:
+                result["fail_stage"] = "template"
+                result["error_type"] = "missing_metadata_locator"
+                return result
+
+            opened = open_factory()
+            if opened is None:
+                result["fail_stage"] = "open"
+                result["error_type"] = "resolve_failed"
+                return result
+            # P0#1/P1#5: remember the open-target DOM so the builder can render a
+            # real clickable Metadata trigger on the branch Viewer state.
+            try:
+                open_dom = capture_locator_snapshot(opened)
+                result["meta_open_dom"] = open_dom
+            except Exception:
+                open_dom = None
+            opened.click()
+
+            if not wait_for_metadata_panel_state(page, open_factory, timeout_s=per_series_timeout_s, stable_s=0.6):
+                result.update({"ok": False, "fail_stage": "stabilize", "error_type": "metadata_timeout"})
+                return result
+
+            rows, raw_outer_html, uid_hash = self._capture_metadata_panel(open_factory)
+            # P1#8: run the unified HTML sanitizer before any persistence.
+            outer_html = sanitize_html(raw_outer_html) if raw_outer_html else ""
+            (meta_dir / "metadata_rows.json").write_text(
+                json.dumps({"rows": rows, "outer_html": outer_html, "raw_outer_html_lines": 0 if outer_html else None,
+                            "uid_sha256_prefix": uid_hash}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            pages_out, docs_out = capture_page_topology(
+                [("page" if index == 0 else f"page{index}", candidate) for index, candidate in enumerate(pages.values())],
+                meta_dir,
+            )
+            # P0#1: synthesize a Metadata region into the metadata document.
+            if docs_out and outer_html:
+                self._attach_metadata_region(docs_out[0], outer_html)
+            self._write_topology(meta_dir, pages_out, docs_out)
+
+            closed = close_factory()
+            close_error: str | None = None
+            if closed is not None:
+                try:
+                    closed.click()
+                except Exception as error:
+                    close_error = type(error).__name__
+            # P1#5: the hidden-wait result is effective — a panel that never
+            # hides degrades the branch to partial (never a silent success).
+            hidden = self._wait_for_metadata_hidden(page, open_factory, timeout_s=min(2.0, per_series_timeout_s))
+            if not hidden:
+                result.update({"ok": False, "fail_stage": "close", "error_type": "metadata_not_hidden",
+                               "warning": "metadata_panel_not_hidden"})
+                return result
+            if close_error:
+                result.update({"ok": True, "fail_stage": None, "uid_hash_prefix": uid_hash,
+                               "row_count": len(rows), "close_error": close_error})
+                return result
+
+            result.update({
+                "ok": True,
+                "fail_stage": None,
+                "uid_hash_prefix": uid_hash,
+                "row_count": len(rows),
+            })
+            return result
+        except Exception as error:
+            result.update({"ok": False, "fail_stage": result.get("fail_stage") or "metadata", "error_type": type(error).__name__})
+            return result
+
+    @staticmethod
+    def _attach_metadata_region(meta_doc: ReplicaDocument, outer_html: str) -> None:
+        """Synthesize a ``region_type="metadata"`` InteractionRegion onto a document.
+
+        The region root carries the sanitized full panel ``outerHTML`` (and a
+        non-empty extracted text) so the builder's ``_is_metadata_panel`` renders
+        it as a ``.replica-metadata`` scrollable panel. Attributes are chosen to
+        satisfy the named-panel / dialog identity check.
+        """
+        panel_snapshot = _metadata_panel_snapshot(meta_doc, outer_html)
+        meta_doc.regions.append(InteractionRegion(
+            f"{meta_doc.document_id}_metadata", "metadata", meta_doc.document_id,
+            panel_snapshot, [], None,
+        ))
+
+    def _wait_for_metadata_hidden(self, page: object, open_factory: object, timeout_s: float = 2.0) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if metadata_panel_signature(open_factory) is None:
+                return True
+            page.wait_for_timeout(100)
+        return False
+
+    def _capture_metadata_panel(self, open_factory: object) -> tuple[list[dict[str, object]], str, str | None]:
+        """Capture the full Metadata panel outerHTML and parse tag/value rows.
+
+        Extracts and validates SeriesNumber / SeriesDescription / SeriesInstanceUID
+        (when present). A raw SeriesInstanceUID is reduced to a non-reversible
+        SHA-256 prefix for audit and never written into filenames/logs. The raw
+        ``outerHTML`` returned here is sanitized by the caller before persistence.
+        """
+        try:
+            target = open_factory()
+            scope = target.locator("xpath=ancestor::html")
+            import capture_snapshot as cs
+            candidates = cs._MARKER_REGION_CANDIDATES["Meta 信息工具"][1]
+            outer_html = ""
+            for selector in candidates:
+                matches = scope.locator(selector)
+                for index in range(matches.count()):
+                    candidate = matches.nth(index)
+                    try:
+                        if not candidate.is_visible():
+                            continue
+                        tag = candidate.evaluate("el => el.tagName.toLowerCase()")
+                        if tag in {"a", "button", "i", "input", "select", "span", "svg", "textarea"}:
+                            continue
+                        outer_html = candidate.evaluate("el => el.outerHTML")
+                        break
+                    except Exception:
+                        continue
+                if outer_html:
+                    break
+            text = (scope.inner_text() if hasattr(scope, "inner_text") else "") or ""
+            rows = self._parse_metadata_rows(text, outer_html)
+            uid = self._find_uid(rows, outer_html)
+            uid_hash = metadata_uid_sha256_prefix(uid) if uid else None
+            return rows, outer_html, uid_hash
+        except Exception:
+            return [], "", None
+
+    def _parse_metadata_rows(self, text: str, outer_html: str) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        seen = set()
+        candidates = (text or "").splitlines() + re.split(r"<[^>]+>", outer_html or "")
+        for line in candidates:
+            line = re.sub(r"\s+", " ", line).strip()
+            if not line or line in seen:
+                continue
+            seen.add(line)
+            normalized = line.lower()
+            known = any(
+                label in normalized
+                for label in ("series number", "series description", "seriesinstanceuid", "series instance uid", "seriesnumber")
+            )
+            if known:
+                rows.append({"row": line})
+        # Ensure the three audited identity fields are represented (if absent, the
+        # transactional audit still records that they were not found).
+        found = " ".join(str(row["row"]).lower() for row in rows)
+        for label in ("series number", "series description", "seriesinstanceuid", "series instance uid"):
+            if label not in found:
+                rows.append({"row_text_not_found": label})
+        return rows
+
+    def _find_uid(self, rows: list[dict[str, object]], outer_html: str) -> str | None:
+        for row in rows:
+            text = str(row.get("row", ""))
+            m = re.search(r"(?:series.?instance.?uid|x[0-9a-f]{8})[:：]?\s*([0-9.]+)", text, re.IGNORECASE)
+            if m:
+                return m.group(1)
+        m = re.search(r"(?:seriesinstanceuid|x[0-9a-f]{8})[:：]?\s*([0-9.]+)", (outer_html or ""), re.IGNORECASE)
+        return m.group(1) if m else None
+
+    def finalize_series_branches(
+        self,
+        page: object,
+        template: RecordingTemplate,
+        series_action_id: str = "",
+        close_action_id: str = "",
+        config: dict[str, object] | None = None,
+    ) -> list[CaptureBranchOutcome]:
+        """Discover all series and serially capture each, restoring original state.
+
+        Saves the initially-selected series, scrollTop and panel open/closed
+        state, enumerates descriptors, then walks them one at a time (never in
+        parallel) with per-descriptor ``try/finally`` failure isolation. After a
+        bounded number of hub-unrecoverable failures one controlled reload is
+        allowed; a second is fatal and marks the overall pass partial/failed.
+        The original selection, scrollTop and panel state are restored at the end,
+        and a ``series_capture_manifest.json`` is written with audited counts.
+        """
+        config = config if config is not None else _expansion_config_value()
+        per_series_timeout_s = float(config.get("per_series_timeout_s") or 20) if config else 20.0
+        total_timeout_s = float(config.get("total_series_timeout_s") or 900) if config else 900.0
+        max_series = int(config.get("max_series") or 40) if config else 40
+
+        # P1#7: emit only safe discovery/phase events (branch id / ordinal /
+        # counts / status / stage). Raw series_key / UID / patient text never
+        # reach the event stream.
+        _emit_series_event({"event": "series_discovery_started"})
+        started: float = 0.0
+        bootstrap_error: str | None = None
+        try:
+            pages = _live_pages_map(page)
+            series_locator = _resolve_locator_recipe(template.series_action.locator, pages)
+            if series_locator is None:
+                raise HubUnrecoverableError("series list locator unresolved at discovery")
+            root = _series_scope_root(series_locator)
+            doc_id = "d_series_hub"
+            initial_state = self._snapshot_hub_state(root, template, pages)
+            # Started just before discovery/iteration so the total-time budget is
+            # measured only over the exploration loop (a stable budget baseline).
+            started = time.monotonic()
+
+            try:
+                descriptors, _members, evidence = discover_series_candidates(
+                    root, doc_id, max_scroll_steps=max_series, max_duration_s=min(10.0, total_timeout_s)
+                )
+            except Exception:
+                descriptors, evidence = [], SeriesCollectionEvidence("scroll_harvest", False, 0, 0, 0, False, "series_discovery_failed", 0)
+            # P1#6: discovered is the discovery's absolute count; every descriptor
+            # must receive a terminal status (captured/partial/failed/skipped).
+            discovered = len(descriptors)
+            _emit_series_event({
+                "event": "series_discovered",
+                "discovered": discovered,
+                "reached_end": bool(evidence.reached_end),
+                "warning": evidence.warning,
+            })
+
+            outcomes: list[CaptureBranchOutcome] = []
+            consecutive_hub_failures = 0
+            reloaded = False
+            budget_exhausted = False
+            emitted_terminal_ordinals: set[int] = set()
+            for position, descriptor in enumerate(descriptors[:max_series]):
+                if time.monotonic() - started >= total_timeout_s:
+                    budget_exhausted = True
+                    for extra in descriptors[position:]:
+                        outcomes.append(CaptureBranchOutcome(
+                            branch_id=_safe_series_key(extra), series_key=extra.series_key, label=extra.label,
+                            ordinal=extra.ordinal, document_id=extra.document_id, source_member_id=extra.member_id,
+                            activation=extra.activation or "click", capture_status="skipped_budget",
+                            fail_stage="budget", error_type=None, warning="series_budget_exhausted",
+                        ))
+                    break
+                if consecutive_hub_failures >= 3 and reloaded:
+                    # Second hub-unrecoverable block: stop and mark overall partial.
+                    for extra in descriptors[position:]:
+                        outcomes.append(CaptureBranchOutcome(
+                            branch_id=_safe_series_key(extra), series_key=extra.series_key, label=extra.label,
+                            ordinal=extra.ordinal, document_id=extra.document_id, source_member_id=extra.member_id,
+                            activation=extra.activation or "click", capture_status="failed",
+                            fail_stage="hub_unrecoverable", error_type="hub_unrecoverable",
+                            warning="series_hub_unrecoverable",
+                        ))
+                    break
+                # P1#7: per-branch capture_started event (safe ordinal only).
+                _emit_series_event({"event": "series_capture_started", "branch_id": _safe_series_key(descriptor), "ordinal": descriptor.ordinal})
+                try:
+                    outcome = self.capture_one_series(page, descriptor, template, pages, config)
+                    consecutive_hub_failures = 0
+                except HubUnrecoverableError:
+                    consecutive_hub_failures += 1
+                    if consecutive_hub_failures >= 3 and not reloaded:
+                        try:
+                            page.reload()
+                            page.wait_for_load_state()
+                        except Exception:
+                            pass
+                        reloaded = True
+                        consecutive_hub_failures = 0
+                        # P1#5: after the controlled reload, re-build pages/root/
+                        # template locators — never reuse pre-reload locators.
+                        pages = _live_pages_map(page)
+                        series_locator = _resolve_locator_recipe(template.series_action.locator, pages)
+                        if series_locator is not None:
+                            root = _series_scope_root(series_locator)
+                        try:
+                            outcome = self.capture_one_series(page, descriptor, template, pages, config)
+                            consecutive_hub_failures = 0
+                        except Exception as error:
+                            outcome = CaptureBranchOutcome(
+                                branch_id=_safe_series_key(descriptor), series_key=descriptor.series_key,
+                                label=descriptor.label, ordinal=descriptor.ordinal, document_id=descriptor.document_id,
+                                source_member_id=descriptor.member_id, activation=descriptor.activation or "click",
+                                capture_status="failed", fail_stage="transaction", error_type=type(error).__name__,
+                                warning=None,
+                            )
+                    elif consecutive_hub_failures >= 3:
+                        for extra in descriptors[position:]:
+                            outcomes.append(CaptureBranchOutcome(
+                                branch_id=_safe_series_key(extra), series_key=extra.series_key, label=extra.label,
+                                ordinal=extra.ordinal, document_id=extra.document_id, source_member_id=extra.member_id,
+                                activation=extra.activation or "click", capture_status="failed",
+                                fail_stage="hub_unrecoverable", error_type="hub_unrecoverable",
+                                warning="series_hub_unrecoverable",
+                            ))
+                        break
+                    else:
+                        outcome = CaptureBranchOutcome(
+                            branch_id=_safe_series_key(descriptor), series_key=descriptor.series_key,
+                            label=descriptor.label, ordinal=descriptor.ordinal, document_id=descriptor.document_id,
+                            source_member_id=descriptor.member_id, activation=descriptor.activation or "click",
+                            capture_status="failed", fail_stage="hub_unrecoverable", error_type="hub_unrecoverable",
+                            warning=None,
+                        )
+                except Exception as error:
+                    outcome = CaptureBranchOutcome(
+                        branch_id=_safe_series_key(descriptor), series_key=descriptor.series_key,
+                        label=descriptor.label, ordinal=descriptor.ordinal, document_id=descriptor.document_id,
+                        source_member_id=descriptor.member_id, activation=descriptor.activation or "click",
+                        capture_status="failed", fail_stage="transaction", error_type=type(error).__name__,
+                        warning=None,
+                    )
+                outcomes.append(outcome)
+                # P1#7: per-branch terminal event mapped cleanly onto SERIES_EVENT_NAMES.
+                terminal_event = {
+                    "captured": "series_capture_completed",
+                    "partial": "series_capture_partial",
+                    "failed": "series_capture_failed",
+                }.get(outcome.capture_status)
+                if terminal_event:
+                    emitted_terminal_ordinals.add(outcome.ordinal)
+                    _emit_series_event({
+                        "event": terminal_event,
+                        "branch_id": outcome.branch_id,
+                        "ordinal": outcome.ordinal,
+                        "error_type": outcome.error_type,
+                    })
+
+            # P1#6: discovered stays the discovery absolute count; conservation is
+            # enforced across the four terminal buckets. Every discovered descriptor
+            # (including any max_series / budget-capped / hub tail) gets a terminal
+            # status so the denominator is never silently shrunk, and the full
+            # closed set ``manifest_outcomes`` is the returned/ persisted page set
+            # (P1#6 closure): tails enter the returned outcomes, receive a
+            # safe persisted branch artefact (status + descriptor), surface in the
+            # flow's ``series_branches`` via the loader, and get a conventional
+            # terminal event (skipped strictly maps to ``series_capture_partial``).
+            handled_ordinals = {o.ordinal for o in outcomes}
+            manifest_outcomes = list(outcomes)
+            for descriptor in descriptors:
+                if descriptor.ordinal in handled_ordinals:
+                    continue
+                tail = CaptureBranchOutcome(
+                    branch_id=_safe_series_key(descriptor), series_key=descriptor.series_key,
+                    label=descriptor.label, ordinal=descriptor.ordinal, document_id=descriptor.document_id,
+                    source_member_id=descriptor.member_id, activation=descriptor.activation or "click",
+                    capture_status="skipped_budget", fail_stage="limit", error_type=None,
+                    warning="series_limit_reached",
+                )
+                manifest_outcomes.append(tail)
+
+            # Persist a safe, loadable branch artefact for every terminal that
+            # never ran ``capture_one_series`` (max / budget / hub tails) so the
+            # loader surfaces each in the flow's ``series_branches`` just like any
+            # other branch (P1#6 closure).
+            descriptor_by_ordinal = {d.ordinal: d for d in descriptors}
+            for outcome in manifest_outcomes:
+                if (self.series_branches_root / outcome.branch_id / "status.json").is_file():
+                    continue
+                descriptor = descriptor_by_ordinal.get(outcome.ordinal)
+                if descriptor is None:
+                    continue
+                self._persist_unattempted_branch(descriptor, outcome)
+
+            # P1#7: every terminal outcome that has not yet produced a series
+            # event gets one now. Skipped statuses have no dedicated SERIES_EVENT
+            # name, so they map to the agreed equivalent partial terminal event;
+            # ordinal/branch-id/safe-stage only, never raw identity.
+            for outcome in manifest_outcomes:
+                if outcome.ordinal in emitted_terminal_ordinals:
+                    continue
+                terminal_event = {
+                    "captured": "series_capture_completed",
+                    "partial": "series_capture_partial",
+                    "failed": "series_capture_failed",
+                    "skipped_budget": "series_capture_partial",
+                    "skipped_duplicate": "series_capture_partial",
+                }.get(outcome.capture_status)
+                if not terminal_event:
+                    continue
+                emitted_terminal_ordinals.add(outcome.ordinal)
+                _emit_series_event({
+                    "event": terminal_event,
+                    "branch_id": outcome.branch_id,
+                    "ordinal": outcome.ordinal,
+                    "error_type": outcome.error_type,
+                })
+
+            captured_count = sum(1 for o in manifest_outcomes if o.capture_status == "captured")
+            partial_count = sum(1 for o in manifest_outcomes if o.capture_status == "partial")
+            failed_count = sum(1 for o in manifest_outcomes if o.capture_status == "failed")
+            skipped_count = sum(
+                1 for o in manifest_outcomes
+                if o.capture_status in ("skipped_duplicate", "skipped_budget")
+            )
+            # P1#6: overall success requires a fully confirmed, fully-captured pass;
+            # any partial/failed/skipped or unreached-end forces overall_ok=False.
+            overall_ok = (
+                bool(evidence.reached_end)
+                and captured_count == discovered
+                and partial_count == 0
+                and failed_count == 0
+                and skipped_count == 0
+            )
+            # §6.4: after all branches, restore the original series/scroll/panel.
+            # A failed end-of-pass restoration is never swallowed: it forces
+            # overall_ok=False and is audited as an expansion warning (P1#5).
+            end_restore_ok = True
+            try:
+                end_restore_ok, _problem = self._restore_hub_state(page, root, template, pages, initial_state)
+            except Exception:
+                end_restore_ok = False
+            if not end_restore_ok:
+                overall_ok = False
+            self._write_series_capture_manifest(
+                manifest_outcomes, discovered, captured_count, partial_count, failed_count, skipped_count,
+                evidence, overall_ok, started, budget_exhausted, reloaded=reloaded,
+                restore_failed=not end_restore_ok,
+            )
+            _emit_series_event({"event": "series_expansion_completed", "overall_ok": overall_ok})
+            return manifest_outcomes
+        except Exception as error:
+            # P1#7: exploration infrastructure failure is surfaced through the
+            # series event channel as a failed/phase event, never swallowed.
+            bootstrap_error = type(error).__name__
+            _emit_series_event({"event": "series_expansion_completed", "overall_ok": False, "error_type": bootstrap_error})
+            try:
+                outcomes: list[CaptureBranchOutcome] = []
+                self._write_series_capture_manifest(
+                    outcomes, 0, 0, 0, 0, 0,
+                    SeriesCollectionEvidence("scroll_harvest", False, 0, 0, 0, False,
+                                             "series_discovery_failed" if not isinstance(error, HubUnrecoverableError) else "series_hub_unrecoverable", 0),
+                    False, started, budget_exhausted=False,
+                )
+            except Exception:
+                pass
+            return []
+
+    def _write_series_capture_manifest(
+        self,
+        outcomes: list[CaptureBranchOutcome],
+        discovered: int,
+        captured_count: int,
+        partial_count: int,
+        failed_count: int,
+        skipped_count: int,
+        evidence: SeriesCollectionEvidence,
+        overall_ok: bool,
+        started: float,
+        budget_exhausted: bool = False,
+        reloaded: bool = False,
+        restore_failed: bool = False,
+    ) -> None:
+        """Persist ``series_capture_manifest.json`` with audited, non-sensitive counts."""
+        expansion_warning = evidence.warning
+        if budget_exhausted:
+            expansion_warning = "series_budget_exhausted"
+        elif reloaded:
+            # One controlled reload/bootstrap was used to recover a
+            # hub-unrecoverable run (see ``finalize_series_branches``). This is
+            # audited so operators can see that recovery happened exactly once.
+            expansion_warning = "series_reload_recovered_once"
+        elif restore_failed:
+            # The end-of-pass hub/panel/selection restoration did not fully
+            # succeed; overall_ok is False and the run is audited (P1#5) rather
+            # than silently continuing.
+            expansion_warning = "hub_restore_failed"
+        manifest = {
+            "discovered_count": discovered,
+            "captured_count": captured_count,
+            "partial_count": partial_count,
+            "failed_count": failed_count,
+            "skipped_count": skipped_count,
+            "reloaded": reloaded,
+            "count_conserved": (captured_count + partial_count + failed_count + skipped_count) == discovered,
+            "reached_end": bool(evidence.reached_end),
+            "warning": expansion_warning,
+            "overall_ok": overall_ok,
+            "total_duration_ms": int((time.monotonic() - started) * 1000),
+            "branches": [
+                {
+                    "branch_id": o.branch_id,
+                    "series_key_sha256": hashlib.sha256(
+                        f"{o.document_id}::{o.series_key}".encode("utf-8")
+                    ).hexdigest(),
+                    "ordinal": o.ordinal,
+                    "capture_status": o.capture_status,
+                    "fail_stage": o.fail_stage,
+                    "error_type": o.error_type,
+                    "warning": o.warning,
+                    "metadata_captured": o.metadata_captured,
+                }
+                for o in outcomes
+            ],
+        }
+        self.series_branches_root.mkdir(parents=True, exist_ok=True)
+        (self.series_branches_root / "series_capture_manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def _persist_unattempted_branch(self, descriptor: SeriesDescriptor, outcome: CaptureBranchOutcome) -> None:
+        """Persist a safe, loadable branch artefact for a tail / unattempted descriptor.
+
+        (P1#6 closure) Budget/max/hub tails never call ``capture_one_series``, so
+        they otherwise leave no ``status.json``/``descriptor.json`` and never
+        surface in ``_load_series_branch_snapshots`` -> flow ``series_branches``.
+        Writing the same safe artefact shape as a real branch (only the hash of
+        the series identity in ``status.json``; ``descriptor.json`` stays within
+        the restricted capture tree, matching real captured branches) lets the
+        loader emit a first-class terminal (skipped/failed) ``SeriesBranch``.
+        """
+        branch_dir = self.series_branches_root / outcome.branch_id
+        branch_dir.mkdir(parents=True, exist_ok=True)
+        (branch_dir / "descriptor.json").write_text(
+            json.dumps(asdict(descriptor), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        status: dict[str, object] = {
+            "branch_id": outcome.branch_id,
+            "series_key_sha256": hashlib.sha256(
+                f"{descriptor.document_id}::{descriptor.series_key}".encode("utf-8")
+            ).hexdigest(),
+            "ordinal": descriptor.ordinal,
+            "capture_status": outcome.capture_status,
+            "fail_stage": outcome.fail_stage,
+            "error_type": outcome.error_type,
+            "activation": outcome.activation,
+            "source_member_id": descriptor.member_id,
+            "warning": outcome.warning,
+            "metadata_captured": False,
+        }
+        (branch_dir / "status.json").write_text(
+            json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def _snapshot_hub_state(self, root: object, template: RecordingTemplate, pages: dict[str, object]) -> dict[str, object]:
+        selected_series_key: str | None = None
+        try:
+            descriptors, _members, _ev = discover_series_candidates(root, "d_hub_state", max_scroll_steps=5, max_duration_s=2.0)
+            selected = next((d for d in descriptors if d.selected), None)
+            selected_series_key = selected.series_key if selected else None
+        except Exception:
+            pass
+        scroll_top = 0
+        try:
+            scroll_top = root.evaluate("el => el.scrollTop")
+        except Exception:
+            pass
+        meta_open = self._meta_factory(template.metadata_open, pages)
+        panel_open = False
+        if meta_open is not None:
+            panel_open = metadata_panel_signature(meta_open) is not None
+        return {"selected_series_key": selected_series_key, "scroll_top": scroll_top, "panel_open": panel_open}
+
+    @staticmethod
+    def _row_is_selected(locator: object) -> bool:
+        """True when a series row currently reports a selected/active state."""
+        try:
+            state = locator.evaluate(
+                """element => ({
+                    aria_selected: element.getAttribute('aria-selected'),
+                    selected_attr: element.hasAttribute('selected'),
+                    data_selected: element.getAttribute('data-selected'),
+                    active_class: /(^|\\s)(active|current|selected)(\\s|$)/.test(element.className || ''),
+                })"""
+            )
+        except Exception:
+            return False
+        if not state:
+            return False
+        return (
+            str(state.get("aria_selected") or "").lower() == "true"
+            or bool(state.get("selected_attr"))
+            or str(state.get("data_selected") or "").lower() in ("true", "1", "selected")
+            or bool(state.get("active_class"))
+        )
+
+    def _restore_hub_state(
+        self,
+        page: object,
+        root: object,
+        template: RecordingTemplate,
+        pages: dict[str, object],
+        initial: dict[str, object],
+    ) -> tuple[bool, str | None]:
+        """Restore and VERIFY the original selection / scrollTop / panel state.
+
+        Returns ``(ok, problem)``: ``ok`` is False (with a short unlocalized
+        ``problem`` reason) whenever any part of the restoration fails — the
+        Metadata panel did not hide/open, the hub is inoperable, or the original
+        selection/scrollTop were not restored. Failures are never swallowed
+        (P1#5); the caller degrades the branch or records a warning.
+
+        Restore the original series selection first (Playwright's click may
+        auto-scroll to bring the row into view), then restore the exact scrollTop
+        LAST so a selection-driven scroll cannot clobber it. The panel open/closed
+        state is restored around the selection.
+        """
+        problems: list[str] = []
+        if initial.get("panel_open"):
+            if not self._open_metadata_if_needed(page, template, pages, want_open=True):
+                problems.append("metadata_open_failed")
+        else:
+            if not self._open_metadata_if_needed(page, template, pages, want_open=False):
+                problems.append("metadata_not_hidden")
+
+        if initial.get("selected_series_key"):
+            try:
+                descriptors, _members, _ev = discover_series_candidates(root, "d_hub_restore", max_scroll_steps=8, max_duration_s=3.0)
+                target = next((d for d in descriptors if d.series_key == initial["selected_series_key"]), None)
+                if target is None:
+                    problems.append("selection_lost")
+                else:
+                    row, _steps = _locate_series_row(root, target, max_scroll_steps=12)
+                    if row is None:
+                        problems.append("selection_unlocatable")
+                    else:
+                        self._perform_activation(row, target.activation or "click")
+                        if not self._row_is_selected(row):
+                            problems.append("selection_not_restored")
+            except Exception as error:
+                problems.append(f"selection_restore_error:{type(error).__name__}")
+
+        try:
+            root.evaluate("(el, top) => el.scrollTop = top", int(initial.get("scroll_top", 0)))
+            restored_top = root.evaluate("el => el.scrollTop")
+            if abs(int(restored_top) - int(initial.get("scroll_top", 0))) > 2:
+                problems.append("scroll_not_restored")
+        except Exception as error:
+            problems.append(f"scroll_restore_error:{type(error).__name__}")
+
+        return (not problems), (";".join(problems) if problems else None)
+
+    def _open_metadata_if_needed(self, page: object, template: RecordingTemplate, pages: dict[str, object], want_open: bool) -> bool:
+        """Open/close the Metadata panel toward ``want_open`` and VERIFY the result.
+
+        Closing now waits for the panel to actually hide (a close that does not
+        take effect is reported as a failed restore rather than silently left
+        open for the next branch). Returns ``True`` when the desired end state is
+        reached (or no Metadata trigger is present); ``False`` on failure.
+        """
+        meta_open = self._meta_factory(template.metadata_open, pages)
+        if meta_open is None:
+            return True
+        try:
+            opened = meta_open()
+            if opened is None:
+                return False
+            currently_open = metadata_panel_signature(meta_open) is not None
+            if want_open and not currently_open:
+                opened.click()
+            elif not want_open and currently_open:
+                close = self._meta_factory(template.metadata_close, pages)
+                if close is not None:
+                    candidate = close()
+                    if candidate is not None:
+                        candidate.click()
+            if want_open:
+                return metadata_panel_signature(meta_open) is not None
+            # Closing: wait (bounded) for the panel to actually hide.
+            return self._wait_for_metadata_hidden(page, meta_open, timeout_s=2.0)
+        except Exception:
+            return False
+
+
+
+@dataclass(frozen=True)
+class RecordingTemplate:
+    """Static classification of the human-recorded single-series template.
+
+    ``series_action`` is the recorded series-activation action (序列选择); its
+    click/dblclick is inherited verbatim by the future explorer. ``metadata_open``
+    and ``metadata_close`` are the recorded Meta 信息工具 actions. A valid
+    expansion template requires series + open + close, with the close a
+    distinct, later metadata action than the open.
+    """
+
+    series_action: ActionTarget | None
+    metadata_open: ActionTarget | None
+    metadata_close: ActionTarget | None
+
+    @property
+    def complete(self) -> bool:
+        return (
+            self.series_action is not None
+            and self.metadata_open is not None
+            and self.metadata_close is not None
+            and self.metadata_open != self.metadata_close
+        )
+
+
+def classify_recording_template(plan: ActionPlan) -> RecordingTemplate:
+    """Identify the series activation and Metadata open/close recorded actions.
+
+    Deterministic static proxy over the recorded action plan (no browser, so it
+    runs in the template/preflight pass): the series action is the first
+    ``序列选择`` marker action whose click/dblclick is inherited; Metadata
+    actions are all ``Meta 信息工具`` actions in recording order, where the OPEN
+    is the first and the CLOSE is the last (the canonical template records
+    open-then-close). Phase 5 may refine open/close from live panel visibility;
+    this byte-stable proxy is the Phase 4 contract the trigger depends on.
+    """
+    series: ActionTarget | None = None
+    meta_actions: list[ActionTarget] = []
+    for group in plan.marker_groups:
+        normalized = normalize_label(group.marker_label)
+        for action in group.actions:
+            if normalized == normalize_label("序列选择") and series is None:
+                series = action
+            elif normalized == normalize_label("Meta 信息工具"):
+                meta_actions.append(action)
+    open_action = meta_actions[0] if meta_actions else None
+    close_action = meta_actions[-1] if len(meta_actions) >= 2 else None
+    return RecordingTemplate(series, open_action, close_action)
+
 
 _LIVE_SESSION: LiveCaptureSession | None = None
 _INTERACTIVE_AUTH_DONE = False
+_EXPANSION_CONFIG: dict[str, object] = {}
+
+
+def _expansion_config_value() -> dict[str, object]:
+    """Return the expansion run config, cached from the subprocess environment.
+
+    ``run_live_capture`` serializes the expansion config into the
+    ``REPLICA_EXPANSION_CONFIG`` environment variable of the instrumented
+    replay subprocess; this is the only cross-process channel (mirroring how
+    ``REPLICA_CAPTURE_OUTPUT`` reaches the live session). Tests that exercise
+    only text instrumentation set the config on ``instrument_marked_actions``
+    directly and never reach this path.
+    """
+    global _EXPANSION_CONFIG
+    if not _EXPANSION_CONFIG:
+        raw = os.environ.get("REPLICA_EXPANSION_CONFIG")
+        if raw:
+            try:
+                _EXPANSION_CONFIG = json.loads(raw)
+            except (ValueError, TypeError):
+                _EXPANSION_CONFIG = {}
+    return _EXPANSION_CONFIG
+
+
+def _expansion_enabled(config: dict[str, object] | None) -> bool:
+    return bool((config or {}).get("expand_all_series"))
 
 
 def configure_live_capture(session: LiveCaptureSession | None) -> None:
@@ -280,6 +1884,43 @@ def capture_hook_after(action_id: str, page: object, locator_factory: object | N
             capture_hook_failed(action_id, error)
 
 
+def capture_hook_expand_series(
+    page: object,
+    series_locator_factory: object | None = None,
+    series_action_id: str = "",
+    close_action_id: str = "",
+) -> None:
+    """Runtime hook imported by instrumented scripts (independent expansion trigger).
+
+    This is a *separate* hook from ``capture_hook_after``: it is injected by
+    ``instrument_marked_actions`` into the Metadata-close action's success
+    ``else:`` branch, immediately after that action's ``capture_hook_after``.
+    It exists so the future all-series explorer runs after the panel is closed,
+    while ``capture_hook_after`` keeps its single-after-snapshot duty. It passes
+    only stable recipes (locator factory / action ids / page var) — no LLM
+    decision happens here. When expansion is disabled or no session is wired,
+    it is a safe no-op.
+    """
+    if not _expansion_enabled(_expansion_config_value()):
+        return
+    session = _LIVE_SESSION or _session_from_environment()
+    if session is None:
+        return
+    try:
+        session.expand_series(page, series_locator_factory, series_action_id, close_action_id)
+    except Exception as error:
+        # P1#7: a top-level exploration infrastructure failure is surfaced through
+        # the series event channel using a SERIES_EVENT_NAMES name (never the
+        # orphaned ``series_expansion_failed``). The Session itself emits the
+        # per-branch events; this only catches failures that escape the explorer
+        # (e.g. template/parse crashes) — never raw UID / patient text.
+        _emit_series_event({
+            "event": "series_expansion_completed",
+            "overall_ok": False,
+            "error_type": f"infra_{type(error).__name__}",
+        })
+
+
 def capture_hook_failed(action_id: str, error: BaseException) -> None:
     """Record an action-level failure without aborting later independent markers."""
     print(json.dumps({"event": "action_failed", "action_id": action_id, "error": type(error).__name__}), flush=True)
@@ -294,9 +1935,29 @@ def _session_from_environment() -> LiveCaptureSession | None:
     return _LIVE_SESSION
 
 
-def instrument_marked_actions(source: str, use_storage_state: bool = False, interactive_auth: bool = False, marker_annotations: object | None = None) -> str:
-    """Insert capture hooks around marked Playwright action statements without executing source."""
+def instrument_marked_actions(source: str, use_storage_state: bool = False, interactive_auth: bool = False, marker_annotations: object | None = None, expansion_config: dict[str, object] | None = None) -> str:
+    """Insert capture hooks around marked Playwright action statements without executing source.
+
+    When ``expansion_config`` enables ``expand_all_series``, the recording
+    template must contain a series-activation action plus a Metadata open and a
+    Metadata close; an independent ``capture_hook_expand_series`` call is then
+    injected into the Metadata-close action's success ``else:`` branch, directly
+    after that action's own ``capture_hook_after``. When disabled (default), no
+    expansion hook is produced and prior recording behavior is unchanged.
+    """
     plan = parse_action_plan(source, _coerce_marker_annotations(marker_annotations))
+    expansion = dict(expansion_config or {})
+    expand = _expansion_enabled(expansion)
+    template = classify_recording_template(plan)
+    if expand and not template.complete:
+        raise ValueError(
+            "expansion requires a series-select action plus a Metadata open and "
+            "a Metadata close in the recording template"
+        )
+    close_action_id = template.metadata_close.action_id if (expand and template.metadata_close) else None
+    series_action = template.series_action if expand else None
+    series_src = series_action.locator.source_expression if (series_action is not None and series_action.locator) else ""
+    series_action_id = series_action.action_id if series_action is not None else ""
     actions = {}
     for group in plan.marker_groups:
         for action in group.actions:
@@ -309,7 +1970,8 @@ def instrument_marked_actions(source: str, use_storage_state: bool = False, inte
         source = source.replace("chromium.launch()", "chromium.launch(headless=False)")
         source = source.replace("chromium.launch(headless=True)", "chromium.launch(headless=False)")
     source_lines = source.splitlines()
-    output = ["import os" if use_storage_state else "", "from batch_capture_replicate import capture_hook_after, capture_hook_before, capture_hook_failed"]
+    hook_import = "capture_hook_after, capture_hook_before, capture_hook_expand_series, capture_hook_failed" if expand else "capture_hook_after, capture_hook_before, capture_hook_failed"
+    output = ["import os" if use_storage_state else "", f"from batch_capture_replicate import {hook_import}"]
     for index, line in enumerate(source_lines, start=1):
         indent = line[: len(line) - len(line.lstrip())]
         line_actions = actions.get(index, [])
@@ -328,6 +1990,9 @@ def instrument_marked_actions(source: str, use_storage_state: bool = False, inte
         for action_id, page_var, locator_source, marker_label in line_actions:
             factory = f", lambda: {locator_source}" if locator_source else ""
             output.append(f'{indent}    capture_hook_after("{action_id}", {page_var}{factory}, {marker_label!r})')
+            if expand and action_id == close_action_id:
+                series_factory = f"lambda: {series_src}" if series_src else "None"
+                output.append(f"{indent}    capture_hook_expand_series({page_var}, {series_factory}, {series_action_id!r}, {close_action_id!r})")
     instrumented = "\n".join(line for line in output if line) + "\n"
     ast.parse(instrumented)
     return instrumented
@@ -341,6 +2006,7 @@ def run_live_capture(
     interactive_auth: bool = False,
     emit: Callable[[dict[str, str]], None] | None = None,
     marker_annotations: object | None = None,
+    expansion_config: dict[str, object] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Execute one instrumented recording script in a fresh process with capture hooks enabled."""
     script_path = Path(script_path)
@@ -351,7 +2017,7 @@ def run_live_capture(
         shutil.rmtree(snapshot_root)
     instrumented_path = output_root / "instrumented_replay.py"
     instrumented_path.write_text(
-        instrument_marked_actions(script_path.read_text(encoding="utf-8"), storage_state is not None, interactive_auth, marker_annotations),
+        instrument_marked_actions(script_path.read_text(encoding="utf-8"), storage_state is not None, interactive_auth, marker_annotations, expansion_config),
         encoding="utf-8",
     )
     environment = os.environ.copy()
@@ -362,6 +2028,8 @@ def run_live_capture(
         environment["REPLICA_STORAGE_STATE"] = str(Path(storage_state).resolve())
     if interactive_auth:
         environment["REPLICA_INTERACTIVE_AUTH"] = "1"
+    if _expansion_enabled(expansion_config):
+        environment["REPLICA_EXPANSION_CONFIG"] = json.dumps(expansion_config, ensure_ascii=False)
     managed = ManagedProcess(
         [codegen_python_executable(), str(instrumented_path)],
         cwd=Path(project_root),
@@ -411,6 +2079,176 @@ def _load_selector_closure(capture_root: Path, action_id: str):
         return None
     from replica_models import SelectorClosure
     return SelectorClosure(**json.loads(path.read_text(encoding="utf-8")))
+
+
+def _load_branch_topology(capture_root: Path, branch_dir: Path, subdir: str):
+    """Load a branch viewer/metadata topology, rebasing asset relpaths to capture_root.
+
+    Reuses ``ReplicaDocument.from_dict`` (the same decoder the snapshots use) so
+    there is exactly one topology decoder in this module — never a second one.
+    """
+    payload = json.loads((branch_dir / subdir / "topology.json").read_text(encoding="utf-8"))
+    pages = [ReplicaPage(**item) for item in payload.get("pages", [])]
+    documents = []
+    for item in payload.get("documents", []):
+        rel = item.get("screenshot_asset_relpath")
+        if rel:
+            try:
+                item["screenshot_asset_relpath"] = str((branch_dir / subdir / rel).resolve().relative_to(capture_root.resolve())).replace("\\", "/")
+            except ValueError:
+                pass
+        documents.append(ReplicaDocument.from_dict(item))
+    return pages, documents
+
+
+def _metadata_panel_text(outer_html: str) -> str:
+    """Extract concise visible text from a sanitized Metadata panel outerHTML.
+
+    The builder's ``_is_metadata_panel`` requires a non-empty ``root.text`` in
+    addition to a matching id/class/role; the panel's visible text is derived
+    from the captured HTML so the panel is recognized and rendered complete.
+    """
+    text = re.sub(r"<[^>]+>", " ", outer_html or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:2000]
+
+
+def _metadata_panel_snapshot(meta_doc: ReplicaDocument, outer_html: str) -> DomNodeSnapshot:
+    panel_attributes = {"id": "metadata-panel", "class": "tagsBox", "role": "dialog"}
+    rect = Rect(0, 0, float(meta_doc.viewport.get("width") or 0), float(meta_doc.viewport.get("height") or 0), "page_viewport_css")
+    return DomNodeSnapshot("div", _metadata_panel_text(outer_html), panel_attributes, rect, outer_html, {})
+
+
+def _attach_metadata_region_to_doc(meta_doc: ReplicaDocument, outer_html: str) -> None:
+    """Attach a ``region_type="metadata"`` InteractionRegion to a document (P0#1).
+
+    The region root carries the sanitized full Metadata panel ``outerHTML`` (and a
+    non-empty extracted text) so the builder's ``_is_metadata_panel`` renders it
+    as a complete scrollable ``.replica-metadata`` panel.
+    """
+    panel_snapshot = _metadata_panel_snapshot(meta_doc, outer_html)
+    meta_doc.regions.append(InteractionRegion(
+        f"{meta_doc.document_id}_metadata", "metadata", meta_doc.document_id,
+        panel_snapshot, [], None,
+    ))
+
+
+def _load_series_branch_snapshots(
+    capture_root: Path,
+) -> tuple[list[SeriesBranchCapture], list[str], dict[str, object] | None]:
+    """Read every Phase-5 branch snapshot under ``capture/series_branches/*/``.
+
+    Returns ``(snapshots, warnings, expansion)`` where ``expansion`` is the
+    aggregate manifest evidence (or ``None`` when no branches were captured).
+    Only decode/viewer snapshots are surfaced; each ``SeriesBranchCapture`` carries
+    the viewer/metadata state evidence needed to build a v2 flow. No raw UID or
+    patient text is emitted here.
+    """
+    root = Path(capture_root) / "series_branches"
+    snapshots: list[SeriesBranchCapture] = []
+    warnings: list[str] = []
+    if not root.is_dir():
+        return snapshots, warnings, None
+    manifest_path = root / "series_capture_manifest.json"
+    expansion = None
+    if manifest_path.is_file():
+        expansion = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for branch_dir in sorted(root.iterdir()):
+        if not branch_dir.is_dir():
+            continue
+        status_path = branch_dir / "status.json"
+        if not status_path.is_file():
+            warnings.append(f"series_branch_missing_status:{branch_dir.name}")
+            continue
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            descriptor = SeriesDescriptor(**json.loads((branch_dir / "descriptor.json").read_text(encoding="utf-8")))
+        except Exception:
+            warnings.append(f"series_branch_unreadable:{branch_dir.name}")
+            continue
+        capture_status = str(status.get("capture_status"))
+        viewer_pages: list[ReplicaPage] = []
+        viewer_documents: list[ReplicaDocument] = []
+        metadata_pages: list[ReplicaPage] = []
+        metadata_documents: list[ReplicaDocument] = []
+        try:
+            viewer_pages, viewer_documents = _load_branch_topology(capture_root, branch_dir, "viewer")
+        except Exception:
+            viewer_pages, viewer_documents = [], []
+        try:
+            metadata_pages, metadata_documents = _load_branch_topology(capture_root, branch_dir, "metadata")
+        except Exception:
+            metadata_pages, metadata_documents = [], []
+        metadata_rows: list[dict[str, object]] = []
+        metadata_outer_html: str = ""
+        # The writer persists ``metadata/metadata_rows.json`` (see
+        # capture_one_series -> _capture_metadata_transaction); this is the only
+        # authoritative location. Load it so captured rows/outerHTML restore the
+        # Metadata region even when an older/partial artifact's topology did not
+        # already embed a ``metadata`` region (P0#1 loader fallback).
+        rows_payload_path = branch_dir / "metadata" / "metadata_rows.json"
+        if rows_payload_path.is_file():
+            try:
+                payload = json.loads(rows_payload_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    metadata_rows = payload.get("rows", [])
+                    metadata_outer_html = str(payload.get("outer_html") or "")
+            except Exception:
+                metadata_rows = []
+        # P0#1: assemble the captured (sanitized) Metadata outerHTML into the
+        # metadata document as a real ``metadata`` InteractionRegion so the offline
+        # replica renders a complete, scrollable Metadata panel. Only attach when
+        # the loaded topology does not already carry a ``metadata`` region so a
+        # fallback never duplicates a region the writer already embedded.
+        if (
+            metadata_outer_html
+            and metadata_documents
+            and not any(
+                region.region_type == "metadata"
+                for doc in metadata_documents
+                for region in doc.regions
+            )
+        ):
+            try:
+                _attach_metadata_region_to_doc(metadata_documents[0], metadata_outer_html)
+            except Exception:
+                pass
+        # P0#1: load the captured Metadata open-target DOM (if any) so the branch
+        # Viewer state can render a real clickable Metadata trigger button.
+        meta_open_dom: DomNodeSnapshot | None = None
+        meta_open_target_path = branch_dir / "meta_open_target.json"
+        if meta_open_target_path.is_file():
+            try:
+                meta_open_payload = json.loads(meta_open_target_path.read_text(encoding="utf-8"))
+                meta_open_payload["rect"] = Rect(**meta_open_payload["rect"])
+                meta_open_dom = DomNodeSnapshot(**meta_open_payload)
+            except Exception:
+                meta_open_dom = None
+        if not viewer_documents and capture_status in ("captured", "partial"):
+            warnings.append(f"series_branch_missing_viewer:{branch_dir.name}")
+            continue
+        snapshots.append(SeriesBranchCapture(
+            branch_id=str(status.get("branch_id") or branch_dir.name),
+            series_key=descriptor.series_key,
+            label=descriptor.label,
+            ordinal=descriptor.ordinal,
+            document_id=descriptor.document_id,
+            source_member_id=str(status.get("source_member_id") or descriptor.member_id),
+            activation=descriptor.activation or "click",
+            capture_status=capture_status,
+            warning=status.get("warning"),
+            viewer_pages=viewer_pages,
+            viewer_documents=viewer_documents,
+            metadata_pages=metadata_pages,
+            metadata_documents=metadata_documents,
+            metadata_rows=metadata_rows,
+            meta_open_dom=meta_open_dom,
+        ))
+        if status.get("warning"):
+            warnings.append(f"series_branch_warning:{branch_dir.name}::{status['warning']}")
+        if status.get("fail_stage"):
+            warnings.append(f"series_branch_failed_stage:{branch_dir.name}::{status['fail_stage']}")
+    return snapshots, warnings, expansion
 
 
 def _topology_changed(before_pages: list[ReplicaPage], before_documents: list[ReplicaDocument], after_pages: list[ReplicaPage], after_documents: list[ReplicaDocument]) -> bool:
@@ -479,6 +2317,54 @@ def _has_snapshot_pair(capture_root: Path, action_id: str) -> bool:
     return all((snapshots / phase / "topology.json").is_file() for phase in ("before", "after"))
 
 
+def _action_marker_id(state: ReplicaState, action_id: str) -> str | None:
+    return next(
+        (
+            target.marker_id
+            for document in state.documents
+            for target in document.targets
+            if target.action_id == action_id
+        ),
+        None,
+    )
+
+
+def _skip_popup_shell_state(states: list[ReplicaState]) -> None:
+    """Point popup entry past a genuinely incomplete loading shell."""
+    if len(states) < 3:
+        return
+    entry, shell, ready = states[:3]
+    transition = next((item for item in entry.transitions if item.mode == "popup"), None)
+    if transition is None or transition.to_state_id != shell.state_id:
+        return
+    shell_frames = [doc for doc in shell.documents if doc.parent_document_id is not None]
+    ready_frames = [doc for doc in ready.documents if doc.parent_document_id is not None]
+    if len(shell_frames) != 1 or len(ready_frames) != 1:
+        return
+    shell_bytes = shell_frames[0].screenshot_size_bytes
+    ready_bytes = ready_frames[0].screenshot_size_bytes
+    if shell_bytes < 50_000 and ready_bytes >= max(50_000, shell_bytes * 4):
+        transition.to_state_id = ready.state_id
+
+
+def _refresh_delayed_state(
+    state: ReplicaState,
+    pages: list[ReplicaPage],
+    documents: list[ReplicaDocument],
+) -> None:
+    """Use the next action's before-snapshot when a popup finished loading late."""
+    current_frames = [doc for doc in state.documents if doc.parent_document_id is not None]
+    ready_frames = [doc for doc in documents if doc.parent_document_id is not None]
+    if len(current_frames) != 1 or len(ready_frames) != 1:
+        return
+    current_bytes = current_frames[0].screenshot_size_bytes
+    ready_bytes = ready_frames[0].screenshot_size_bytes
+    if current_bytes >= 50_000 or ready_bytes < max(50_000, current_bytes * 4):
+        return
+    state.pages = pages
+    state.documents = documents
+
+
 def build_flow_from_snapshots(script_path: str | Path, capture_root: str | Path, marker_annotations: object | None = None) -> ReplicaFlow:
     """Build a sequential ReplicaFlow from marked-action snapshot pairs.
 
@@ -505,6 +2391,8 @@ def build_flow_from_snapshots(script_path: str | Path, capture_root: str | Path,
     first_pages, first_documents = _load_snapshot_state(capture_root, actions[0].action_id, "before")
     states = [ReplicaState("s_000", 0, "", "page", first_pages, first_documents, [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry_snapshot"))]
     for index, action in enumerate(actions, start=1):
+        before_pages, before_documents = _load_snapshot_state(capture_root, action.action_id, "before")
+        _refresh_delayed_state(states[-1], before_pages, before_documents)
         target = _load_target_snapshot(capture_root, action.action_id)
         closure = _load_selector_closure(capture_root, action.action_id)
         if target and states[-1].documents:
@@ -526,8 +2414,338 @@ def build_flow_from_snapshots(script_path: str | Path, capture_root: str | Path,
             _carry_forward_interactive_nodes(states[-1].documents, documents)
             states.append(ReplicaState(state_id, len(states), "", "page", pages, documents, [], evidence))
     viewport = first_pages[0].entry_document_id and first_documents[0].viewport if first_documents else {"width": 0, "height": 0}
+    _skip_popup_shell_state(states)
     warnings = [f"action_capture_failed:{action_id}" for action_id in skipped_actions]
-    return ReplicaFlow(1, script_path.stem, script_path.name, sha256_file(script_path), datetime.now(timezone.utc).isoformat(), viewport, plan.bootstrap, plan.popup_expectations, CaptureTimingProfile(), "s_000", states, warnings)
+
+    # Phase 6: merge any Phase-5 series-branch snapshots into the flow as
+    # ordinary ReplicaState / ReplicaDocument (schema v2). Each successful /
+    # partial branch gets a unique viewer state; each metadata-successful branch
+    # gets a unique metadata state whose close transition returns explicitly to
+    # the same branch's viewer state.
+    series_branches, expansion_evidence = _build_branches_into_flow(states, capture_root, plan, warnings)
+
+    return ReplicaFlow(
+        2,
+        script_path.stem,
+        script_path.name,
+        sha256_file(script_path),
+        datetime.now(timezone.utc).isoformat(),
+        viewport,
+        plan.bootstrap,
+        plan.popup_expectations,
+        CaptureTimingProfile(),
+        "s_000",
+        states,
+        warnings,
+        series_branches=series_branches,
+        series_expansion=expansion_evidence,
+    )
+
+
+def _build_branches_into_flow(
+    states: list[ReplicaState],
+    capture_root: Path,
+    plan: ActionPlan,
+    warnings: list[str],
+) -> tuple[list[SeriesBranch], SeriesExpansionEvidence | None]:
+    """Merge captured series branches into ``states`` (in place) and return branches/evidence.
+
+    Uses ``_load_series_branch_snapshots`` (which reuses ``ReplicaDocument.from_dict``
+    — the module's one topology decoder). Synthetic action IDs follow the stable
+    ``series:{branch_id}:activate/meta_open/meta_close`` scheme.
+    """
+    template = classify_recording_template(plan)
+    branch_selector = template.series_action.locator if template.series_action is not None else None
+    meta_open_recipe = template.metadata_open.locator if template.metadata_open is not None else None
+
+    snapshots, branch_warnings, expansion_payload = _load_series_branch_snapshots(Path(capture_root))
+    warnings.extend(branch_warnings)
+    if not snapshots:
+        return [], None
+
+    series_branches: list[SeriesBranch] = []
+    next_ordinal = len(states)
+    active_page_var = "page"
+
+    for snapshot in snapshots:
+        branch_id = snapshot.branch_id
+        viewer_state_id: str | None = None
+        metadata_state_id: str | None = None
+        return_state_id: str | None = None
+        selector = branch_selector
+
+        # Unique viewer state for captured/partial branches that have a valid
+        # viewer snapshot.
+        if snapshot.capture_status in ("captured", "partial") and snapshot.viewer_documents:
+            viewer_state_id = f"bviewer_{branch_id}"
+            viewer_ordinal = next_ordinal
+            next_ordinal += 1
+            # P0#2: atomically remap pages + documents (ids, parent ids, page
+            # ids, entry_document_id and in-document region/target references) so
+            # the builder can resolve each branch entry document via
+            # ``target_page.entry_document_id``.
+            viewer_pages, viewer_documents = _branch_topology(snapshot.viewer_pages, snapshot.viewer_documents, branch_id)
+            evidence = StateEvidence(False, False, False, False, 0, 0, 0, 0, "series_branch_viewer")
+            viewer_transitions: list[ReplicaTransition] = []
+            # Metadata trigger lives on the viewer state (a real clickable DOM
+            # target, not a dom=None placeholder).
+            if snapshot.capture_status in ("captured", "partial") and snapshot.metadata_documents:
+                # (closure #3) Mount the trigger on exactly ONE viewer document —
+                # the one the meta-open recipe's frame chain resolves to — so a
+                # nested-frame viewer never duplicates / misplaces it.
+                # ``document_id`` is taken from that owning document; when the
+                # frame chain is ambiguous or unresolvable we do NOT guess
+                # ``documents[-1]`` — the trigger (and its metadata state) is
+                # simply omitted, which is strictly safer than a wrong mount.
+                owning_doc_id = _document_id_for_recipe(meta_open_recipe, viewer_pages, viewer_documents)
+                if owning_doc_id is None:
+                    page_docs = [doc for doc in viewer_documents if doc.page_var == active_page_var]
+                    if len(page_docs) == 1:
+                        owning_doc_id = page_docs[0].document_id
+                if owning_doc_id:
+                    metadata_state_id = f"bmeta_{branch_id}"
+                    meta_action = _synthetic_meta_open_target(
+                        branch_id, meta_open_recipe, owning_doc_id, dom=snapshot.meta_open_dom
+                    )
+                    for doc in viewer_documents:
+                        if doc.document_id == owning_doc_id:
+                            doc.targets.append(meta_action)
+                    viewer_transitions.append(ReplicaTransition(
+                        f"series:{branch_id}:meta_open", f"series:{branch_id}:meta_open",
+                        viewer_state_id, metadata_state_id, active_page_var, active_page_var, "same_page",
+                    ))
+            states.append(ReplicaState(
+                viewer_state_id, viewer_ordinal, "", active_page_var,
+                viewer_pages, viewer_documents, viewer_transitions, evidence,
+            ))
+            return_state_id = viewer_state_id
+
+            # Unique metadata state for metadata-successful branches; its close
+            # returns explicitly to the same branch's viewer state.
+            if metadata_state_id is not None:
+                meta_ordinal = next_ordinal
+                next_ordinal += 1
+                metadata_transitions = [ReplicaTransition(
+                    f"series:{branch_id}:meta_close", f"series:{branch_id}:meta_close",
+                    metadata_state_id, viewer_state_id, active_page_var, active_page_var, "same_page",
+                )]
+                meta_pages, meta_documents = _branch_topology(snapshot.metadata_pages, snapshot.metadata_documents, branch_id)
+                states.append(ReplicaState(
+                    metadata_state_id, meta_ordinal, "", active_page_var,
+                    meta_pages, meta_documents,
+                    metadata_transitions,
+                    StateEvidence(False, False, False, False, 0, 0, 0, 0, "series_branch_metadata"),
+                ))
+
+        branch_warning = snapshot.warning
+        if snapshot.capture_status == "failed" and not branch_warning:
+            branch_warning = snapshot.warning or "series_capture_failed"
+        series_branches.append(SeriesBranch(
+            branch_id=branch_id,
+            series_key=snapshot.series_key,
+            label=snapshot.label,
+            ordinal=snapshot.ordinal,
+            document_id=snapshot.document_id,
+            source_member_id=snapshot.source_member_id,
+            selector=selector,
+            activation=snapshot.activation,
+            viewer_state_id=viewer_state_id,
+            metadata_state_id=metadata_state_id,
+            return_state_id=return_state_id,
+            capture_status=snapshot.capture_status,
+            warning=branch_warning,
+        ))
+
+    expansion = _expansion_evidence(snapshots, expansion_payload)
+    return series_branches, expansion
+
+
+def _branch_topology(
+    pages: list[ReplicaPage],
+    documents: list[ReplicaDocument],
+    branch_id: str,
+) -> tuple[list[ReplicaPage], list[ReplicaDocument]]:
+    """(P0#2) Atomically remap a branch's page/document graph to branch-unique IDs.
+
+    Each branch snapshot lives in its own asset namespace, yet all flow states
+    share one document-id pool and one asset directory (relative to the capture
+    root). This single atomic transform rebases:
+
+    - ``ReplicaDocument.document_id`` and ``parent_document_id``
+    - ``ReplicaPage.page_id`` and ``ReplicaPage.entry_document_id``
+    - in-document ``region.document_id`` and ``target.document_id`` references
+
+    so ``target_page.entry_document_id`` reliably resolves to a remapped
+    document (no dangling/StopIteration in the builder's route resolution).
+    """
+    prefix = f"{branch_id}__"
+    remap_doc: dict[str, str] = {}
+    for document in documents:
+        remap_doc.setdefault(document.document_id, f"{prefix}{document.document_id}")
+    remap_page: dict[str, str] = {page.page_id: f"{prefix}{page.page_id}" for page in pages}
+
+    new_pages = [
+        replace(
+            page,
+            page_id=remap_page.get(page.page_id, page.page_id),
+            # (closure suggestion #1) ``opener_page_id`` references another page
+            # in the *same* branch snapshot; remap it through the page map so a
+            # multi-page / popup branch never keeps a dangling pre-remap opener
+            # id after the graph is rebased.
+            opener_page_id=(
+                remap_page.get(page.opener_page_id, page.opener_page_id)
+                if page.opener_page_id is not None else None
+            ),
+            entry_document_id=remap_doc.get(page.entry_document_id, page.entry_document_id),
+        )
+        for page in pages
+    ]
+    new_documents = []
+    for document in documents:
+        new_id = remap_doc[document.document_id]
+        parent = document.parent_document_id
+        if parent is not None and parent in remap_doc:
+            parent = remap_doc[parent]
+        new_regions = [replace(region, document_id=remap_doc.get(region.document_id, region.document_id)) for region in document.regions]
+        new_targets = [replace(target, document_id=remap_doc.get(target.document_id, target.document_id)) for target in document.targets]
+        new_documents.append(replace(
+            document,
+            document_id=new_id,
+            parent_document_id=parent,
+            page_id=remap_page.get(document.page_id, document.page_id),
+            regions=new_regions,
+            targets=new_targets,
+        ))
+    return new_pages, new_documents
+
+
+def _frame_hop_matches_document(hop: FrameHop, document: ReplicaDocument) -> bool:
+    """True when a recipe ``frame_chain`` hop points at ``document``.
+
+    A hop carries both the selector (``#id`` / ``iframe[name=...]``) and the
+    frame's own id/name captured at record time; a document records the same
+    ``frame_selector``/``frame_id``/``frame_name`` that ``capture_page_topology``
+    captured. Any one of them matching is sufficient, since a resolved hop must
+    already be the correct parent in the chain.
+    """
+    if hop.frame_id and hop.frame_id == document.frame_id:
+        return True
+    if hop.frame_name and hop.frame_name == document.frame_name:
+        return True
+    if hop.selector and document.frame_selector:
+        if hop.selector == document.frame_selector:
+            return True
+        # ``iframe#id`` / ``iframe[name=foo]`` (hop) vs ``#id`` (document) — the
+        # recorded ``.locator(x).content_frame`` chain carries a wrapper selector
+        # while the captured document records its bare frame selector.
+        raw_id = re.search(r"#([A-Za-z_][\w-]*)", hop.selector)
+        doc_id = re.search(r"#([A-Za-z_][\w-]*)", document.frame_selector)
+        if raw_id and doc_id and raw_id.group(1) == doc_id.group(1):
+            return True
+        # ``iframe[name=foo]`` (document) vs ``foo`` (hop.name) — compare the
+        # bare name when the selectors differ only in wrapper syntax.
+        if "name=" in hop.selector and "name=" in document.frame_selector:
+            try:
+                if re.search(r"name=['\"]([^'\"]+)", hop.selector).group(1) == re.search(r"name=['\"]([^'\"]+)", document.frame_selector).group(1):
+                    return True
+            except (AttributeError, IndexError):
+                pass
+        if "=" not in hop.selector and "=" not in document.frame_selector and hop.selector == document.frame_selector.lstrip("#").strip():
+            return True
+    return False
+
+
+def _document_id_for_recipe(
+    recipe: LocatorRecipe | None,
+    pages: list[ReplicaPage],
+    documents: list[ReplicaDocument],
+) -> str | None:
+    """Resolve the owning document id for a recorded locator recipe (closure #3).
+
+    Starts at ``recipe.page_var``'s entry document, then walks each ``frame_chain``
+    hop down the captured document hierarchy (matching ``frame_selector`` /
+    ``frame_id`` / ``frame_name``). Every hop must resolve to exactly one direct
+    child document; an ambiguous or unresolvable chain returns ``None`` rather
+    than guessing. This is the single owning-document rule used to mount the
+    meta-open target so nested-frame viewers never duplicate/misplace the trigger.
+    """
+    if recipe is None:
+        return None
+    page = next((page for page in pages if page.page_var == recipe.page_var), None)
+    if page is None:
+        return None
+    current = page.entry_document_id
+    for hop in recipe.frame_chain or []:
+        candidates = [
+            doc.document_id
+            for doc in documents
+            if doc.parent_document_id == current and _frame_hop_matches_document(hop, doc)
+        ]
+        if len(candidates) != 1:
+            return None
+        current = candidates[0]
+    return current
+
+
+def _synthetic_meta_open_target(
+    branch_id: str,
+    meta_open_recipe: LocatorRecipe | None,
+    document_id: str,
+    dom: DomNodeSnapshot | None = None,
+) -> ActionTarget:
+    return ActionTarget(
+        action_id=f"series:{branch_id}:meta_open",
+        marker_id="",
+        action_type="click",
+        action_source_kind="locator",
+        action_args={},
+        locator=meta_open_recipe,
+        dom=dom,
+        selector_closure=None,
+        point=None,
+        key=None,
+        replay_policy="execute",
+        skip_reason=None,
+        document_id=document_id,
+        transition_id=f"series:{branch_id}:meta_open",
+    )
+
+
+def _expansion_evidence(snapshots: list[SeriesBranchCapture], expansion_payload: dict[str, object] | None) -> SeriesExpansionEvidence:
+    """(P1#6) Aggregate flow-level expansion evidence using the discovery count.
+
+    ``discovered`` is frozen to the discovery's absolute count (from the capture
+    manifest when present) so skipped_budget / skipped_duplicate branches can
+    never be silently dropped from the denominator. The v2 schema has no
+    ``skipped_count`` field, so skipped entries are conservatively mapped to
+    ``partial`` (retaining the flow warning) — never discarded.
+    """
+    manifest = expansion_payload if isinstance(expansion_payload, dict) else {}
+    has_counts = any(key in manifest for key in ("discovered_count", "captured_count"))
+    if has_counts:
+        captured = int(manifest.get("captured_count") or 0)
+        partial = int(manifest.get("partial_count") or 0) + int(manifest.get("skipped_count") or 0)
+        failed = int(manifest.get("failed_count") or 0)
+        discovered = int(manifest.get("discovered_count") or (captured + partial + failed))
+    else:
+        # No manifest (e.g. unit-level fixtures): derive from the branch dirs,
+        # mapping any skipped terminal status to partial.
+        captured = sum(1 for s in snapshots if s.capture_status == "captured")
+        partial = sum(1 for s in snapshots if s.capture_status in ("partial", "skipped_budget", "skipped_duplicate"))
+        failed = sum(1 for s in snapshots if s.capture_status == "failed")
+        discovered = captured + partial + failed
+    reached_end = bool(manifest.get("reached_end")) if has_counts else bool((expansion_payload or {}).get("reached_end")) if expansion_payload else False
+    warning = manifest.get("warning") if has_counts else ((expansion_payload or {}).get("warning") if expansion_payload else None)
+    total_ms = int(manifest.get("total_duration_ms") or 0) if has_counts else (int((expansion_payload or {}).get("total_duration_ms") or 0) if expansion_payload else 0)
+    return SeriesExpansionEvidence(
+        discovered_count=discovered,
+        captured_count=captured,
+        partial_count=partial,
+        failed_count=failed,
+        reached_end=reached_end,
+        total_duration_ms=total_ms,
+        warning=warning,
+    )
 
 
 def _capture_to_manifest_core(
@@ -538,6 +2756,7 @@ def _capture_to_manifest_core(
     storage_state: str | Path | None,
     interactive_auth: bool,
     capture_timeout_s: int,
+    expansion_config: dict[str, object] | None = None,
 ) -> Path:
     """Shared capture-only body: run one instrumented replay and persist its manifest.
 
@@ -556,6 +2775,7 @@ def _capture_to_manifest_core(
         interactive_auth=interactive_auth,
         emit=notify,
         marker_annotations=marker_annotations,
+        expansion_config=expansion_config,
     )
     if result.returncode:
         notify({"event": "failed", "stage": "capture"})
@@ -585,6 +2805,7 @@ def capture_to_manifest(
     storage_state: str | Path | None = None,
     interactive_auth: bool = False,
     capture_timeout_s: int = 900,
+    expansion_config: dict[str, object] | None = None,
 ) -> Path:
     """Public capture-only boundary: validate annotations, replay, and persist a manifest.
 
@@ -598,6 +2819,7 @@ def capture_to_manifest(
     return _capture_to_manifest_core(
         script_path, capture_root, marker_annotations, notify,
         storage_state, interactive_auth, capture_timeout_s,
+        expansion_config=expansion_config,
     )
 
 
@@ -630,6 +2852,7 @@ def capture_and_build(
     interactive_auth: bool = False,
     capture_timeout_s: int = 900,
     annotations_path: str | Path | None = None,
+    expansion_config: dict[str, object] | None = None,
 ) -> Path:
     """Backward-compatible wrapper: capture to a manifest, then build the replica.
 
@@ -647,11 +2870,13 @@ def capture_and_build(
             script_path, annotations_path, capture_root, emit=notify,
             storage_state=storage_state, interactive_auth=interactive_auth,
             capture_timeout_s=capture_timeout_s,
+            expansion_config=expansion_config,
         )
     else:
         manifest_path = _capture_to_manifest_core(
             script_path, capture_root, None, notify,
             storage_state, interactive_auth, capture_timeout_s,
+            expansion_config=expansion_config,
         )
     entrypoint = build_from_manifest(
         manifest_path, capture_root, output_root / "replica",
@@ -841,10 +3066,24 @@ def main() -> None:
     parser.add_argument("--storage-state")
     parser.add_argument("--capture-timeout", type=int, default=900)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--expand-all-series", action="store_true")
+    parser.add_argument("--max-series", type=int, default=40)
+    parser.add_argument("--per-series-timeout", type=int, default=20)
+    parser.add_argument("--total-series-timeout", type=int, default=900)
+    parser.add_argument("--viewer-capture-mode", default="first_stable_frame")
     args = parser.parse_args()
     emit = lambda event: print(json.dumps(event, ensure_ascii=False), flush=True)
     storage_state = args.storage_state if args.auth_mode == "storage-state" else None
     interactive_auth = args.auth_mode == "interactive"
+    expansion_config = None
+    if args.expand_all_series:
+        expansion_config = {
+            "expand_all_series": True,
+            "max_series": args.max_series,
+            "per_series_timeout_s": args.per_series_timeout,
+            "total_series_timeout_s": args.total_series_timeout,
+            "viewer_capture_mode": args.viewer_capture_mode,
+        }
     if args.mode == "offline-build":
         if not args.manifest or not args.flow_root:
             parser.error("offline-build requires --manifest and --flow-root")
@@ -867,6 +3106,7 @@ def main() -> None:
                 emit=emit, storage_state=storage_state,
                 interactive_auth=interactive_auth,
                 capture_timeout_s=args.capture_timeout,
+                expansion_config=expansion_config,
             )
         except Exception as error:
             emit({"event": "failed", "category": classify_capture_error(error)})
@@ -889,6 +3129,7 @@ def main() -> None:
             interactive_auth=interactive_auth,
             capture_timeout_s=args.capture_timeout,
             annotations_path=args.annotations,
+            expansion_config=expansion_config,
         )
     except Exception as error:
         emit({"event": "failed", "category": classify_capture_error(error)})

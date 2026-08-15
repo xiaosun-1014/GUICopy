@@ -32,6 +32,13 @@ snapshots/
 replicas/
 annotations/
 
+# 多序列探索 / 复刻原始产物（敏感医疗数据，绝不提交）
+# 生产环境 capture 位于 out/{医院}/runs/{run_id}/capture（已由上方 out/ 覆盖）；
+# 这些仓库根级目录仅作防御性覆盖，避免任何未嵌套在 out 下的原始产物被跟踪。
+capture/
+spy/
+/out/**/series_branches/
+
 # 运行时产物（带时间戳）
 canvas_frames/*
 dicom_meta_*.json
@@ -40,6 +47,9 @@ report_*.png
 
 # 被录制进程持续覆盖的文件，不要纳入版本控制
 recorded_script.py
+
+# 调试/运行时日志
+debug.log
 
 # 废弃的临时文件
 *.tmp.*

@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>Multi-series anonymous fixture — popup viewer</title>
+<style>
+  body { font-family: sans-serif; margin: 10px; }
+  h1 { font-size: 15px; }
+  #series-list { height: 128px; width: 320px; overflow: auto; border: 1px solid #bbb; }
+  .item {
+    height: 24px; box-sizing: border-box; display: flex; align-items: center;
+    padding: 0 8px; border-bottom: 1px solid #eee; cursor: pointer;
+  }
+  .item[aria-selected="true"] { background: #dbe9ff; }
+  .series-frames { color: #666; margin-left: 6px; }
+  #viewer { margin-top: 10px; width: 320px; height: 90px; border: 2px solid #999;
+            display: flex; align-items: center; justify-content: center; }
+  #metadata { margin-top: 8px; width: 320px; border: 1px solid #aaa; padding: 6px;
+              font-family: monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+  <h1>Multi-series popup (anonymized)</h1>
+  <p class="muted">Popup document hosting the scrollable series list directly (no iframe).</p>
+  <section id="series-list" class="series-list" role="listbox" aria-label="Series list">
+    <div class="item" role="option" data-series="Coronal MIP" data-series-uid="uid-1992"
+         data-frame-count="362" data-viewer-key="vw-coronal-a" data-bg="#cfe8cf"
+         data-series-number="101" data-series-description="Coronal MIP thin"
+         data-series-instance-uid="1.2.826.0.1.3680043.2001.1992"
+         aria-selected="true" onclick="selectSeries(this)">
+      <span class="series-name">Coronal MIP</span><span class="series-frames">1.0 362幅</span>
+    </div>
+    <div class="item" role="option" data-series="Coronal MIP" data-series-uid="uid-2047"
+         data-frame-count="180" data-viewer-key="vw-coronal-b" data-bg="#f5e6c8"
+         data-series-number="102" data-series-description="Coronal MIP thick"
+         data-series-instance-uid="1.2.826.0.1.3680043.2001.2047"
+         aria-selected="false" onclick="selectSeries(this)">
+      <span class="series-name">Coronal MIP</span><span class="series-frames">3.0 180幅</span>
+    </div>
+    <div class="item" role="option" data-series="Axial" data-series-uid="uid-3011"
+         data-frame-count="400" data-viewer-key="vw-axial" data-bg="#d8e2f0"
+         data-series-number="201" data-series-description="Axial soft tissue"
+         data-series-instance-uid="1.2.826.0.1.3680043.2001.3011"
+         aria-selected="false" onclick="selectSeries(this)">
+      <span class="series-name">Axial</span><span class="series-frames">0.8 400幅</span>
+    </div>
+    <div class="item" role="option" data-series="Thin 1.0" data-series-uid="uid-4105"
+         data-frame-count="500" data-viewer-key="vw-thin" data-bg="#e6d8f0"
+         data-series-number="301" data-series-description="Thin bone"
+         data-series-instance-uid="1.2.826.0.1.3680043.2001.4105"
+         aria-selected="false" onclick="selectSeries(this)">
+      <span class="series-name">Thin 1.0</span><span class="series-frames">1.0 500幅</span>
+    </div>
+    <!-- SCROLL-REVEALED. -->
+    <div class="item" role="option" data-series="Sagittal" data-series-uid="uid-5209"
+         data-frame-count="120" data-viewer-key="vw-sagittal" data-bg="#f0d8d8"
+         data-series-number="401" data-series-description="Sagittal reformat"
+         data-series-instance-uid="1.2.826.0.1.3680043.2001.5209"
+         aria-selected="false" onclick="selectSeries(this)">
+      <span class="series-name">Sagittal</span><span class="series-frames">2.0 120幅</span>
+    </div>
+  </section>
+  <div id="viewer" data-viewer-key="vw-coronal-a" style="background:#cfe8cf">Viewer: Coronal MIP (uid-1992)</div>
+  <section id="metadata">
+    <div>SeriesNumber: <span id="meta-number">101</span></div>
+    <div>SeriesDescription: <span id="meta-desc">Coronal MIP thin</span></div>
+    <div>SeriesInstanceUID: <span id="meta-uid">1.2.826.0.1.3680043.2001.1992</span></div>
+  </section>
+
+  <script>
+    function selectSeries(el) {
+      document.querySelectorAll('#series-list .item').forEach(function (x) {
+        x.setAttribute('aria-selected', x === el ? 'true' : 'false');
+      });
+      var viewer = document.getElementById('viewer');
+      viewer.dataset.viewerKey = el.dataset.viewerKey;
+      viewer.style.background = el.dataset.bg;
+      viewer.textContent = 'Viewer: ' + el.dataset.series + ' (uid ' + el.dataset.seriesUid + ')';
+      document.getElementById('meta-number').textContent = el.dataset.seriesNumber;
+      document.getElementById('meta-desc').textContent = el.dataset.seriesDescription;
+      document.getElementById('meta-uid').textContent = el.dataset.seriesInstanceUid;
+    }
+  </script>
+</body>
+</html>

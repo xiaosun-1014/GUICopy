@@ -13,7 +13,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from pipeline_io import RunLayout, redact_payload
-from pipeline_models import PipelineConfig, PipelineStatus, StageResult
+from pipeline_models import PipelineConfig, PipelineStage, PipelineStatus, StageResult
 
 # Maps a validation stage value to the ``drivers`` report key.
 DRIVER_STAGE_KEYS = {
@@ -51,6 +51,33 @@ def _extract_drivers_and_capabilities(results: list[StageResult]) -> tuple[dict,
     return drivers, capabilities
 
 
+def extract_series_coverage(results: list[StageResult]) -> dict | None:
+    """Return the series-coverage summary attached to the LIVE_CAPTURE stage, or
+    ``None`` when no run carried one (e.g. expansion disabled / untouched)."""
+    for result in results:
+        if result.stage == PipelineStage.LIVE_CAPTURE:
+            coverage = (result.metrics or {}).get("series_coverage")
+            if isinstance(coverage, dict):
+                return coverage
+    return None
+
+
+def _empty_coverage(enabled: bool) -> dict:
+    """Default coverage payload when a run performed no series exploration."""
+    return {
+        "enabled": bool(enabled),
+        "status": "not_requested",
+        "discovered": 0,
+        "captured": 0,
+        "partial": 0,
+        "failed": 0,
+        "reached_end": False,
+        "expansion_completed": False,
+        "warning": None,
+        "branches": [],
+    }
+
+
 def write_pipeline_report(
     layout: RunLayout,
     config: PipelineConfig,
@@ -63,6 +90,9 @@ def write_pipeline_report(
     """
     status = aggregate_status(results)
     drivers, capabilities = _extract_drivers_and_capabilities(results)
+    series_coverage = extract_series_coverage(results) or _empty_coverage(
+        config.expand_all_series
+    )
     payload = redact_payload(
         {
             "schema_version": 1,
@@ -71,6 +101,7 @@ def write_pipeline_report(
             "status": status.value,
             "drivers": drivers,
             "capabilities": capabilities,
+            "series_coverage": series_coverage,
             "stages": [
                 {
                     **asdict(result),

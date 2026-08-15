@@ -7,10 +7,15 @@
 - TerminalGuard D4 终态唯一性（fatal/completed 顺序与次数）
 - redact seeded registry 脱敏
 """
+import json
 import unittest
 
 from orchestrator_events import (
+    ORCHESTRATOR_EVENT_NAMES,
+    RESERVED_TERMINAL_NAMES,
+    SERIES_EVENT_NAMES,
     MarkerTracker,
+    SeriesTracker,
     TerminalGuard,
     normalize_child_event,
     parse_envelope,
@@ -259,6 +264,137 @@ class TestRedact(unittest.TestCase):
 
     def test_empty_registry_no_change(self):
         self.assertEqual(redact("anything", []), "anything")
+
+
+class TestSeriesEventNamespace(unittest.TestCase):
+    """Phase 8: series_* events must not collide with the orchestrator reserved
+    names so that forwarded child events keep a clean top-level series_* name."""
+
+    def test_series_names_disjoint_from_orchestrator_reserved_names(self):
+        self.assertTrue(
+            SERIES_EVENT_NAMES.isdisjoint(ORCHESTRATOR_EVENT_NAMES),
+            f"collision: {SERIES_EVENT_NAMES & ORCHESTRATOR_EVENT_NAMES}",
+        )
+        self.assertTrue(
+            SERIES_EVENT_NAMES.isdisjoint(RESERVED_TERMINAL_NAMES),
+            f"collision with terminal: {SERIES_EVENT_NAMES & RESERVED_TERMINAL_NAMES}",
+        )
+
+    def test_forwarded_series_child_event_keeps_clean_top_level_name(self):
+        child = {"event": "series_discovered", "reached_end": True, "discovered": 3}
+        ev = normalize_child_event(child, "capturing_live", "run_1")
+        # Not renamed to capture_series_*: keeps prefix-free top-level name.
+        self.assertEqual(ev["event"], "series_discovered")
+        self.assertEqual(ev["payload"], child)
+
+    def test_series_capture_terminal_not_a_d4_business_terminal(self):
+        # series_expansion_completed is a phase-level terminal only: it must NOT be
+        # part of RESERVED_TERMINAL_NAMES and must not trip TerminalGuard as a
+        # business terminal.
+        self.assertNotIn("series_expansion_completed", RESERVED_TERMINAL_NAMES)
+        guard = TerminalGuard()
+        guard.note("series_discovery_started")
+        guard.note("series_expansion_completed")
+        guard.note("completed")  # the real business terminal still follows
+        self.assertTrue(guard.certify())
+
+
+class TestSeriesTracker(unittest.TestCase):
+    # A realistic clipped series event stream; fields are branch id / ordinal /
+    # counts / error type only — never patient text or full metadata.
+    STREAM = [
+        {"event": "series_discovery_started"},
+        {"event": "series_discovered", "reached_end": True, "discovered": 3},
+        {"event": "series_capture_started", "branch_id": "br0", "ordinal": 0},
+        {"event": "series_capture_completed", "branch_id": "br0", "ordinal": 0},
+        {"event": "series_capture_started", "branch_id": "br1", "ordinal": 1},
+        {"event": "series_capture_completed", "branch_id": "br1", "ordinal": 1},
+        {"event": "series_capture_started", "branch_id": "br2", "ordinal": 2},
+        {"event": "series_capture_partial", "branch_id": "br2", "ordinal": 2,
+         "error_type": "metadata_timeout"},
+        {"event": "series_expansion_completed"},
+    ]
+
+    def _run(self, stream):
+        tracker = SeriesTracker()
+        for event in stream:
+            tracker.note(event)
+        return tracker
+
+    def test_counts_reflect_captured_partial(self):
+        tracker = self._run(self.STREAM)
+        self.assertEqual(
+            tracker.counts(),
+            {"discovered": 3, "captured": 2, "partial": 1, "failed": 0},
+        )
+
+    def test_coverage_complete_when_reached_end_and_no_failures(self):
+        tracker = SeriesTracker()
+        for event in (
+            {"event": "series_discovered", "reached_end": True, "discovered": 2},
+            {"event": "series_capture_completed", "branch_id": "a", "ordinal": 0},
+            {"event": "series_capture_completed", "branch_id": "b", "ordinal": 1},
+            {"event": "series_expansion_completed"},
+        ):
+            tracker.note(event)
+        self.assertEqual(tracker.coverage()["status"], "complete")
+        self.assertTrue(tracker.coverage()["reached_end"])
+
+    def test_coverage_partial_on_any_branch_partial(self):
+        tracker = self._run(self.STREAM)
+        self.assertEqual(tracker.coverage()["status"], "partial")
+
+    def test_coverage_partial_when_list_not_reached_end(self):
+        tracker = SeriesTracker()
+        for event in (
+            {"event": "series_discovered", "reached_end": False, "discovered": 4,
+             "warning": "series_virtualized_partial"},
+            {"event": "series_capture_completed", "branch_id": "a", "ordinal": 0},
+        ):
+            tracker.note(event)
+        cov = tracker.coverage()
+        self.assertEqual(cov["status"], "partial")
+        self.assertEqual(cov["warning"], "series_virtualized_partial")
+
+    def test_coverage_failed_when_no_usable_viewer(self):
+        tracker = SeriesTracker()
+        tracker.note({"event": "series_discovered", "reached_end": False, "discovered": 0})
+        tracker.note({"event": "series_expansion_completed"})
+        self.assertEqual(tracker.coverage()["status"], "failed")
+
+    def test_coverage_failed_on_infrastructure_error(self):
+        tracker = SeriesTracker()
+        for event in (
+            {"event": "series_discovered", "reached_end": True, "discovered": 1},
+            {"event": "series_capture_failed", "branch_id": "a", "ordinal": 0,
+             "error_type": "infra_reload_exhausted"},
+        ):
+            tracker.note(event)
+        self.assertEqual(tracker.coverage()["status"], "failed")
+
+    def test_not_requested_when_no_series_events(self):
+        self.assertEqual(SeriesTracker().coverage()["status"], "not_requested")
+
+    def test_branch_summary_never_carries_patient_text(self):
+        tracker = self._run(self.STREAM)
+        cov = tracker.coverage()
+        for branch in cov["branches"]:
+            self.assertEqual(set(branch), {"branch_id", "ordinal", "status", "stage"})
+            serialized = json.dumps(branch)
+            self.assertNotIn("张三", serialized)
+            self.assertNotIn("PatientName", serialized)
+            self.assertNotIn("SeriesInstanceUID", serialized)
+
+    def test_note_ignores_unknown_event_kinds(self):
+        tracker = SeriesTracker()
+        tracker.note({"event": "progress", "stage": "capturing_live"})
+        self.assertEqual(tracker.coverage()["status"], "not_requested")
+        self.assertEqual(tracker.counts()["discovered"], 0)
+
+    def test_empty_coverage_is_not_enabled(self):
+        cov = SeriesTracker().coverage()
+        self.assertFalse(cov["enabled"])
+        self.assertFalse(cov["reached_end"])
 
 
 if __name__ == "__main__":

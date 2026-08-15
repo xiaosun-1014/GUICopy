@@ -9,6 +9,7 @@ from playwright.sync_api import sync_playwright
 from build_replica import build_replica
 from replay_helpers import ReplicaServer
 from replay_helpers import sha256_file
+from replay_helpers import series_key_slug
 from replica_models import (
     ActionTarget,
     BootstrapPlan,
@@ -17,10 +18,12 @@ from replica_models import (
     InteractionRegion,
     LocatorRecipe,
     Rect,
+    RegionMember,
     ReplicaDocument,
     ReplicaFlow,
     ReplicaPage,
     ReplicaState,
+    ReplicaTransition,
     StateEvidence,
 )
 
@@ -76,6 +79,47 @@ class BuildReplicaTests(unittest.TestCase):
                 self.assertEqual(page.frame_locator("#viewer").locator("body").count(), 1)
                 browser.close()
 
+    def test_fill_followed_by_enter_stays_editable_until_enter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir()
+            (root / "assets" / "main.png").write_bytes(b"png")
+            input_node = DomNodeSnapshot(
+                "input", "", {"id": "wl", "value": "40"}, Rect(10, 20, 80, 30, "page_viewport_css"),
+                '<input id="wl" value="40">', {"display": "block"},
+            )
+            locator = LocatorRecipe('page.locator("#wl")', "page", [], "css", {"args": ["#wl"]}, None, None)
+            fill = ActionTarget("a_fill", "m_wl", "fill", "locator", {"args": ["0"]}, locator, input_node, None, None, None, "execute", None, "d_main", "t_fill")
+            press = ActionTarget("a_enter", "m_wl", "press", "locator", {"args": ["Enter"]}, locator, input_node, None, None, None, "execute", None, "d_main", "t_enter")
+            page_model = ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)
+            evidence = StateEvidence(False, False, False, False, 0, 0, 0, 0, "state")
+            states = [
+                ReplicaState("s_000", 0, "", "page", [page_model], [ReplicaDocument("d_main", "p_main", "page", "main", None, None, None, None, {"width": 200, "height": 100}, 1, "css", 0, 0, "assets/main.png", "main", 3, targets=[fill])], [ReplicaTransition("t_fill", "a_fill", "s_000", "s_001", "page", "page", "same_page")], evidence),
+                ReplicaState("s_001", 1, "", "page", [page_model], [ReplicaDocument("d_main", "p_main", "page", "main", None, None, None, None, {"width": 200, "height": 100}, 1, "css", 0, 0, "assets/main.png", "main", 3, targets=[press])], [ReplicaTransition("t_enter", "a_enter", "s_001", "s_002", "page", "page", "same_page")], evidence),
+                ReplicaState("s_002", 2, "", "page", [page_model], [ReplicaDocument("d_main", "p_main", "page", "main", None, None, None, None, {"width": 200, "height": 100}, 1, "css", 0, 0, "assets/main.png", "main", 3, targets=[press])], [], evidence),
+            ]
+            flow = ReplicaFlow(1, "editable", "recorded.py", "hash", "now", {"width": 200, "height": 100}, BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000", states, [])
+            output = root / "replica"
+            build_replica(flow, root, output)
+
+            with ReplicaServer(output) as server, sync_playwright() as playwright:
+                browser = playwright.chromium.launch()
+                page = browser.new_page()
+                page.goto(server.url)
+                field = page.locator("#wl")
+                field.click()
+                self.assertEqual(field.input_value(), "40")
+                self.assertEqual(field.get_attribute("autocomplete"), "off")
+                self.assertEqual(field.evaluate("element => getComputedStyle(element).opacity"), "1")
+                field.fill("125")
+                self.assertEqual(page.url, server.url)
+                self.assertEqual(field.input_value(), "125")
+                field.press("Enter")
+                page.wait_for_url("**/states/s_002/index.html")
+                self.assertIn("/states/s_002/index.html", page.url)
+                self.assertEqual(page.locator("#wl").input_value(), "125")
+                browser.close()
+
     def test_metadata_region_renders_complete_scrollable_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -111,6 +155,7 @@ class BuildReplicaTests(unittest.TestCase):
             rendered = (output / "index.html").read_text(encoding="utf-8")
 
             self.assertIn('data-replica-panel-region="r_meta"', rendered)
+            self.assertIn('class="replica-metadata"', rendered)
             self.assertIn("Final Metadata Row", rendered)
             self.assertIn("overflow-y:auto", rendered)
             with ReplicaServer(output) as server, sync_playwright() as playwright:
@@ -121,6 +166,215 @@ class BuildReplicaTests(unittest.TestCase):
                     "element => ({clientHeight: element.clientHeight, scrollHeight: element.scrollHeight})"
                 )
                 self.assertGreater(scroll_state["scrollHeight"], scroll_state["clientHeight"])
+                browser.close()
+
+    def test_metadata_members_are_not_rendered_twice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir()
+            (root / "assets" / "main.png").write_bytes(b"png")
+            member_dom = DomNodeSnapshot(
+                "div", "Patient Name", {"id": "patient-name"},
+                Rect(50, 80, 120, 20, "page_viewport_css"),
+                '<div id="patient-name">Patient Name</div>', {"display": "block"},
+            )
+            panel = DomNodeSnapshot(
+                "div", "Patient Name", {"id": "tagsBox"},
+                Rect(40, 50, 300, 120, "page_viewport_css"),
+                '<div id="tagsBox"><div id="patient-name">Patient Name</div></div>',
+                {"display": "block"},
+            )
+            region = InteractionRegion(
+                "r_meta", "metadata", "d_main", panel,
+                [RegionMember("member", "div", member_dom)], None,
+            )
+            document = ReplicaDocument(
+                "d_main", "p_main", "page", "main", None, None, None, None,
+                {"width": 800, "height": 600}, 1, "css", 0, 0,
+                "assets/main.png", "main", 3, regions=[region],
+            )
+            flow = ReplicaFlow(
+                1, "meta", "recorded.py", "hash", "now", {"width": 800, "height": 600},
+                BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000",
+                [ReplicaState(
+                    "s_000", 0, "", "page",
+                    [ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)],
+                    [document], [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry"),
+                )], [],
+            )
+
+            output = root / "replica"
+            build_replica(flow, root, output)
+            rendered = (output / "index.html").read_text(encoding="utf-8")
+
+            self.assertEqual(rendered.count('id="patient-name"'), 1)
+
+    def test_metadata_close_action_is_embedded_in_original_dom_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir()
+            (root / "assets" / "main.png").write_bytes(b"png")
+            close = DomNodeSnapshot(
+                "a", "", {"class": "close"}, Rect(770, 0, 30, 30, "page_viewport_css"),
+                '<a class="close"><i class="icon icon-close"></i></a>', {"display": "block"},
+            )
+            panel = DomNodeSnapshot(
+                "div", "Patient Metadata", {"id": "tagsBox", "class": "box-tags"},
+                Rect(0, 0, 800, 600, "page_viewport_css"),
+                '<div id="tagsBox" class="box-tags"><div>Patient Metadata</div>'
+                '<a class="close"><i class="icon icon-close"></i></a></div>',
+                {"display": "block"},
+            )
+            target = ActionTarget(
+                "a_close", "m_meta", "click", "locator", {},
+                LocatorRecipe('page.locator("#tagsBox a.close")', "page", [], "css", {"args": ["#tagsBox a.close"]}, None, None),
+                close, None, None, None, "execute", None, "d_main", None,
+            )
+            document = ReplicaDocument(
+                "d_main", "p_main", "page", "main", None, None, None, None,
+                {"width": 800, "height": 600}, 1, "css", 0, 0,
+                "assets/main.png", "main", 3, targets=[target],
+                regions=[InteractionRegion("r_meta", "metadata", "d_main", panel, [], None)],
+            )
+            flow = ReplicaFlow(
+                1, "close", "recorded.py", "hash", "now", {"width": 800, "height": 600},
+                BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000",
+                [ReplicaState(
+                    "s_000", 0, "", "page",
+                    [ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)],
+                    [document], [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry"),
+                )], [],
+            )
+
+            output = root / "replica"
+            build_replica(flow, root, output)
+            rendered = (output / "index.html").read_text(encoding="utf-8")
+
+            self.assertEqual(rendered.count('data-replica-action="a_close"'), 1)
+            self.assertEqual(rendered.count('id="tagsBox"'), 1)
+            self.assertNotIn("data-replica-back", rendered)
+            self.assertIn("data-replica-panel-close", rendered)
+
+    def test_tags_icon_is_not_rendered_as_metadata_panel_or_close_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir()
+            (root / "assets" / "main.png").write_bytes(b"png")
+            icon = DomNodeSnapshot(
+                "i", "", {"class": "icon icon-tags"},
+                Rect(700, 50, 20, 21, "page_viewport_css"),
+                '<i class="icon icon-tags"></i>', {"display": "inline"},
+            )
+            tags = DomNodeSnapshot(
+                "a", "Tags", {"class": "tool tool-tags", "title": "Tags"},
+                Rect(690, 40, 40, 40, "page_viewport_css"),
+                '<a class="tool tool-tags" title="Tags">Tags</a>', {"display": "block"},
+            )
+            target = ActionTarget(
+                "a_tags", "m_meta", "click", "locator", {},
+                LocatorRecipe('page.get_by_title("Tags")', "page", [], "title", {"args": ["Tags"]}, None, None),
+                tags, None, None, None, "execute", None, "d_main", None,
+            )
+            document = ReplicaDocument(
+                "d_main", "p_main", "page", "main", None, None, None, None,
+                {"width": 800, "height": 600}, 1, "css", 0, 0,
+                "assets/main.png", "main", 3, targets=[target],
+                regions=[InteractionRegion("r_icon", "metadata", "d_main", icon, [], None)],
+            )
+            flow = ReplicaFlow(
+                1, "icon", "recorded.py", "hash", "now", {"width": 800, "height": 600},
+                BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000",
+                [ReplicaState(
+                    "s_000", 0, "", "page",
+                    [ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)],
+                    [document], [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry"),
+                )], [],
+            )
+
+            output = root / "replica"
+            build_replica(flow, root, output)
+            rendered = (output / "index.html").read_text(encoding="utf-8")
+
+            self.assertNotIn("data-replica-panel-region", rendered)
+            self.assertNotIn("data-replica-back", rendered)
+            self.assertEqual(rendered.count('data-replica-action="a_tags"'), 1)
+            self.assertIn('role="link"', rendered)
+            with ReplicaServer(output) as server, sync_playwright() as playwright:
+                browser = playwright.chromium.launch()
+                page = browser.new_page()
+                page.goto(server.url)
+                self.assertEqual(page.get_by_role("link").filter(has_text="Tags").count(), 1)
+                browser.close()
+
+    def test_replica_scales_to_fit_smaller_viewport(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir()
+            (root / "assets" / "main.png").write_bytes(b"png")
+            document = ReplicaDocument(
+                "d_main", "p_main", "page", "main", None, None, None, None,
+                {"width": 800, "height": 600}, 1, "css", 0, 0,
+                "assets/main.png", "main", 3,
+            )
+            flow = ReplicaFlow(
+                1, "responsive", "recorded.py", "hash", "now", {"width": 800, "height": 600},
+                BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000",
+                [ReplicaState(
+                    "s_000", 0, "", "page",
+                    [ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)],
+                    [document], [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry"),
+                )], [],
+            )
+            output = root / "replica"
+            build_replica(flow, root, output)
+
+            with ReplicaServer(output) as server, sync_playwright() as playwright:
+                browser = playwright.chromium.launch()
+                page = browser.new_page(viewport={"width": 400, "height": 300})
+                page.goto(server.url)
+                box = page.locator(".replica").bounding_box()
+                self.assertAlmostEqual(box["width"], 400, delta=1)
+                self.assertAlmostEqual(box["height"], 300, delta=1)
+                self.assertGreaterEqual(box["x"], -1)
+                self.assertGreaterEqual(box["y"], -1)
+                self.assertLessEqual(box["x"] + box["width"], 401)
+                self.assertLessEqual(box["y"] + box["height"], 301)
+                self.assertEqual(page.evaluate("document.documentElement.scrollWidth"), 400)
+                browser.close()
+
+    def test_replica_scales_up_to_fill_larger_viewport_and_versions_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir()
+            (root / "assets" / "main.png").write_bytes(b"png")
+            document = ReplicaDocument(
+                "d_main", "p_main", "page", "main", None, None, None, None,
+                {"width": 800, "height": 600}, 1, "css", 0, 0,
+                "assets/main.png", "main", 3,
+            )
+            flow = ReplicaFlow(
+                1, "responsive-large", "recorded.py", "hash", "now", {"width": 800, "height": 600},
+                BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000",
+                [ReplicaState(
+                    "s_000", 0, "", "page",
+                    [ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)],
+                    [document], [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry"),
+                )], [],
+            )
+            output = root / "replica"
+            build_replica(flow, root, output)
+            rendered = (output / "index.html").read_text(encoding="utf-8")
+
+            self.assertRegex(rendered, r'replica_runtime\.js\?v=[0-9a-f]{12}')
+            with ReplicaServer(output) as server, sync_playwright() as playwright:
+                browser = playwright.chromium.launch()
+                page = browser.new_page(viewport={"width": 1200, "height": 900})
+                page.goto(server.url)
+                box = page.locator(".replica").bounding_box()
+                self.assertAlmostEqual(box["width"], 1200, delta=1)
+                self.assertAlmostEqual(box["height"], 900, delta=1)
+                self.assertEqual(page.evaluate("document.documentElement.scrollWidth"), 1200)
+                self.assertEqual(page.evaluate("document.documentElement.scrollHeight"), 900)
                 browser.close()
 
     def test_non_entry_metadata_page_renders_panel_and_close_back_button(self):
@@ -310,6 +564,41 @@ class BuildReplicaTests(unittest.TestCase):
             self.assertIn(f"assets/by-hash/{sha256_file(root / 'assets' / 'first.png')}.png", (output / "index.html").read_text(encoding="utf-8"))
             self.assertIn(f"assets/by-hash/{sha256_file(root / 'assets' / 'second.png')}.png", (output / "states" / "s_001" / "index.html").read_text(encoding="utf-8"))
 
+
+    def test_series_members_receive_route_key_and_route_map_is_injected(self):
+        from test.test_replica_runtime import _build_series_flow, _write_assets
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_assets(root)
+            flow = _build_series_flow()
+            output = root / "replica"
+            build_replica(flow, root, output)
+
+            # Every series-region member is route-keyed in every document that
+            # carries the series list (hub and all viewer states).
+            hub = (output / "index.html").read_text(encoding="utf-8")
+            for key in ("A", "B", "C", "D"):
+                self.assertIn(f'data-replica-series-key="{series_key_slug(key)}"', hub)
+            self.assertIn('role="option"', hub)
+            self.assertIn('aria-selected="true"', hub)  # hub marks A selected
+            # Failed branch is flagged disabled in the markup.
+            self.assertIn(f'data-replica-series-key="{series_key_slug("D")}"', hub)
+            self.assertIn('aria-disabled="true"', hub)  # D carries disabled state
+            self.assertIn("window.__REPLICA_SERIES_ROUTE__", hub)
+            # The raw series_key (which may be a real SeriesInstanceUID) must
+            # never be written verbatim into the served HTML.
+            self.assertNotIn("data-replica-series-key=\"B\"", hub)
+            self.assertNotIn('"A": {', hub)
+
+            # A viewer state's series region also carries route keys so a user can
+            # jump directly between series without returning to the hub.
+            vb = (output / "states" / "s_vb" / "index.html").read_text(encoding="utf-8")
+            for key in ("A", "B", "C"):
+                self.assertIn(f'data-replica-series-key="{series_key_slug(key)}"', vb)
+            # B is the active series in its own viewer state.
+            self.assertIn(f'data-replica-series-key="{series_key_slug("B")}"', vb)
+            self.assertIn('aria-disabled="true"', vb)
 
     def test_builder_fails_when_required_screenshot_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:

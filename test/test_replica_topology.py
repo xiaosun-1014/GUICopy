@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from PIL import Image, ImageStat
 from playwright.sync_api import sync_playwright
 
 from capture_snapshot import capture_page_topology
@@ -32,6 +33,8 @@ class ReplicaTopologyTests(unittest.TestCase):
             self.assertEqual(inner.parent_document_id, next(document.document_id for document in main_documents if document.frame_name == "viewerHost"))
             self.assertTrue((Path(tmp) / inner.screenshot_asset_relpath).exists())
             self.assertTrue((Path(tmp) / inner.screenshot_asset_relpath).with_suffix(".jpeg").exists())
+            with Image.open(Path(tmp) / inner.screenshot_asset_relpath) as image:
+                self.assertGreater(ImageStat.Stat(image.convert("L")).stddev[0], 1.0)
             browser.close()
 
 

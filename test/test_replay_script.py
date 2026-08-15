@@ -1,11 +1,138 @@
+import ast
 import tempfile
 import unittest
 import importlib.util
 from pathlib import Path
 from urllib.request import urlopen
 
+from batch_capture_replicate import classify_recording_template, instrument_marked_actions
 from replay_helpers import ReplicaServer
-from rewrite_script import generate_replay_script, generate_serve_script
+from rewrite_script import generate_replay_script, generate_serve_script, parse_action_plan
+
+
+EXPANSION_SOURCE = '''from playwright.sync_api import sync_playwright
+
+def run():
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        # [MARKER: 序列选择]
+        page.locator("#series").click()
+        # [MARKER: Meta 信息工具]
+        page.locator("#meta-open").click()
+        # [MARKER: Meta 信息工具]
+        page.locator("#meta-close").click()
+        browser.close()
+
+run()
+'''
+
+EXPANSION_CONFIG = {
+    "expand_all_series": True,
+    "max_series": 40,
+    "per_series_timeout_s": 20,
+    "total_series_timeout_s": 600,
+    "viewer_capture_mode": "first_stable_frame",
+}
+
+
+class ExpansionHookInjectionTests(unittest.TestCase):
+    def test_template_classification_detects_series_open_close(self):
+        plan = parse_action_plan(EXPANSION_SOURCE)
+        template = classify_recording_template(plan)
+        self.assertTrue(template.complete)
+        self.assertEqual(template.series_action.action_id, "a_000_001")
+        self.assertEqual(template.metadata_open.action_id, "a_001_001")
+        self.assertEqual(template.metadata_close.action_id, "a_002_001")
+
+    def test_expansion_hook_imported_only_when_enabled(self):
+        instrumented = instrument_marked_actions(EXPANSION_SOURCE, expansion_config=EXPANSION_CONFIG)
+        self.assertIn("capture_hook_expand_series", instrumented)
+        self.assertTrue(
+            instrumented.startswith(
+                "from batch_capture_replicate import capture_hook_after, capture_hook_before, capture_hook_expand_series, capture_hook_failed"
+            )
+        )
+
+    def test_no_expansion_hook_by_default(self):
+        instrumented = instrument_marked_actions(EXPANSION_SOURCE)
+        self.assertNotIn("capture_hook_expand_series", instrumented)
+        self.assertIn("capture_hook_after", instrumented)
+        self.assertNotIn("capture_hook_expand_series", instrumented)
+
+    def test_expansion_hook_follows_close_after_and_precedes_browser_close(self):
+        instrumented = instrument_marked_actions(EXPANSION_SOURCE, expansion_config=EXPANSION_CONFIG)
+        ast.parse(instrumented)
+        after_pos = instrumented.find('capture_hook_after("a_002_001"')
+        expand_pos = instrumented.find("capture_hook_expand_series(page, lambda:")
+        close_pos = instrumented.find("browser.close()")
+        self.assertGreater(after_pos, -1)
+        self.assertGreater(expand_pos, -1)
+        self.assertGreater(close_pos, -1)
+        self.assertLess(after_pos, expand_pos)
+        self.assertLess(expand_pos, close_pos)
+        # The expansion trigger carries the stable series + close action ids.
+        self.assertIn("a_000_001", instrumented[expand_pos:])
+        self.assertIn("a_002_001", instrumented[expand_pos:])
+        # Expansion never fires for the open or series actions.
+        self.assertEqual(instrumented.count("capture_hook_expand_series("), 1)
+
+    def test_expansion_hook_sits_in_same_else_branch_as_close_after(self):
+        # Both the close action's after-hook and the expansion hook must be the
+        # immediate children of the same success ``else:`` (same indentation).
+        # When the close action throws, the except branch runs and NEITHER the
+        # after-hook NOR the expansion runs.
+        instrumented = instrument_marked_actions(EXPANSION_SOURCE, expansion_config=EXPANSION_CONFIG)
+        lines = instrumented.splitlines()
+        try_idx = next(i for i, line in enumerate(lines) if 'page.locator("#meta-close").click()' in line)
+        self.assertEqual(lines[try_idx].lstrip(), 'page.locator("#meta-close").click()')
+        self.assertTrue(lines[try_idx + 1].lstrip().startswith("except Exception as error:"))
+        else_idx = next(i for i in range(try_idx + 1, len(lines)) if lines[i].lstrip() == "else:")
+        after_idx = next(i for i in range(else_idx + 1, len(lines)) if 'capture_hook_after("a_002_001"' in lines[i])
+        expand_idx = next(i for i in range(else_idx + 1, len(lines)) if "capture_hook_expand_series(" in lines[i])
+        self.assertEqual(
+            len(lines[after_idx]) - len(lines[after_idx].lstrip()),
+            len(lines[expand_idx]) - len(lines[expand_idx].lstrip()),
+        )
+        self.assertLess(after_idx, expand_idx)
+
+    def test_marked_actions_run_exactly_once_without_expansion(self):
+        instrumented = instrument_marked_actions(EXPANSION_SOURCE)
+        # Each marked action's before/after must appear exactly once; the
+        # original actions are not duplicated by instrumentation.
+        for action_id in ("a_000_001", "a_001_001", "a_002_001"):
+            self.assertEqual(instrumented.count(f'capture_hook_before("{action_id}"'), 1)
+            self.assertEqual(instrumented.count(f'capture_hook_after("{action_id}"'), 1)
+            self.assertEqual(instrumented.count(f'capture_hook_failed("{action_id}"'), 1)
+
+    def test_incomplete_template_raises_when_expansion_requested(self):
+        incomplete = '''from playwright.sync_api import sync_playwright
+
+def run():
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        # [MARKER: 序列选择]
+        page.locator("#series").click()
+        # [MARKER: Meta 信息工具]
+        page.locator("#meta-open").click()
+        browser.close()
+
+run()
+'''
+        with self.assertRaisesRegex(ValueError, "Metadata open and a Metadata close"):
+            instrument_marked_actions(incomplete, expansion_config=EXPANSION_CONFIG)
+        self.assertFalse(classify_recording_template(parse_action_plan(incomplete)).complete)
+
+    def test_dblclick_series_activation_is_inherited(self):
+        source = EXPANSION_SOURCE.replace('page.locator("#series").click()', 'page.locator("#series").dblclick()')
+        instrumented = instrument_marked_actions(source, expansion_config=EXPANSION_CONFIG)
+        # The inherited activation stays whatever the human recorded (dblclick) and
+        # the expansion trigger still carries the series locator factory.
+        self.assertIn('page.locator("#series").dblclick()', instrumented)
+        self.assertIn("capture_hook_expand_series(page, lambda:", instrumented)
+        self.assertIn("a_000_001", instrumented)
+        self.assertIn("a_002_001", instrumented)
 
 
 class ReplicaServerTests(unittest.TestCase):

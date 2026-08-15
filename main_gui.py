@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import uuid
 from collections import defaultdict, deque
@@ -35,6 +36,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
@@ -45,6 +47,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QSplitter,
     QStatusBar,
     QVBoxLayout,
@@ -54,7 +57,12 @@ from PyQt6.QtWidgets import (
 from agent import parse_markers
 from codegen_manager import CodegenManager
 from markers import DEFAULT_MARKERS, Marker, render
-from orchestrator_events import MarkerTracker, MARKER_STATUSES
+from orchestrator_events import (
+    SERIES_EVENT_NAMES,
+    MarkerTracker,
+    SeriesTracker,
+    MARKER_STATUSES,
+)
 from replica_annotation_panel import ReplicaAnnotationPanel
 from rewrite_script import (
     LocatorEditError,
@@ -74,6 +82,16 @@ FTIMAGE_URL = os.environ.get(
     "https://yyx.ftimage.cn/dimage/index.html",
 )
 FTIMAGE_OUTPUT = PROJECT_ROOT / "out" / "ftimage" / "processed_script_ftimage.py"
+
+# Phase 8 series-expansion defaults. Mirror ``PipelineConfig`` (pipeline_models.py)
+# safe defaults so the GUI and the orchestrator agree even before a run is saved.
+SERIES_EXPAND_DEFAULT = False
+SERIES_MAX_DEFAULT = 40
+SERIES_PER_TIMEOUT_DEFAULT = 20
+SERIES_TOTAL_TIMEOUT_DEFAULT = 900
+# MVP capture modes: only first_stable_frame is implemented. Do NOT expose an
+# un-implemented "all frames" option as selectable.
+SERIES_CAPTURE_MODES = ("first_stable_frame",)
 
 
 def replica_python_executable() -> str:
@@ -105,6 +123,22 @@ def normalize_ftimage_codegen(source: str) -> str:
     return source.replace(
         'page.get_by_role("link").filter(has_text=re.compile(r"^$")).click()',
         'page.locator("#tagsBox a.close").click()',
+    )
+
+
+_PAGE_GOTO_URL_RE = re.compile(
+    r'(?m)^(?P<prefix>\s*page\.goto\(\s*)(?:"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')'
+)
+
+
+def preserve_entry_url(source: str, entry_url: str) -> str:
+    """Keep the user-supplied recording URL as the replay entry point."""
+    if not entry_url:
+        return source
+    return _PAGE_GOTO_URL_RE.sub(
+        lambda match: match.group("prefix") + json.dumps(entry_url, ensure_ascii=False),
+        source,
+        count=1,
     )
 
 
@@ -449,6 +483,7 @@ class MainWindow(QMainWindow):
         self._manager: CodegenManager | None = None
         self._export_process: QProcess | None = None
         self._latest_code = ""
+        self._entry_url = ""
         self._saved_source_hash: str | None = None
 
         # ---- pipeline orchestrator state (per-stream JSONL buffering) ----
@@ -463,6 +498,8 @@ class MainWindow(QMainWindow):
         self._kill_timer: Optional[QTimer] = None
         # D3 marker_result upsert + summary overlay (counts semantic)
         self._marker_tracker = MarkerTracker()
+        # Phase 8: series expansion progress (discovered/captured/partial/failed).
+        self._series_tracker = SeriesTracker()
 
         # ---- 数据模型：有序行列表 ----
         # 每项: {"type": "codegen"|"marker", "text": str}
@@ -578,6 +615,40 @@ class MainWindow(QMainWindow):
         layout.addLayout(out_row)
         layout.addLayout(ctrl_row)
 
+        # ---- Phase 8: series-expansion configuration (opt-in, default OFF) ----
+        series_row = QHBoxLayout()
+        self.expand_all_series_chk = QCheckBox("自动探索全部序列")
+        self.expand_all_series_chk.setChecked(SERIES_EXPAND_DEFAULT)
+        self.expand_all_series_chk.stateChanged.connect(self._sync_series_controls)
+        series_row.addWidget(self.expand_all_series_chk)
+        series_row.addWidget(QLabel("最大序列数:"))
+        self.max_series_spin = QSpinBox()
+        self.max_series_spin.setRange(1, 100)
+        self.max_series_spin.setValue(SERIES_MAX_DEFAULT)
+        series_row.addWidget(self.max_series_spin)
+        series_row.addWidget(QLabel("单序列超时(s):"))
+        self.per_series_timeout_spin = QSpinBox()
+        self.per_series_timeout_spin.setRange(1, 3600)
+        self.per_series_timeout_spin.setValue(SERIES_PER_TIMEOUT_DEFAULT)
+        series_row.addWidget(self.per_series_timeout_spin)
+        series_row.addWidget(QLabel("总超时(s):"))
+        self.total_series_timeout_spin = QSpinBox()
+        self.total_series_timeout_spin.setRange(1, 3600)
+        self.total_series_timeout_spin.setValue(SERIES_TOTAL_TIMEOUT_DEFAULT)
+        series_row.addWidget(self.total_series_timeout_spin)
+        series_row.addWidget(QLabel("capture 模式:"))
+        self.viewer_capture_mode_combo = QComboBox()
+        for mode in SERIES_CAPTURE_MODES:
+            self.viewer_capture_mode_combo.addItem(mode, mode)
+        series_row.addWidget(self.viewer_capture_mode_combo)
+        self.series_status_label = QLabel("")
+        self.series_status_label.setStyleSheet("color: #555;")
+        series_row.addSpacing(8)
+        series_row.addWidget(self.series_status_label)
+        series_row.addStretch(1)
+        layout.addLayout(series_row)
+        self._sync_series_controls()
+
         self.annotation_panel = ReplicaAnnotationPanel()
         self.annotation_panel.source_jump_requested.connect(
             self._select_source_span
@@ -644,6 +715,7 @@ class MainWindow(QMainWindow):
             on_update=self._on_update_from_worker,
             desktop_size=(available_geometry.width(), available_geometry.height()),
         )
+        self._entry_url = url
 
         try:
             self._manager.start(url)
@@ -765,6 +837,8 @@ class MainWindow(QMainWindow):
         self._output_root = output_root
         self._pipeline_cancel_requested = False
         self._marker_tracker = MarkerTracker()
+        self._series_tracker = SeriesTracker()
+        self.series_status_label.setText("")
 
         process = QProcess(self)
         process.setProgram(interpreter)
@@ -776,6 +850,7 @@ class MainWindow(QMainWindow):
             "--output-root", str(output_root),
             "--auth-mode", str(self.replica_auth_mode.currentData()),
             "--operation", str(operation),
+            *self.series_config_args(),
         ])
         process.readyReadStandardOutput.connect(lambda: self._on_export_output("stdout"))
         process.readyReadStandardError.connect(lambda: self._on_export_output("stderr"))
@@ -910,6 +985,11 @@ class MainWindow(QMainWindow):
             self._show_status(f"离线复刻 {stage}…", 5000)
             return
 
+        if kind in SERIES_EVENT_NAMES:
+            # Phase 8: series expansion progress (discovered/captured/partial/failed).
+            self._on_series_event(event)
+            return
+
         # fall back for any other event kinds
         self._show_status(f"离线复刻：{kind}", 5000)
 
@@ -1015,6 +1095,59 @@ class MainWindow(QMainWindow):
         else:
             self.export_replica_btn.setText("⚙️ 生成 Adapter + 离线复刻")
 
+    # ---------- Phase 8: series-expansion config + progress display ----------
+    def _sync_series_controls(self) -> None:
+        """Enable budget controls only when all-series discovery is on.
+
+        The MVP capture mode combo stays enabled but only offers the implemented
+        ``first_stable_frame`` mode (no un-implemented all-frames option).
+        """
+        enabled = self.expand_all_series_chk.isChecked()
+        for control in (
+            self.max_series_spin,
+            self.per_series_timeout_spin,
+            self.total_series_timeout_spin,
+        ):
+            control.setEnabled(enabled)
+        if not enabled:
+            self.series_status_label.setText("")
+            self._series_tracker = SeriesTracker()
+
+    def series_config_args(self) -> list[str]:
+        """Return the CLI args for series expansion (empty when disabled).
+
+        Deliberately mirrors the orchestrator's ``--expand-all-series`` / budget
+        flags so the GUI and the child pipeline agree on what was requested.
+        """
+        if not self.expand_all_series_chk.isChecked():
+            return []
+        return [
+            "--expand-all-series",
+            "--max-series", str(self.max_series_spin.value()),
+            "--per-series-timeout", str(self.per_series_timeout_spin.value()),
+            "--total-series-timeout", str(self.total_series_timeout_spin.value()),
+            "--viewer-capture-mode", str(self.viewer_capture_mode_combo.currentData()),
+        ]
+
+    def _on_series_event(self, event: dict) -> None:
+        """Track a ``series_*`` event and show discovered/captured/partial/failed.
+
+        Forwarded child events carry the real fields under ``payload`` (child's
+        raw JSON); orchestrator-origin events carry them at top level. ``note``
+        tolerates both since it reads ``event['event']`` for the kind.
+        """
+        child = event.get("payload") if isinstance(event.get("payload"), dict) else event
+        self._series_tracker.note(child)
+        counts = self._series_tracker.counts()
+        coverage = self._series_tracker.coverage()
+        label = (
+            f"序列: 发现 {counts['discovered']} | "
+            f"成功 {counts['captured']} | 部分 {counts['partial']} | "
+            f"失败 {counts['failed']} | {coverage['status']}"
+        )
+        self.series_status_label.setText(label)
+        self._show_status(f"离线复刻序列探索：{label}", 5000)
+
     def _on_clear(self) -> None:
         self._display_items.clear()
         self._marker_anchors.clear()
@@ -1096,7 +1229,8 @@ class MainWindow(QMainWindow):
         必须每次用全量 codegen 内容替换所有 codegen 条目，
         然后将 marker 按【codegen 序列偏移 + 指纹】重新定位（见 relocate_markers）。
         """
-        new_codegen_lines = normalize_ftimage_codegen(code).splitlines()
+        normalized = normalize_ftimage_codegen(code)
+        new_codegen_lines = preserve_entry_url(normalized, self._entry_url).splitlines()
 
         if not self._panel_initialized:
             # 首次：用全部 codegen 内容初始化
