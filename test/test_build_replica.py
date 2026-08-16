@@ -766,6 +766,40 @@ class BuildReplicaTests(unittest.TestCase):
             self.assertIn('<section class="overlay">', guard_html)
             self.assertNotIn('overflow-y:auto;max-height:200px', guard_html)
 
+    def test_meta_two_step_augmentation_synthesizes_tags_menu_state(self):
+        from test.test_replica_runtime import _augment_meta_flow, _build_series_flow, _write_assets
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_assets(root)
+            flow = _augment_meta_flow()
+            output = root / "replica"
+            build_replica(flow, root, output)
+
+            # Branch viewer: 更多 no longer jumps straight to branch metadata; it
+            # goes through the synthesized Tags-menu middle state.
+            vb = (output / "states" / "s_vx" / "index.html").read_text(encoding="utf-8")
+            self.assertIn("btags_bx/index.html", vb)
+            # The middle state shows the same series viewer plus a visible Tags row.
+            btags = (output / "states" / "btags_bx" / "index.html").read_text(encoding="utf-8")
+            self.assertIn('data-replica-action="series:bx:tags"', btags)
+            self.assertIn("data-replica-visible", btags)
+            self.assertIn("s_mx/index.html", btags)
+            self.assertIn(".overlay>[data-replica-visible]", btags)
+
+            # Boundary: a plain multi-series flow (no synthetic series:*:meta_open
+            # collapse, no unrendered recorded Tags step) must NOT gain btags states.
+            guard = Path(tmp) / "guard"
+            guard.mkdir()
+            (guard / "assets").mkdir()
+            _write_assets(guard)
+            flow2 = _build_series_flow()
+            out2 = guard / "replica"
+            build_replica(flow2, guard, out2)
+            self.assertFalse((out2 / "states" / "btags_branch_b").is_dir())
+            vb2 = (out2 / "states" / "s_vb" / "index.html").read_text(encoding="utf-8")
+            self.assertNotIn("btags_", vb2)
+
     def test_builder_fails_when_required_screenshot_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

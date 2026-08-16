@@ -2,17 +2,27 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
 import hashlib
 import html
 import re
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from locator_risk import classify_locator_risk
-from replica_models import DomNodeSnapshot, InteractionRegion, ReplicaDocument, ReplicaFlow, ReplicaState
+from replica_models import (
+    ActionTarget,
+    DomNodeSnapshot,
+    InteractionRegion,
+    Rect,
+    ReplicaDocument,
+    ReplicaFlow,
+    ReplicaState,
+    ReplicaTransition,
+)
 from rewrite_script import generate_replay_script, generate_serve_script
 from replay_helpers import sha256_file, series_key_slug
 
@@ -411,6 +421,9 @@ def _render_document(
         ".replica-bg{display:block;width:100%;height:100%;object-fit:fill}"
         ".overlay{position:absolute;inset:0}.overlay>*{box-sizing:border-box}"
         ".overlay>[data-replica-overlay]{opacity:0}.overlay>[data-replica-action]{z-index:1}.overlay>[data-replica-series-key]{z-index:2}.overlay>[data-replica-series-key][data-replica-below-fold]{opacity:1}"
+        ".overlay>[data-replica-visible]{opacity:1;z-index:3;background:rgb(20,25,33);border:1px solid rgb(44,52,63);"
+        "border-radius:4px;color:rgb(209,228,255);display:flex;align-items:center;justify-content:center;"
+        "font:13px/1.4 'Helvetica Neue',Helvetica,sans-serif;cursor:pointer;box-shadow:0 8px 20px rgba(0,0,0,.55)}"
         ".overlay>[data-replica-overlay]:not([data-replica-action]):not([data-replica-input]):not([data-replica-series-key]):not([role]):not(button):not(input):not(select):not(textarea):not(canvas):not(a){pointer-events:none}"
         ".overlay>[data-replica-action],.overlay>[data-replica-input],.overlay>[data-replica-series-key],.overlay>[data-replica-overlay][role],.overlay>[data-replica-overlay][data-testid],.overlay>[data-replica-overlay]button,.overlay>[data-replica-overlay]input,.overlay>[data-replica-overlay]select,.overlay>[data-replica-overlay]textarea,.overlay>[data-replica-overlay]canvas,.overlay>[data-replica-overlay]a{pointer-events:auto}"
         ".overlay>[data-replica-input]{opacity:1;caret-color:rgb(255,255,255)}"
@@ -699,6 +712,123 @@ def _locator_risk_metadata(flow: ReplicaFlow) -> dict[str, dict[str, object]]:
     return metadata
 
 
+def _augment_meta_two_step(flow: ReplicaFlow, states: dict[str, ReplicaState]) -> None:
+    """Restore the recorded 更多 -> Tags two-step Metadata open on offline pages.
+
+    Two fidelity gaps make the replica diverge from the real page:
+
+    - The recorded main-path Tags click can carry a transition but no rendered
+      DOM element (its snapshot was taken too late / collapsed), leaving the
+      "Tags" step a dead end. Synthesize a clickable Tags row there.
+    - Branch Metadata is collapsed by ``_synthetic_meta_open_target`` into a
+      single ``series:<branch>:meta_open`` action jumping straight to the branch
+      Metadata state. Insert a per-branch intermediate ``btags_<branch>`` state
+      that reuses the branch's own Viewer document + screenshot and adds a
+      visible "Tags" row; route the Viewer's 更多 through it, so opening
+      Metadata observes the real two-step interaction.
+    """
+    fallback_rect = Rect(1264, 44, 96, 34, "page_viewport_css")
+
+    def tags_rect_for(doc: ReplicaDocument) -> Rect:
+        for region in doc.regions:
+            if region.region_type == "metadata" and region.root.rect is not None:
+                return region.root.rect
+        return fallback_rect
+
+    def synthetic_tags_target(action_id: str, doc: ReplicaDocument) -> ActionTarget:
+        rect = tags_rect_for(doc)
+        dom = DomNodeSnapshot(
+            "a", "Tags", {"data-replica-visible": ""},
+            rect, '<a data-replica-visible="">Tags</a>', {},
+        )
+        return ActionTarget(
+            action_id, "m_tags", "click", "locator", {},
+            None, dom, None, None, None, "execute", None, doc.document_id, None,
+        )
+
+    metadata_state_ids = {
+        state.state_id
+        for state in flow.states
+        if any(_is_metadata_panel(region) for doc in state.documents for region in doc.regions)
+    }
+    rendered_action_ids_by_state = {
+        state.state_id: {target.action_id for doc in state.documents for target in (doc.targets or [])}
+        for state in flow.states
+    }
+
+    # 1) Main path: give a recorded-but-unrendered Metadata step a clicked element.
+    for state in flow.states:
+        if state.state_id in metadata_state_ids or not state.documents:
+            continue
+        for transition in state.transitions:
+            if transition.to_state_id not in metadata_state_ids:
+                continue
+            if transition.action_id in rendered_action_ids_by_state[state.state_id]:
+                continue
+            doc = state.documents[0]
+            doc.targets = list(doc.targets or []) + [synthetic_tags_target(transition.action_id, doc)]
+
+    # 2) Branch viewers: synthesize the intermediate Tags-menu state per branch.
+    for branch in flow.series_branches:
+        if branch.viewer_state_id not in states or branch.metadata_state_id not in states:
+            continue
+        viewer_state = states[branch.viewer_state_id]
+        # Only the expansion's synthetic one-step collapse needs re-splitting; a
+        # branch whose Metadata open is driven by ordinary recorded actions stays
+        # untouched (its own transitions already encode the real steps).
+        synthetic_open = next(
+            (
+                transition for transition in viewer_state.transitions
+                if transition.action_id == f"series:{branch.branch_id}:meta_open"
+            ),
+            None,
+        )
+        if synthetic_open is None:
+            continue
+        src_page = next(
+            (p for p in viewer_state.pages if p.page_var == viewer_state.active_page_var),
+            viewer_state.pages[0] if viewer_state.pages else None,
+        )
+        if src_page is None:
+            continue
+        viewer_doc = next(
+            (d for d in viewer_state.documents if d.document_id == src_page.entry_document_id),
+            viewer_state.documents[0] if viewer_state.documents else None,
+        )
+        if viewer_doc is None:
+            continue
+        btags_id = f"btags_{branch.branch_id}"
+        tags_doc = replace(
+            viewer_doc,
+            document_id=f"{btags_id}__doc",
+            targets=list(viewer_doc.targets or [])
+            + [synthetic_tags_target(f"series:{branch.branch_id}:tags", viewer_doc)],
+        )
+        pages = [replace(page, entry_document_id=tags_doc.document_id) for page in viewer_state.pages]
+        btags_state = ReplicaState(
+            btags_id,
+            viewer_state.ordinal,
+            viewer_state.source_url,
+            viewer_state.active_page_var,
+            pages,
+            [tags_doc],
+            [ReplicaTransition(
+                f"t_tags_{branch.branch_id}", f"series:{branch.branch_id}:tags",
+                btags_id, branch.metadata_state_id, "page", "page", "same_page",
+            )],
+            copy.copy(viewer_state.evidence),
+        )
+        states[btags_id] = btags_state
+        flow.states.append(btags_state)
+        # Re-point the Viewer's 更多 (meta_open) through the Tags step.
+        for transition in viewer_state.transitions:
+            if (
+                transition.action_id == f"series:{branch.branch_id}:meta_open"
+                and transition.to_state_id == branch.metadata_state_id
+            ):
+                transition.to_state_id = btags_id
+
+
 def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Path:
     """Write screenshots, DOM overlays, iframe trees, and declared state transitions."""
     source_root = Path(source_root)
@@ -729,6 +859,7 @@ def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Pa
     locator_risk_metadata = _locator_risk_metadata(flow)
     (output_root / "locator_mapping.json").write_text(json.dumps(locator_risk_metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     states = {state.state_id: state for state in flow.states}
+    _augment_meta_two_step(flow, states)
     asset_paths: dict[tuple[str, str], Path] = {}
     copied_hashes: set[Path] = set()
     total_asset_bytes = 0

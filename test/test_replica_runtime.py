@@ -223,6 +223,64 @@ def _tall_scroll_flow():
     )
 
 
+def _augment_meta_flow():
+    """Compact flow with the exact collapsed shapes the build-time two-step
+    Metadata augmentation targets: a synthetic ``series:bx:meta_open`` branch
+    jump that lands directly on the branch metadata state, and a recorded main
+    Tags step (``a_tags``) that has a transition but no rendered element.
+    """
+    def doc(document_id, asset, targets=None, regions=None):
+        return ReplicaDocument(
+            document_id, "p_main", "page", "main", None, None, None, None,
+            {"width": 300, "height": 200}, 1, "css", 0, 0, asset, document_id, 3,
+            targets=targets or [], regions=regions or [],
+        )
+
+    meta_panel = lambda document_id, tag: InteractionRegion(
+        f"r_{document_id}", "metadata", document_id,
+        DomNodeSnapshot("div", "Metadata panel", {"id": "mpanel", "class": "tagsBox"},
+                        Rect(0, 0, 300, 200, "page_viewport_css"),
+                        f'<div id="mpanel" class="tagsBox"><div>{tag}</div></div>', {}),
+        [], None,
+    )
+    more = ActionTarget(
+        "a_more", "m_0", "click", "locator", {}, None,
+        DomNodeSnapshot("a", "更多", {"data-testid": "more"}, Rect(250, 0, 40, 40, "page_viewport_css"),
+                        '<a data-testid="more">更多</a>', {}),
+        None, None, None, "execute", None, "d_main_viewer", None,
+    )
+    x_more = ActionTarget(
+        "series:bx:meta_open", "m_x", "click", "locator", {}, None,
+        DomNodeSnapshot("a", "更多", {"data-testid": "more-x"}, Rect(250, 0, 40, 40, "page_viewport_css"),
+                        '<a data-testid="more-x">更多</a>', {}),
+        None, None, None, "execute", None, "d_vx", None,
+    )
+    main_viewer = doc("d_main_viewer", "assets/va.png", [more])
+    menu = doc("d_menu", "assets/va.png")
+    meta_main = doc("d_meta_main", "assets/ma.png", regions=[meta_panel("d_meta_main", "main-meta")])
+    viewer_x = doc("d_vx", "assets/vb.png", [x_more])
+    meta_x = doc("d_mx", "assets/mb.png", regions=[meta_panel("d_mx", "x-meta")])
+    states = [
+        ReplicaState("s_main", 0, "", "page", [ReplicaPage("p_main", "page", "main", None, None, "d_main_viewer", True, False)],
+                     [main_viewer], [ReplicaTransition("t_more", "a_more", "s_main", "s_menu", "page", "page", "same_page")],
+                     StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry")),
+        ReplicaState("s_menu", 1, "", "page", [ReplicaPage("p_main", "page", "main", None, None, "d_menu", True, False)],
+                     [menu], [ReplicaTransition("t_tags", "a_tags", "s_menu", "s_meta_main", "page", "page", "same_page")],
+                     StateEvidence(False, False, False, False, 0, 0, 0, 0, "viewer")),
+        ReplicaState("s_meta_main", 2, "", "page", [ReplicaPage("p_main", "page", "main", None, None, "d_meta_main", True, False)],
+                     [meta_main], [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "metadata")),
+        ReplicaState("s_vx", 3, "", "page", [ReplicaPage("p_main", "page", "main", None, None, "d_vx", True, False)],
+                     [viewer_x], [ReplicaTransition("t_bx", "series:bx:meta_open", "s_vx", "s_mx", "page", "page", "same_page")],
+                     StateEvidence(False, False, False, False, 0, 0, 0, 0, "viewer")),
+        ReplicaState("s_mx", 4, "", "page", [ReplicaPage("p_main", "page", "main", None, None, "d_mx", True, False)],
+                     [meta_x], [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "metadata")),
+    ]
+    branches = [SeriesBranch("bx", "X", "Series X", 0, "d_hub", "mx", None, "click", "s_vx", "s_mx", "s_vx", "captured", None)]
+    return ReplicaFlow(1, "meta-two-step", "recorded.py", "hash", "now", {"width": 300, "height": 200},
+                       BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_main", states, [],
+                       series_branches=branches)
+
+
 def _write_assets(root: Path) -> None:
     """Write distinct screenshot bytes for every document so the by-hash assets differ."""
     assets = root / "assets"
@@ -557,6 +615,46 @@ class ReplicaRuntimeTests(unittest.TestCase):
                 page.locator('[data-testid="meta-open"]').click()
                 page.wait_for_url("**/states/s_mt/index.html")
                 self.assertEqual(page.locator("#m-tag-t").inner_text(), "tag-TALL: value-TALL")
+                browser.close()
+
+    def test_branch_meta_open_is_two_step_via_tags_menu(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_assets(root)
+            flow = _augment_meta_flow()
+            output = root / "replica"
+            build_replica(flow, root, output)
+
+            # Build shape: the branch viewer's 更多 no longer jumps straight to
+            # the metadata state, and the recorded Tags step got a real element.
+            vb = (output / "states" / "s_vx" / "index.html").read_text(encoding="utf-8")
+            self.assertNotIn("states/s_mx/index.html", vb.split("__REPLICA_SERIES_ROUTE__")[0])
+            self.assertIn("btags_bx/index.html", vb)
+            menu = (output / "states" / "s_menu" / "index.html").read_text(encoding="utf-8")
+            self.assertIn('data-replica-action="a_tags"', menu)
+
+            with ReplicaServer(output) as server, sync_playwright() as playwright:
+                browser = playwright.chromium.launch()
+                page = browser.new_page(viewport={"width": 300, "height": 200})
+                host = server.url.replace("/index.html", "")
+
+                # Branch path: 更多 -> Tags menu (same series viewer) -> Tags -> metadata.
+                page.goto(f"{host}/states/s_vx/index.html", wait_until="load", timeout=30000)
+                page.locator('[data-replica-action="series:bx:meta_open"]').click()
+                page.wait_for_url("**/states/btags_bx/index.html")
+                tags = page.locator('[data-replica-action="series:bx:tags"]')
+                self.assertEqual(tags.count(), 1)
+                self.assertEqual(tags.get_attribute("data-replica-visible"), "")
+                self.assertEqual(tags.evaluate("el => getComputedStyle(el).opacity"), "1")
+                tags.click()
+                page.wait_for_url("**/states/s_mx/index.html")
+                self.assertEqual(page.locator(".replica-metadata").count(), 1)
+
+                # Recorded main path: the previously dead-end Tags step is clickable.
+                page.goto(f"{host}/states/s_menu/index.html", wait_until="load", timeout=30000)
+                page.locator('[data-replica-action="a_tags"]').click()
+                page.wait_for_url("**/states/s_meta_main/index.html")
+                self.assertEqual(page.locator(".replica-metadata").count(), 1)
                 browser.close()
 
 
