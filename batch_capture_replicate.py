@@ -2328,6 +2328,13 @@ def _load_snapshot_state(capture_root: Path, action_id: str, phase: str) -> tupl
     documents = []
     for item in payload["documents"]:
         item["screenshot_asset_relpath"] = str((phase_root / item["screenshot_asset_relpath"]).relative_to(capture_root)).replace("\\", "/")
+        # The scroll-stitched series-list background is stored phase-relative; rebase
+        # it against capture_root exactly like the screenshot so the builder can
+        # resolve it and switch to the full panel-scroll replica.
+        if item.get("series_list_full_asset_relpath"):
+            item["series_list_full_asset_relpath"] = str(
+                (phase_root / item["series_list_full_asset_relpath"]).relative_to(capture_root)
+            ).replace("\\", "/")
         documents.append(ReplicaDocument.from_dict(item))
     return pages, documents
 
@@ -2371,6 +2378,14 @@ def _load_branch_topology(capture_root: Path, branch_dir: Path, subdir: str):
         if rel:
             try:
                 item["screenshot_asset_relpath"] = str((branch_dir / subdir / rel).resolve().relative_to(capture_root.resolve())).replace("\\", "/")
+            except ValueError:
+                pass
+        tall_rel = item.get("series_list_full_asset_relpath")
+        if tall_rel:
+            try:
+                item["series_list_full_asset_relpath"] = str(
+                    (branch_dir / subdir / tall_rel).resolve().relative_to(capture_root.resolve())
+                ).replace("\\", "/")
             except ValueError:
                 pass
         documents.append(ReplicaDocument.from_dict(item))

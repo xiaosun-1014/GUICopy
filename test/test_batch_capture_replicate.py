@@ -1120,6 +1120,35 @@ def run(page):
         self.assertEqual(snapshots[0].metadata_rows, [{"row": "Series Number: 1"}])
         self.assertIsNone(expansion)
 
+    def test_load_snapshot_state_rebases_series_list_full_asset(self):
+        # The scroll-stitched series-list background is stored phase-relative and
+        # must be rebased against the capture root exactly like screenshots, or
+        # the builder cannot resolve it and silently falls back to the static
+        # overlay-scroll replica.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            phase = root / "snapshots" / "a_000_001" / "after"
+            assets = phase / "assets"
+            assets.mkdir(parents=True)
+            (assets / "series_list_full_d_test.jpeg").write_bytes(b"jpeg")
+            doc = self._branch_doc("d_p_000_root")
+            doc["screenshot_asset_relpath"] = "assets/d_p_000_root.png"
+            doc["series_list_full_asset_relpath"] = "assets/series_list_full_d_test.jpeg"
+            (phase / "topology.json").write_text(
+                json.dumps({"pages": [], "documents": [doc]}), encoding="utf-8"
+            )
+
+            _, documents = replica_batch._load_snapshot_state(root, "a_000_001", "after")
+
+            self.assertEqual(
+                documents[0].series_list_full_asset_relpath,
+                "snapshots/a_000_001/after/assets/series_list_full_d_test.jpeg",
+            )
+            self.assertEqual(
+                documents[0].screenshot_asset_relpath,
+                "snapshots/a_000_001/after/assets/d_p_000_root.png",
+            )
+
     def test_expand_series_reconstructs_template_and_delegates_when_source_present(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)
