@@ -24,6 +24,7 @@ from replica_models import (
     ReplicaPage,
     ReplicaState,
     ReplicaTransition,
+    SeriesBranch,
     StateEvidence,
 )
 
@@ -691,6 +692,79 @@ class BuildReplicaTests(unittest.TestCase):
             # B is the active series in its own viewer state.
             self.assertIn(f'data-replica-series-key="{series_key_slug("B")}"', vb)
             self.assertIn('aria-disabled="true"', vb)
+
+    def test_series_list_scroll_overflow_marks_below_fold_rows(self):
+        # A series list whose rows extend below the captured fold must get a
+        # scrollable overlay (content height = list extent) and the below-fold
+        # rows must render their own content (opacity:1) instead of staying
+        # transparent hit-targets with no screenshot underneath.
+        from test.test_replica_runtime import _build_series_flow
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir()
+            (root / "assets" / "hub.png").write_bytes(b"png")
+            members = []
+            for index in range(10):
+                y = index * 24  # 0..216; index 9 lands at 216 >= viewport 200
+                dom = DomNodeSnapshot(
+                    "div", f"Series {index}", {"id": f"m{index}", "role": "option", "aria-selected": "false"},
+                    Rect(0, y, 300, 20, "region_content_css"),
+                    f'<div id="m{index}" role="option">Series {index}</div>', {},
+                )
+                members.append(RegionMember(f"m{index}", "div", dom))
+            hub_root = DomNodeSnapshot(
+                "div", "", {"id": "series", "role": "listbox"},
+                Rect(0, 0, 300, 200, "page_viewport_css"),
+                '<div id="series" role="listbox"></div>', {},
+            )
+            hub = ReplicaDocument(
+                "d_hub", "p_main", "page", "main", None, None, None, None,
+                {"width": 300, "height": 200}, 1, "css", 0, 0, "assets/hub.png", "hub", 3,
+                regions=[InteractionRegion("d_hub_series", "series", "d_hub", hub_root, members, None)],
+            )
+            page = ReplicaPage("p_main", "page", "main", None, None, "d_hub", True, False)
+            evidence = StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry")
+            branch = SeriesBranch(
+                "branch_9", "series9", "Series 9", 9, "d_hub", "m9", None, "click",
+                None, None, None, "failed", "no_viewer_snapshot",
+            )
+            flow = ReplicaFlow(
+                1, "tall", "recorded.py", "hash", "now", {"width": 300, "height": 200},
+                BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(),
+                "s_hub", [ReplicaState("s_hub", 0, "", "page", [page], [hub], [], evidence)],
+                [],
+                series_branches=[branch],
+            )
+            output = root / "replica"
+            build_replica(flow, root, output)
+            rendered = (output / "index.html").read_text(encoding="utf-8")
+
+            # Overlay becomes an independent scroll container sized to the list extent.
+            self.assertIn(
+                '<section class="overlay" style="overflow-y:auto;max-height:200px;'
+                'height:236px;overscroll-behavior:contain;scrollbar-gutter:stable">',
+                rendered,
+            )
+            # The entirely-below-fold row carries its own visible content flag.
+            self.assertIn(f'data-replica-series-key="{series_key_slug("series9")}"', rendered)
+            self.assertIn('data-replica-below-fold=""', rendered)
+            self.assertIn(
+                ".overlay>[data-replica-series-key][data-replica-below-fold]{opacity:1}",
+                rendered,
+            )
+            # Boundary: a list that fits inside the fold keeps the plain overlay.
+            guard_root = Path(tmp) / "guard"
+            guard_root.mkdir()
+            (guard_root / "assets").mkdir()
+            from test.test_replica_runtime import _write_assets as _write_guard_assets
+            _write_guard_assets(guard_root)
+            flow_guard = _build_series_flow()
+            guard_out = guard_root / "replica"
+            build_replica(flow_guard, guard_root, guard_out)
+            guard_html = (guard_out / "index.html").read_text(encoding="utf-8")
+            self.assertIn('<section class="overlay">', guard_html)
+            self.assertNotIn('overflow-y:auto;max-height:200px', guard_html)
 
     def test_builder_fails_when_required_screenshot_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:

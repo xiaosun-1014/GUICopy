@@ -1,7 +1,7 @@
 # FTImage 多序列自动发现与离线点击缺陷修复说明
 
 > 日期：2026-08-16  
-> 状态：代码修复已实施并经复核验证（2026-08-16 复核：`test_replica_regions` 17/17、`test_build_replica` 18/18、旧副本 6/6 route 均含几何、真实坐标点击 `(100,630)` 命中 `66f1f366f470` 并跳转 `bviewer_b002`、console 无异常）；旧捕获结果已离线重建；完整 8/8 序列仍需重新录制验收  
+> 状态：**关闭**。代码修复实施并复核；新录制验收全部达成（2026-08-16 run `out/ftimage/runs/20260816T050045Z-f44c89`：`discovered_count=8`、8/8 全 captured、0 failed/skipped、`count_conserved=true`、`overall_ok=true`、逐序列 Meta 互异）；另于 2026-08-16 补做离线副本列表滚动增强（§6.5），折叠下最后 MPR-Sag 滚动后即可点击并打开其 Metadata  
 > 缺陷等级：P1（核心能力部分失效，但不涉及数据破坏）  
 > 影响范围：FTImage 文本身份回退型序列列表，以及所有由 series region 生成的离线透明点击层
 
@@ -249,6 +249,18 @@ style = (
 
 旧 action overlay 保持 `z-index: 1`。不改变非序列 action 的行为，只确保序列 route 在重叠区域优先。
 
+### 6.5 离线副本列表滚动（封闭 §16 第 3 项，2026-08-16 补充）
+
+真实序列列表是滚动容器（FT `div.os-viewport`），其行 rect 是**滚动内容坐标**：折叠线以下的行（`y >= 视口高`）在离线静态页里没有对应背景截图，此前 `overflow:hidden` 固定视口下不可达。
+
+`build_replica.py::_render_document` 现在：
+
+- 计算序列列表内容高度 `series_extent = max(y + height)`；当它超过视口高时，给 `.overlay` 加 `overflow-y:auto;max-height:{vh}px;height:{extent}px`——恢复列表自身的独立纵向滚动（scrollTop 由内容坐标自然映射，无需额外换算）。
+- 对 `y >= 视口高` 的 route 注入 `data-replica-below-fold=""`，并加 CSS `.overlay>[data-replica-series-key][data-replica-below-fold]{opacity:1}`：折叠下行没有截图衬底，改由 route 自带的缩略图/标签文本渲染成可见行。
+- RUNTIME 无需改动（事件委托 + `elementFromPoint` 在滚动后天然命中）。
+
+实测（run `20260816T050045Z-f44c89` 重建副本，1696×880）：滚动到底后最后两行（MPR-Cor / **MPR-Sag**，opacity:1）可见；屏幕坐标点击 MPR-Sag → `states/bviewer_b007_95d26a714ce1/index.html` → 点 Meta → `states/bmeta_b007_95d26a714ce1/index.html`，console 0 错误。
+
 ## 7. 代码变更清单
 
 | 文件 | 变更 | 目的 |
@@ -257,8 +269,11 @@ style = (
 | `batch_capture_replicate.py` | 激活匹配复用公共标准化函数 | 防止发现与点击语义不一致 |
 | `build_replica.py` | series route 注入绝对坐标与尺寸 | 让透明点击层覆盖背景截图 |
 | `build_replica.py` | series route 设置 `z-index: 2` | 避免被旧 action overlay 覆盖 |
+| `build_replica.py` | 序列列表超出视口时 `.overlay` 变独立滚动容器 + 折叠下行 `data-replica-below-fold` 显形 | 让折叠下最后一个 MPR-Sag 滚动后仍可点击并打开对应 Metadata（§6.5） |
 | `test/test_replica_regions.py` | 新增动态 `106 -> 109` 回归测试 | 锁住 8 个真实序列不会膨胀为 9 个，且仍可重定位 |
 | `test/test_build_replica.py` | 增加 route 几何断言 | 锁住绝对定位信息不再丢失 |
+| `test/test_build_replica.py` | 新增折叠滚动单测 | 锁住 `.overlay` 滚动样式、折叠行标记与 CSS 规则，且视口内列表不加滚动 |
+| `test/test_replica_runtime.py` | 新增折叠滚动浏览器回归 | 滚动后命中并点开折叠下序列的 viewer + Metadata |
 
 修复保持在共享捕获/构建逻辑中，没有直接修改某个 `completed_*.py` 或手工篡改 manifest。
 
@@ -358,6 +373,8 @@ offline build 只能消费已有快照，不能重新访问真实站点或生成
 
 ## 11. 重新录制验收步骤
 
+> **已完成**（2026-08-16，run `20260816T050045Z-f44c89`）：下述 6 步全部照做并通过，指标与交互验收均满足；离线“滚动后仍能点击”一项由 §6.5 的列表滚动增强支撑。保留本节作为复验 SOP。
+
 1. 使用包含本修复的工作区重新录制同类 FT 检查。
 2. 开启自动扩展全部序列。
 3. 等待 series expansion 完成，不在下载进度变化期间手工干预列表。
@@ -395,7 +412,7 @@ overall_ok = true
 
 series route 现在与普通 action overlay 一样使用 `snapshot.rect`。这是离线截图 overlay 的既有坐标模型，不引入新的坐标系。
 
-若未来某 viewer 的 series rect 使用滚动内容坐标且离线页面支持独立滚动，需要继续处理 `scrollTop` 映射；本次 FT 首屏已通过真实坐标验证，折叠以下项目列入后续增强而非本次阻塞项。
+折叠线上的行：route rect = 滚动内容坐标（`region_content_css`），与滚动容器在 `scrollTop=0` 时的视觉位置一致，直接绝对定位即可。折叠线下行（`y >= 视口高`）：离线页面把序列列表 `.overlay` 变为独立滚动容器，内容高度取列表 `max(y+height)`，行 rect 以内容坐标放置即自然映射滚动偏移（§6.5）。折痕处“部分可见”的行仍走透明层、其可见片段由截图衬底显示，行为与真实页一致。
 
 ### 12.3 既有 action 与 route 共存
 
@@ -465,8 +482,8 @@ series route 现在与普通 action overlay 一样使用 `snapshot.rect`。这�
 - [x] series route 高于重叠的旧 action overlay。
 - [x] 匿名动态进度回归测试通过。
 - [x] 旧捕获副本重建后真实坐标点击通过。
-- [ ] 新 FT 录制发现数量为真实 8，不再是 9。
-- [ ] 新 FT 录制 8 个序列全部 captured/partial，且无 failed/skipped。
-- [ ] 新离线副本最后一个 MPR-Sag 可点击并能打开对应 Metadata。
+- [x] 新 FT 录制发现数量为真实 8，不再是 9（run `20260816T050045Z-f44c89` `discovered_count=8`）。
+- [x] 新 FT 录制 8 个序列全部 captured/partial，且无 failed/skipped（8/8 captured、`count_conserved=true`、`overall_ok=true`）。
+- [x] 新离线副本最后一个 MPR-Sag 可点击并能打开对应 Metadata（§6.5 滚动增强 + 重建副本实测：进 `bviewer_b007` → `bmeta_b007`）。
 
-在最后三项完成前，代码修复可以视为完成，但真实站缺陷状态应标记为“待重新录制验证”，不应标记为完全关闭。
+三项新录制验收全部达成，缺陷关闭。

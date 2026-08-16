@@ -150,6 +150,79 @@ def _build_series_flow():
     return flow
 
 
+def _tall_scroll_flow():
+    """Hand-rolled flow whose hub series list extends below the 300x200 fold.
+
+    The ninth member (``m9`` at y=216) sits entirely below the captured fold and
+    is wired to a real viewer + metadata branch, so a runtime test can scroll the
+    overlay and click it without a hub round-trip.
+    """
+    members = []
+    for index in range(10):
+        y = index * 24  # 0..216; index 9 lands at 216 >= viewport 200
+        dom = DomNodeSnapshot(
+            "div", f"Series {index}", {"id": f"m{index}", "role": "option", "aria-selected": "false"},
+            Rect(0, y, 300, 20, "region_content_css"),
+            f'<div id="m{index}" role="option">Series {index}</div>', {},
+        )
+        members.append(RegionMember(f"m{index}", "div", dom))
+    hub_root = DomNodeSnapshot(
+        "div", "", {"id": "series", "role": "listbox"},
+        Rect(0, 0, 300, 200, "page_viewport_css"), '<div id="series" role="listbox"></div>', {},
+    )
+    hub = ReplicaDocument(
+        "d_hub", "p_main", "page", "main", None, None, None, None,
+        {"width": 300, "height": 200}, 1, "css", 0, 0, "assets/hub.png", "hub", 3,
+        regions=[InteractionRegion("d_hub_series", "series", "d_hub", hub_root, members, None)],
+    )
+    mark = DomNodeSnapshot(
+        "div", "TALL viewer unique", {"id": "viewer-tall"},
+        Rect(0, 60, 300, 90, "page_viewport_css"),
+        '<div id="viewer-tall">TALL viewer unique</div>', {},
+    )
+    viewer = ReplicaDocument(
+        "d_vt", "p_main", "page", "main", None, None, None, None,
+        {"width": 300, "height": 200}, 1, "css", 0, 0, "assets/vt.png", "vt", 2,
+        targets=[
+            ActionTarget(
+                "meta_open_t", "m_meta", "click", "locator", {},
+                LocatorRecipe('page.locator("#meta-t")', "page", [], "css", {"args": ["#meta-t"]}, None, None),
+                DomNodeSnapshot("div", "Metadata", {"id": "meta-t", "data-testid": "meta-open"},
+                                Rect(0, 160, 100, 30, "page_viewport_css"),
+                                '<div id="meta-t" data-testid="meta-open">Metadata</div>', {}),
+                None, None, None, "execute", None, "d_vt", None,
+            ),
+            ActionTarget("viewer_tall_mark", "m_viewer", "hover", "locator", {}, None,
+                         mark, None, None, None, "explicit_skip", "display", "d_vt", None),
+        ],
+    )
+    metadata = ReplicaDocument(
+        "d_mt", "p_main", "page", "main", None, None, None, None,
+        {"width": 300, "height": 200}, 1, "css", 0, 0, "assets/mt.png", "mt", 2,
+        regions=[InteractionRegion(
+            "d_mt_meta", "metadata", "d_mt",
+            DomNodeSnapshot("div", "Metadata TALL unique", {"id": "mpanel-t", "class": "tagsBox"},
+                            Rect(0, 0, 300, 200, "page_viewport_css"),
+                            '<div id="mpanel-t" class="tagsBox"><div id="m-tag-t">tag-TALL: value-TALL</div></div>', {}),
+            [], None,
+        )],
+    )
+    states = [
+        ReplicaState("s_hub", 0, "", "page", [ReplicaPage("p_main", "page", "main", None, None, "d_hub", True, False)], [hub], [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry")),
+        ReplicaState("s_vt", 1, "", "page", [ReplicaPage("p_main", "page", "main", None, None, "d_vt", True, False)], [viewer], [ReplicaTransition("t_meta_t", "meta_open_t", "s_vt", "s_mt", "page", "page", "same_page")], StateEvidence(False, False, False, False, 0, 0, 0, 0, "viewer")),
+        ReplicaState("s_mt", 2, "", "page", [ReplicaPage("p_main", "page", "main", None, None, "d_mt", True, False)], [metadata], [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "metadata")),
+    ]
+    branches = [SeriesBranch(
+        "branch_t", "tallseries", "Series 9", 9, "d_hub", "m9", None, "click",
+        "s_vt", "s_mt", "s_vt", "captured", None,
+    )]
+    return ReplicaFlow(
+        1, "tall-scroll", "recorded.py", "hash", "now", {"width": 300, "height": 200},
+        BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_hub", states, [],
+        series_branches=branches,
+    )
+
+
 def _write_assets(root: Path) -> None:
     """Write distinct screenshot bytes for every document so the by-hash assets differ."""
     assets = root / "assets"
@@ -431,6 +504,59 @@ class ReplicaRuntimeTests(unittest.TestCase):
                 self.assertEqual(
                     page.locator(f'[data-replica-series-key="{series_key_slug("C")}"]').get_attribute("aria-selected"), "true"
                 )
+                browser.close()
+
+    def test_series_list_scroll_reveals_below_fold_row_and_clicks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_assets(root)
+            (root / "assets" / "vt.png").write_bytes(b"viewer-TALL")
+            (root / "assets" / "mt.png").write_bytes(b"meta-TALL")
+            flow = _tall_scroll_flow()
+            output = root / "replica"
+            build_replica(flow, root, output)
+
+            with ReplicaServer(output) as server, sync_playwright() as playwright:
+                browser = playwright.chromium.launch()
+                page = browser.new_page(viewport={"width": 300, "height": 200})
+                page.goto(server.url)
+
+                below_key = series_key_slug("tallseries")
+                # Premise: before scrolling, the spot where the below-fold row
+                # will appear holds a blank (non-route) overlay node, so the row
+                # is genuinely unreachable without the list's own scroll.
+                pre = page.evaluate(
+                    "() => document.elementFromPoint(150, 185)?.closest('[data-replica-series-key]')?.getAttribute('data-replica-series-key') || null"
+                )
+                self.assertIsNone(pre)
+
+                # Scroll the overlay to its bottom; the below-fold row now shows
+                # its own rendered content (opacity 1) and is clickable there.
+                page.locator(".overlay").evaluate("el => { el.scrollTop = el.scrollHeight - el.clientHeight; }")
+                page.wait_for_timeout(200)
+                hit = page.evaluate(
+                    """() => {
+                        const el = document.elementFromPoint(150, 190);
+                        if (!el) return null;
+                        const r = el.closest('[data-replica-series-key]');
+                        if (!r) return null;
+                        return { key: r.getAttribute('data-replica-series-key'),
+                                 opacity: getComputedStyle(r).opacity };
+                    }"""
+                )
+                self.assertIsNotNone(hit)
+                self.assertEqual(hit["key"], below_key)
+                self.assertEqual(hit["opacity"], "1")
+
+                page.mouse.click(150, 190)
+                page.wait_for_url("**/states/s_vt/index.html")
+                self.assertIn("/states/s_vt/index.html", page.url)
+                self.assertEqual(page.locator("#viewer-tall").inner_text(), "TALL viewer unique")
+
+                # Its Metadata opens (and would return to this branch's viewer).
+                page.locator('[data-testid="meta-open"]').click()
+                page.wait_for_url("**/states/s_mt/index.html")
+                self.assertEqual(page.locator("#m-tag-t").inner_text(), "tag-TALL: value-TALL")
                 browser.close()
 
 

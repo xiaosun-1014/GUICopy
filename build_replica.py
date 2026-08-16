@@ -264,8 +264,16 @@ def _series_member_html(
     series_key: str,
     selected: bool,
     disabled: bool,
+    below_fold: bool = False,
 ) -> str:
-    """Attach a series route key with accessible option semantics to a member node."""
+    """Attach a series route key with accessible option semantics to a member node.
+
+    ``below_fold`` marks rows whose absolute rect starts below the captured
+    viewport fold: the static screenshot only covers the fold, so those rows have
+    no pixel background and must render their own DOM content (icon + label)
+    instead of staying a transparent hit-target (see the CSS rule
+    ``[data-replica-below-fold]{opacity:1}`` in ``_render_document``).
+    """
     style = (
         f"position:absolute;left:{snapshot.rect.x}px;top:{snapshot.rect.y}px;"
         f"width:{snapshot.rect.width}px;height:{snapshot.rect.height}px;"
@@ -274,6 +282,8 @@ def _series_member_html(
         f' data-replica-overlay="" data-replica-series-key="{html.escape(series_key, quote=True)}"'
         f' style="{style}"'
     )
+    if below_fold:
+        attributes += ' data-replica-below-fold=""'
     role_attr = ' role="option"'
     if ' role=' not in snapshot.outer_html and ' role=' not in " ".join(snapshot.attributes):
         attributes += role_attr
@@ -378,6 +388,20 @@ def _render_document(
     series_route_by_identity: dict[str, dict[str, object]] | None = None,
 ) -> str:
     asset = _relative_url(destination, output_root / asset_path)
+    viewport_h = float(document.viewport["height"])
+    # A series list that scrolls in the real viewer is captured in scrolling
+    # content coordinates, so its rows below the captured fold sit at content
+    # y beyond the screenshot height. Give the overlay a scrollable content
+    # height (restoring the list's independent vertical scroll) so those rows
+    # become reachable; the below-fold rows render their own DOM content.
+    series_extent = 0.0
+    for region in document.regions:
+        if region.region_type != "series":
+            continue
+        for member in region.members:
+            member_rect = member.dom.rect
+            series_extent = max(series_extent, float(member_rect.y) + float(member_rect.height))
+    series_overflow = series_extent > viewport_h + 1.0
     parts = [
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>Replica</title>",
         "<style>"
@@ -386,7 +410,7 @@ def _render_document(
         ".replica{position:absolute;overflow:hidden;transform-origin:top left}"
         ".replica-bg{display:block;width:100%;height:100%;object-fit:fill}"
         ".overlay{position:absolute;inset:0}.overlay>*{box-sizing:border-box}"
-        ".overlay>[data-replica-overlay]{opacity:0}.overlay>[data-replica-action]{z-index:1}.overlay>[data-replica-series-key]{z-index:2}"
+        ".overlay>[data-replica-overlay]{opacity:0}.overlay>[data-replica-action]{z-index:1}.overlay>[data-replica-series-key]{z-index:2}.overlay>[data-replica-series-key][data-replica-below-fold]{opacity:1}"
         ".overlay>[data-replica-overlay]:not([data-replica-action]):not([data-replica-input]):not([data-replica-series-key]):not([role]):not(button):not(input):not(select):not(textarea):not(canvas):not(a){pointer-events:none}"
         ".overlay>[data-replica-action],.overlay>[data-replica-input],.overlay>[data-replica-series-key],.overlay>[data-replica-overlay][role],.overlay>[data-replica-overlay][data-testid],.overlay>[data-replica-overlay]button,.overlay>[data-replica-overlay]input,.overlay>[data-replica-overlay]select,.overlay>[data-replica-overlay]textarea,.overlay>[data-replica-overlay]canvas,.overlay>[data-replica-overlay]a{pointer-events:auto}"
         ".overlay>[data-replica-input]{opacity:1;caret-color:rgb(255,255,255)}"
@@ -418,7 +442,12 @@ def _render_document(
         f'data-viewport-height="{document.viewport["height"]}" '
         f'style="width:{document.viewport["width"]}px;height:{document.viewport["height"]}px">',
         f'<img class="replica-bg" src="{asset}" alt="Captured visual state">',
-        '<section class="overlay">',
+        (
+            '<section class="overlay" style="overflow-y:auto;max-height:'
+            f'{viewport_h:.0f}px;height:{series_extent:.0f}px;'
+            'overscroll-behavior:contain;scrollbar-gutter:stable">'
+            if series_overflow else '<section class="overlay">'
+        ),
     ]
     rendered_nodes: set[tuple[str, float, float, float, float]] = set()
     rendered_element_ids: set[str] = set()
@@ -546,6 +575,7 @@ def _render_document(
                     series_key,
                     selected=bool(series_key == selected_series_key),
                     disabled=disabled_route or bool(route.get("disabled")),
+                    below_fold=bool(member.dom.rect.y >= viewport_h),
                 )
                 parts.append(_redact_known_series_identities(
                     member_markup, series_route_by_identity
