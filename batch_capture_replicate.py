@@ -25,7 +25,7 @@ from PIL import Image, ImageStat
 
 from build_replica import build_replica
 from capture_readiness import _metadata_candidate_allowed, canvas_hash, metadata_panel_signature, metadata_uid_sha256_prefix, screenshot_nonblank, viewer_dom_fingerprint, wait_for_metadata_panel_state
-from capture_snapshot import capture_interaction_region, capture_locator_snapshot, capture_marker_interaction_region, capture_page_topology, capture_selector_closure, compute_image_diff, decide_state, marker_region_type, discover_series_candidates, sanitize_html, _MARKER_REGION_CANDIDATES
+from capture_snapshot import capture_interaction_region, capture_locator_snapshot, capture_marker_interaction_region, capture_page_topology, capture_selector_closure, compute_image_diff, decide_state, marker_region_type, discover_series_candidates, normalize_series_text, sanitize_html, _MARKER_REGION_CANDIDATES
 from process_runner import ManagedProcess
 from replay_helpers import read_manifest, sha256_file, write_manifest
 from rewrite_script import ActionPlan, parse_action_plan
@@ -287,7 +287,7 @@ class SeriesBranchCapture:
 
 
 def _normalize_series_text(text: str) -> str:
-    return " ".join(str(text).split()).lower()
+    return normalize_series_text(str(text))
 
 
 def _matches_descriptor(snapshot: DomNodeSnapshot, descriptor: SeriesDescriptor) -> bool:

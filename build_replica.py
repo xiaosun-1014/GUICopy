@@ -266,8 +266,13 @@ def _series_member_html(
     disabled: bool,
 ) -> str:
     """Attach a series route key with accessible option semantics to a member node."""
+    style = (
+        f"position:absolute;left:{snapshot.rect.x}px;top:{snapshot.rect.y}px;"
+        f"width:{snapshot.rect.width}px;height:{snapshot.rect.height}px;"
+    )
     attributes = (
         f' data-replica-overlay="" data-replica-series-key="{html.escape(series_key, quote=True)}"'
+        f' style="{style}"'
     )
     role_attr = ' role="option"'
     if ' role=' not in snapshot.outer_html and ' role=' not in " ".join(snapshot.attributes):
@@ -381,7 +386,7 @@ def _render_document(
         ".replica{position:absolute;overflow:hidden;transform-origin:top left}"
         ".replica-bg{display:block;width:100%;height:100%;object-fit:fill}"
         ".overlay{position:absolute;inset:0}.overlay>*{box-sizing:border-box}"
-        ".overlay>[data-replica-overlay]{opacity:0}.overlay>[data-replica-action]{z-index:1}"
+        ".overlay>[data-replica-overlay]{opacity:0}.overlay>[data-replica-action]{z-index:1}.overlay>[data-replica-series-key]{z-index:2}"
         ".overlay>[data-replica-overlay]:not([data-replica-action]):not([data-replica-input]):not([data-replica-series-key]):not([role]):not(button):not(input):not(select):not(textarea):not(canvas):not(a){pointer-events:none}"
         ".overlay>[data-replica-action],.overlay>[data-replica-input],.overlay>[data-replica-series-key],.overlay>[data-replica-overlay][role],.overlay>[data-replica-overlay][data-testid],.overlay>[data-replica-overlay]button,.overlay>[data-replica-overlay]input,.overlay>[data-replica-overlay]select,.overlay>[data-replica-overlay]textarea,.overlay>[data-replica-overlay]canvas,.overlay>[data-replica-overlay]a{pointer-events:auto}"
         ".overlay>[data-replica-input]{opacity:1;caret-color:rgb(255,255,255)}"

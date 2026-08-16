@@ -197,8 +197,19 @@ _SERIES_IDENTITY_ATTRS = ("data-series-uid", "data-series", "data-uid", "value",
 _SERIES_FRAME_ATTRS = ("data-frame-count", "data-frames", "data-frame_total", "data-total-frames")
 
 
-def _normalize_series_text(text: str) -> str:
-    return " ".join((text or "").split()).lower()
+def normalize_series_text(text: str) -> str:
+    """Normalize stable series text while ignoring transient download progress."""
+    normalized = " ".join((text or "").split())
+    normalized = re.sub(
+        r"(\d{1,6}\s*(?:幅|帧|张|frames?|images?))\s+\d{1,6}$",
+        r"\1",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    return normalized.lower()
+
+
+_normalize_series_text = normalize_series_text
 
 
 def _series_frame_count_from_text(text: str) -> int | None:

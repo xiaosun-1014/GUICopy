@@ -215,6 +215,37 @@ class ReplicaRegionTests(unittest.TestCase):
         self.assertEqual(len(default_descriptors), 0)
         self.assertEqual(default_evidence.discovered_count, 0)
 
+    def test_ft_dynamic_download_count_does_not_duplicate_or_break_row_matching(self):
+        from batch_capture_replicate import _locate_series_row
+
+        fixture = Path(__file__).parent / "fixtures" / "multi_series" / "ft_series_list.html"
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page()
+            page.goto(fixture.as_uri())
+            root = page.locator("[class*=os-viewport]").first
+            root.evaluate("""element => {
+                const row = element.querySelectorAll('a:has(span.total)')[7];
+                let reads = 0;
+                Object.defineProperty(row, 'innerText', {
+                    configurable: true,
+                    get: () => `3.0 x 3.0 MPR-Sag_bone\n/共 131张\n${reads++ ? 109 : 106}`,
+                });
+            }""")
+
+            descriptors, _, evidence = discover_series_candidates(
+                root, "ft", item_selector="a:has(span.total)", identity_attrs=[]
+            )
+            target = next(item for item in descriptors if "MPR-Sag_bone" in item.label)
+            row, _ = _locate_series_row(
+                root, target, item_selector="a:has(span.total)"
+            )
+            browser.close()
+
+        self.assertEqual(len(descriptors), 8)
+        self.assertEqual(evidence.discovered_count, 8)
+        self.assertIsNotNone(row)
+
     def test_ft_fixture_interfering_viewport_counts_nothing(self):
         # The real page has TWO os-viewports; only the first holds series rows.
         # Container scoping must keep the interfering one at zero even with the

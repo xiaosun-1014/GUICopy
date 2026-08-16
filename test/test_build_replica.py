@@ -35,7 +35,7 @@ class SeriesMemberPrivacyTests(unittest.TestCase):
             "li",
             "Anonymous series",
             {"id": raw_key, "title": "private label"},
-            Rect(0, 0, 100, 30, "page_viewport_css"),
+            Rect(11, 22, 100, 30, "page_viewport_css"),
             (
                 f'<li id="{raw_key}" title="private label" data-series-uid="{raw_key}">'
                 f'<span id="thumb-{raw_key}">{raw_key}</span></li>'
@@ -46,6 +46,10 @@ class SeriesMemberPrivacyTests(unittest.TestCase):
         self.assertNotIn(raw_key, rendered)
         self.assertNotIn("private label", rendered)
         self.assertIn('data-replica-series-key="public-slug"', rendered)
+        self.assertIn(
+            'style="position:absolute;left:11px;top:22px;width:100px;height:30px;"',
+            rendered,
+        )
 
     def test_known_identity_is_redacted_from_non_series_markup(self):
         raw_key = "1.2.826.0.1.3680043.201.9002"
