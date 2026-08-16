@@ -281,6 +281,22 @@ def _augment_meta_flow():
                        series_branches=branches)
 
 
+def _tall_page_flow():
+    """The tall multi-series flow, with the hub's full-content list capture wired.
+
+    Mimics a re-captured run whose series list has a scroll-stitched background
+    asset covering the whole container (300x236) and a recorded content height,
+    so the builder should render the page taller and scrollable instead of the
+    overlay-scroll fallback.
+    """
+    flow = _tall_scroll_flow()
+    hub_state = next(state for state in flow.states if state.state_id == "s_hub")
+    hub_doc = hub_state.documents[0]
+    hub_doc.series_list_full_asset_relpath = "assets/list_full.jpeg"
+    hub_doc.series_list_content_height = 236
+    return flow
+
+
 def _write_assets(root: Path) -> None:
     """Write distinct screenshot bytes for every document so the by-hash assets differ."""
     assets = root / "assets"
@@ -655,6 +671,55 @@ class ReplicaRuntimeTests(unittest.TestCase):
                 page.locator('[data-replica-action="a_tags"]').click()
                 page.wait_for_url("**/states/s_meta_main/index.html")
                 self.assertEqual(page.locator(".replica-metadata").count(), 1)
+                browser.close()
+
+    def test_series_list_full_panel_scrolls_with_page_and_stays_clickable(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_assets(root)
+            (root / "assets" / "vt.png").write_bytes(b"viewer-TALL")
+            (root / "assets" / "mt.png").write_bytes(b"meta-TALL")
+            Image.new("RGB", (300, 236), (12, 24, 36)).save(root / "assets" / "list_full.jpeg", "JPEG")
+            flow = _tall_page_flow()
+            output = root / "replica"
+            build_replica(flow, root, output)
+
+            hub = (output / "index.html").read_text(encoding="utf-8")
+            self.assertIn('style="width:300px;height:200px;overflow-y:auto;overscroll-behavior:contain"', hub)
+            self.assertIn('style="height:200px"', hub)  # page screenshot pinned to the fold
+            self.assertIn('class="series-pane-bg"', hub)
+            self.assertNotIn('overflow-y:auto;max-height:200px', hub)  # no overlay scroll in tall mode
+
+            with ReplicaServer(output) as server, sync_playwright() as playwright:
+                browser = playwright.chromium.launch()
+                page = browser.new_page(viewport={"width": 300, "height": 200})
+                page.goto(server.url)
+                self.assertGreaterEqual(
+                    page.locator(".replica").evaluate("el => el.scrollHeight - el.clientHeight"),
+                    30,
+                )
+                self.assertEqual(page.locator(".series-pane-bg").count(), 1)
+                # Below-fold row (content y 216) is not reachable before scrolling.
+                pre = page.evaluate(
+                    "() => document.elementFromPoint(150, 190)?.closest('[data-replica-series-key]')?.getAttribute('data-replica-series-key') || null"
+                )
+                self.assertIsNone(pre)
+                page.locator(".replica").evaluate("el => { el.scrollTop = el.scrollHeight - el.clientHeight; }")
+                page.wait_for_timeout(200)
+                hit = page.evaluate(
+                    """() => {
+                        const el = document.elementFromPoint(150, 190);
+                        if (!el) return null;
+                        const r = el.closest('[data-replica-series-key]');
+                        return r ? r.getAttribute('data-replica-series-key') : null;
+                    }"""
+                )
+                self.assertEqual(hit, series_key_slug("tallseries"))
+                page.mouse.click(150, 190)
+                page.wait_for_url("**/states/s_vt/index.html")
+                self.assertEqual(page.locator("#viewer-tall").inner_text(), "TALL viewer unique")
                 browser.close()
 
 

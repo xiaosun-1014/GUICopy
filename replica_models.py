@@ -252,6 +252,12 @@ class ReplicaDocument:
     screenshot_size_bytes: int
     targets: list[ActionTarget] = field(default_factory=list)
     regions: list[InteractionRegion] = field(default_factory=list)
+    # Optional full-content (scroll-stitched) screenshot of the series list
+    # container, used by the builder to render the list panel as a tall region
+    # that scrolls with the page exactly like the real viewer. Relpath is
+    # relative to the same root as ``screenshot_asset_relpath``.
+    series_list_full_asset_relpath: str | None = None
+    series_list_content_height: int = 0
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "ReplicaDocument":

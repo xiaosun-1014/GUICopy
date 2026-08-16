@@ -7,6 +7,7 @@ import ast
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -411,6 +412,64 @@ def _series_viewer_config_for(page: object) -> dict[str, object]:
     return {}
 
 
+def _capture_series_list_full(
+    root_locator: object,
+    capture_root: Path,
+    document_id: str,
+    page: object,
+) -> tuple[str | None, int]:
+    """Scroll-stitch a full-content screenshot of the series list container.
+
+    The real list panel is taller than the viewport, so a single element
+    screenshot would miss rows below the fold (and for virtualized lists, rows
+    that are not yet rendered). We capture the container window at every scroll
+    position and stitch the tiles into one tall image covering the whole
+    ``scrollHeight``, then restore the original scroll position. Returns
+    ``(asset_relpath_relative_to_capture_root, content_height)``, or
+    ``(None, 0)`` when the container does not overflow its window.
+    """
+    try:
+        metrics = root_locator.evaluate(
+            "el => ({top: el.scrollTop, clientH: el.clientHeight, scrollH: el.scrollHeight})"
+        )
+        client_h = max(1, int(metrics["clientH"]))
+        if metrics["scrollH"] <= metrics["clientH"] + 2:
+            return None, 0
+        root_locator.evaluate("""el => {
+            const s = document.createElement('style');
+            s.id = '__replica_noscrollbar';
+            s.textContent = '*::-webkit-scrollbar{display:none !important}';
+            document.head.appendChild(s);
+        }""")
+        tiles: list[bytes] = []
+        steps = math.ceil(metrics["scrollH"] / client_h)
+        for index in range(steps):
+            root_locator.evaluate("el => el.scrollTop = %d" % (index * client_h))
+            page.wait_for_timeout(120)
+            tiles.append(root_locator.screenshot(type="png"))
+        root_locator.evaluate("""el => {
+            el.scrollTop = 0;
+            const s = document.getElementById('__replica_noscrollbar');
+            if (s) s.remove();
+        }""")
+        widths = {Image.open(io.BytesIO(tile)).size[0] for tile in tiles}
+        width = max(widths) if widths else 0
+        canvas = Image.new("RGB", (width, int(metrics["scrollH"])), (3, 6, 9))
+        offset = 0
+        for tile in tiles:
+            image = Image.open(io.BytesIO(tile)).convert("RGB")
+            canvas.paste(image, (0, offset))
+            offset += image.size[1]
+        assets_dir = capture_root / "assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        path = assets_dir / f"series_list_full_{document_id.replace(':', '_')}.jpeg"
+        canvas.save(path, "JPEG", quality=90)
+        rel = str(path.relative_to(capture_root)).replace("\\", "/")
+        return rel, int(metrics["scrollH"])
+    except Exception:
+        return None, 0
+
+
 def _series_scope_root(target_locator: object, container_selector: str | None = None) -> object:
     """Return the scrollable series-list container that owns the target, same-frame.
 
@@ -713,6 +772,17 @@ class LiveCaptureSession:
             else:
                 region = capture_interaction_region(target_locator.locator("xpath=.."), marker_region_type(marker_label), target_document.document_id)
             target_document.regions.append(region)
+            if marker_label == "序列选择" and target_locator is not None:
+                container = _series_scope_root(
+                    target_locator,
+                    (self._series_cfg or {}).get("item_container_selector"),
+                )
+                rel, content_h = _capture_series_list_full(
+                    container, capture_root, target_document.document_id, page
+                )
+                if rel:
+                    target_document.series_list_full_asset_relpath = rel
+                    target_document.series_list_content_height = content_h
         (capture_root / "topology.json").write_text(
             json.dumps({"pages": [asdict(item) for item in pages], "documents": [asdict(item) for item in documents]}, ensure_ascii=False, indent=2),
             encoding="utf-8",

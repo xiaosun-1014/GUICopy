@@ -396,22 +396,30 @@ def _render_document(
     series_key_by_member: dict[str, str] | None = None,
     selected_series_key: str | None = None,
     series_route_by_identity: dict[str, dict[str, object]] | None = None,
+    series_list_asset: str | None = None,
 ) -> str:
     asset = _relative_url(destination, output_root / asset_path)
     viewport_h = float(document.viewport["height"])
     # A series list that scrolls in the real viewer is captured in scrolling
     # content coordinates, so its rows below the captured fold sit at content
-    # y beyond the screenshot height. Give the overlay a scrollable content
-    # height (restoring the list's independent vertical scroll) so those rows
-    # become reachable; the below-fold rows render their own DOM content.
+    # y beyond the screenshot height.
     series_extent = 0.0
+    series_region = None
     for region in document.regions:
         if region.region_type != "series":
             continue
+        if series_region is None:
+            series_region = region
         for member in region.members:
             member_rect = member.dom.rect
             series_extent = max(series_extent, float(member_rect.y) + float(member_rect.height))
-    series_overflow = series_extent > viewport_h + 1.0
+    # With a full-content list capture the whole (taller) page scrolls so the
+    # panel background and its rows move together like the real viewer; without
+    # one we fall back to a scrollable overlay whose below-fold rows render
+    # their own DOM content over a fixed screenshot.
+    has_tall_list = bool(series_list_asset) and series_region is not None
+    page_overflow = has_tall_list and series_extent > viewport_h + 1.0
+    series_overflow = (not has_tall_list) and series_extent > viewport_h + 1.0
     parts = [
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>Replica</title>",
         "<style>"
@@ -451,15 +459,33 @@ def _render_document(
         "@media(max-width:720px){.replica-metadata .content{padding-inline:24px}.replica-metadata .bd{grid-template-columns:1fr}.replica-metadata .item.single{grid-column:auto}}"
         "</style>",
         "</head>",
-        f'<body><main class="replica" data-viewport-width="{document.viewport["width"]}" '
-        f'data-viewport-height="{document.viewport["height"]}" '
-        f'style="width:{document.viewport["width"]}px;height:{document.viewport["height"]}px">',
-        f'<img class="replica-bg" src="{asset}" alt="Captured visual state">',
+        (
+            f'<body><main class="replica" data-viewport-width="{document.viewport["width"]}" '
+            f'data-viewport-height="{document.viewport["height"]}" '
+            f'style="width:{document.viewport["width"]}px;height:{viewport_h:.0f}px;'
+            f'overflow-y:auto;overscroll-behavior:contain">'
+            if page_overflow else
+            f'<body><main class="replica" data-viewport-width="{document.viewport["width"]}" '
+            f'data-viewport-height="{document.viewport["height"]}" '
+            f'style="width:{document.viewport["width"]}px;height:{document.viewport["height"]}px">'
+        ),
+        (
+            f'<img class="replica-bg" src="{asset}" alt="Captured visual state"'
+            f' style="height:{viewport_h:.0f}px">'
+            if page_overflow else f'<img class="replica-bg" src="{asset}" alt="Captured visual state">'
+        ),
         (
             '<section class="overlay" style="overflow-y:auto;max-height:'
             f'{viewport_h:.0f}px;height:{series_extent:.0f}px;'
             'overscroll-behavior:contain;scrollbar-gutter:stable">'
             if series_overflow else '<section class="overlay">'
+        ),
+        (
+            f'<img class="series-pane-bg" src="{series_list_asset}" '
+            f'style="position:absolute;left:{series_region.root.rect.x}px;'
+            f'top:{series_region.root.rect.y}px;width:{series_region.root.rect.width}px;'
+            f'height:{document.series_list_content_height}px;pointer-events:none;">'
+            if has_tall_list else ""
         ),
     ]
     rendered_nodes: set[tuple[str, float, float, float, float]] = set()
@@ -861,6 +887,7 @@ def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Pa
     states = {state.state_id: state for state in flow.states}
     _augment_meta_two_step(flow, states)
     asset_paths: dict[tuple[str, str], Path] = {}
+    series_list_asset_paths: dict[tuple[str, str], Path] = {}
     copied_hashes: set[Path] = set()
     total_asset_bytes = 0
     for state in flow.states:
@@ -871,13 +898,25 @@ def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Pa
             visual_hash = sha256_file(visual_source) if visual_source.exists() else document.screenshot_sha256
             asset_paths[(state.state_id, document.document_id)] = Path("assets") / "by-hash" / f"{visual_hash}{suffix}"
             destination_asset = output_root / asset_paths[(state.state_id, document.document_id)]
-            if destination_asset in copied_hashes:
-                continue
-            destination_asset.parent.mkdir(parents=True, exist_ok=True)
-            if visual_source.exists():
-                shutil.copy2(visual_source, destination_asset)
-                total_asset_bytes += destination_asset.stat().st_size
+            if destination_asset not in copied_hashes:
+                destination_asset.parent.mkdir(parents=True, exist_ok=True)
+                if visual_source.exists():
+                    shutil.copy2(visual_source, destination_asset)
+                    total_asset_bytes += destination_asset.stat().st_size
             copied_hashes.add(destination_asset)
+            if document.series_list_full_asset_relpath:
+                tall_source = source_root / document.series_list_full_asset_relpath
+                tall_visual = tall_source.with_suffix(".jpeg") if tall_source.with_suffix(".jpeg").exists() else tall_source
+                tall_suffix = tall_visual.suffix or ".png"
+                if tall_visual.exists():
+                    tall_hash = sha256_file(tall_visual)
+                    series_list_asset_paths[(state.state_id, document.document_id)] = Path("assets") / "by-hash" / f"{tall_hash}{tall_suffix}"
+                    tall_dest = output_root / series_list_asset_paths[(state.state_id, document.document_id)]
+                    if tall_dest not in copied_hashes:
+                        tall_dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(tall_visual, tall_dest)
+                        total_asset_bytes += tall_dest.stat().st_size
+                    copied_hashes.add(tall_dest)
     build_warnings: list[str] = []
     if total_asset_bytes >= ASSET_CONFIRM_BYTES:
         build_warnings.append(f"asset_size_confirmation_required:{total_asset_bytes}")
@@ -1053,6 +1092,10 @@ def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Pa
                 series_key_by_member=series_key_by_member or None,
                 selected_series_key=selected_series_key,
                 series_route_by_identity=series_route_by_identity or None,
+                series_list_asset=(
+                    _relative_url(destination, output_root / series_list_asset_paths[(state.state_id, document.document_id)])
+                    if (state.state_id, document.document_id) in series_list_asset_paths else None
+                ),
             ), encoding="utf-8")
     entrypoint = output_root / "index.html"
     if not entrypoint.exists():

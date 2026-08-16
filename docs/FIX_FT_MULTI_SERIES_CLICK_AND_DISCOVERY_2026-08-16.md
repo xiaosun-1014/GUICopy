@@ -261,6 +261,21 @@ style = (
 
 实测（run `20260816T050045Z-f44c89` 重建副本，1696×880）：滚动到底后最后两行（MPR-Cor / **MPR-Sag**，opacity:1）可见；屏幕坐标点击 MPR-Sag → `states/bviewer_b007_95d26a714ce1/index.html` → 点 Meta → `states/bmeta_b007_95d26a714ce1/index.html`，console 0 错误。
 
+**完整复刻模式（滚动时面板整块一起动）**：上面是「无长图回退」——滚动时只有行内容在动、面板截图静止。要做到贴近原站，捕获端 `batch_capture_replicate._capture_series_list_full` 在「序列选择」marker 快照时对序列容器做 **scroll-stitch 长图**（逐屏截图拼成整张 `scrollHeight` 高 image，`scrolling-content` 坐标，恢复 scrollTop），写入 `ReplicaDocument.series_list_full_asset_relpath` / `series_list_content_height`。构建端（`_render_document`）在有长图时：
+- `.replica` 固定视口高 + `overflow-y:auto`，整页成为滚动容器；
+- 面板窗口（series region root rect）位置叠一张不透明 `.series-pane-bg` 长图，行 route 覆盖其上——滚动时**背景长图与行一起动**，观感与原站一致。
+
+旧 run（无长图字段）自动走上面的回退路径，行为与已验收一致。
+
+### 6.6 恢复分支 Meta 两步打开（2026-08-16 补充）
+
+分支（bviewer_bXXX）原先被 `_synthetic_meta_open_target` 压成「点更多→直达 bmeta」一步，与真实站「更多→Tags→面板」不符；另发现主录制路径的 Tags 步（s_002）只有 transition、没有可点元素（死路）。
+
+`build_replica._augment_meta_two_step`（构建期，无需重录）：
+- 主路径：给「有 transition 但无渲染元素、且目标为 Meta 态」的动作合成一个可见 Tags 行元素（`data-replica-visible`），恢复 s_002→s_003 可点；
+- 分支：为每个使用了 `series:<branch>:meta_open` 合成跳跃的分支插入中间态 `btags_<branch>`（复用该分支自己的 Viewer 文档/截图 + 一个可见 Tags 行），并把 viewer 的更多改经该态路由：更多 → 中间 Tags 菜单 → Tags → 本分支 bmeta。非合成形态的分支（普通录制动作驱动）不受影响。
+- 分支 btags 在旧 run 重建副本实测：更多 → `states/btags_b002_fd19ce457cc2/` → Tags → `states/bmeta_b002_fd19ce457cc2/`，console 0 错误。
+
 ## 7. 代码变更清单
 
 | 文件 | 变更 | 目的 |
@@ -274,6 +289,14 @@ style = (
 | `test/test_build_replica.py` | 增加 route 几何断言 | 锁住绝对定位信息不再丢失 |
 | `test/test_build_replica.py` | 新增折叠滚动单测 | 锁住 `.overlay` 滚动样式、折叠行标记与 CSS 规则，且视口内列表不加滚动 |
 | `test/test_replica_runtime.py` | 新增折叠滚动浏览器回归 | 滚动后命中并点开折叠下序列的 viewer + Metadata |
+| `replica_models.py` | `ReplicaDocument` 新增 `series_list_full_asset_relpath` / `series_list_content_height`（带默认值） | 承载完整列表长图与内容高度，旧 manifest 兼容 |
+| `batch_capture_replicate.py` | 新增 `_capture_series_list_full()` scroll-stitch 长图 + 「序列选择」快照挂接 | 录制时保存整张列表长图（后续重录生效） |
+| `build_replica.py` | 有长图时整页滚动 + `.series-pane-bg` 面板背景（§6.5 完整复刻模式） | 滚动时面板背景与行一起动，贴合原站 |
+| `build_replica.py` | 新增 `_augment_meta_two_step()`（§6.6） | 恢复分支与主路径「更多→Tags→面板」两步 |
+| `test/test_replica_runtime.py` | 新增 tall-page 滚动浏览器回归 | 锁住整页滚动 + 长图背景 + 折叠下仍可点 |
+| `test/test_build_replica.py` | 新增两步合成 build 断言 + 边界守卫 | 锁住 btags 合成且不误伤普通分支 |
+| `test/test_replica_runtime.py` | 新增两步浏览器回归 | 更多→btags→Tags→bmeta 交互 |
+| `test/test_capture_and_build_series_contract.py` | 整链 Meta 验收改为两步 | 契约对齐真实交互 |
 
 修复保持在共享捕获/构建逻辑中，没有直接修改某个 `completed_*.py` 或手工篡改 manifest。
 

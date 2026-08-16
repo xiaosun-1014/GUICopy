@@ -346,14 +346,23 @@ class CaptureAndBuildSeriesContractTests(unittest.TestCase):
                 viewer_url = page.url
                 self.assertIn("states/bviewer_", viewer_url)
 
-                # Real captured Metadata trigger -> bmeta_ state.
+                # Real captured Metadata trigger reproduces the real two-step
+                # interaction: 更多 -> Tags menu middle state -> Tags -> bmeta_.
                 trigger = f'[data-replica-action="series:{branch.branch_id}:meta_open"]'
                 self.assertGreaterEqual(page.locator(trigger).count(), 1, "metadata trigger overlay missing")
                 page.locator(trigger).first.click()
                 try:
+                    page.wait_for_url(lambda url: f"states/btags_{branch.branch_id}" in url, timeout=10000)
+                except Exception:
+                    self.fail("clicking 更多 did not open the Tags middle state")
+                tags = f'[data-replica-action="series:{branch.branch_id}:tags"]'
+                self.assertGreaterEqual(page.locator(tags).count(), 1, "Tags row missing in middle state")
+                self.assertEqual(page.locator(tags).first.evaluate("el => getComputedStyle(el).opacity"), "1")
+                page.locator(tags).first.click()
+                try:
                     page.wait_for_url(lambda url: "states/bmeta_" in url, timeout=10000)
                 except Exception:
-                    self.fail("clicking metadata trigger did not open the branch metadata state")
+                    self.fail("clicking Tags did not open the branch metadata state")
 
                 panel = page.locator(".replica-metadata").first
                 self.assertTrue(panel.is_visible(), "metadata panel not visible")
