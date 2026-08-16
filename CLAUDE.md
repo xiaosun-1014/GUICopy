@@ -13,6 +13,7 @@
   - `metadata-panel-sibling-controls-regression.md` — metadata 面板兄弟控件离线回放回归（5c2e2d4 + b637886 叠加）定位与修复；教训：**环境可跑浏览器就一定要跑浏览器套件**，两处独立改动可能叠加成回归
   - `multi-series-subprocess-mainpath-series-region-bug.md` — 子进程整链测试暴露的主路径序列选择快照 strict-mode bug（`.first` 修复）；教训：in-process 调用跳过插桩注入，只有子进程能测主路径，多元素 locator 的单元素操作必须 `.first`
   - `multi-series-activation-selector-divergence.md` — review 发现激活路径 `_locate_series_row` 漏接配置 `item_selector` 导致 FTImage 批量激活全失败；教训：发现/激活选择器必须同源、fixture 若恰好被默认选择器命中会掩盖配置断链，要同时测发现+激活两条路径
+  - `nonmultimodal-backend-subagent-read-image-api500.md` — 本机代理模型非多模态（DeepSeek-V4-Flash），子代理一 Read 截图/图片就 API 500 中断且恢复后再复发；教训：看图类验证改为主会话零读图 DOM 断言（elementFromPoint / getAttribute / wait_for_url），截图只 `.jpeg` 落盘不回读
 - **本文件（CLAUDE.md）** — 项目核心上下文，整合所有记忆的要点
 
 不再使用系统级（AppData）记忆存储。如需添加或更新记忆，直接编辑 `memory/` 下的对应文件，并同步更新 CLAUDE.md 中的相关章节。
