@@ -331,9 +331,15 @@ class ReplicaRuntimeTests(unittest.TestCase):
                 browser = playwright.chromium.launch()
                 page = browser.new_page()
                 page.goto(server.url)
-                page.locator("#two").click()
-                self.assertEqual(page.locator("#two").get_attribute("aria-selected"), "true")
-                self.assertEqual(page.locator("#one").get_attribute("aria-selected"), "false")
+                # Raw ``id`` attributes are identity-redacted from the served
+                # DOM, so locate rows by role+text. Rows are transparent
+                # hit-layers (opacity:0, pixels come from the screenshot), so
+                # dispatch the click on the DOM node to assert the handler.
+                two_row = page.locator('[role="option"]', has_text="Two").first
+                one_row = page.locator('[role="option"]', has_text="One").first
+                two_row.evaluate("el => el.click()")
+                self.assertEqual(two_row.get_attribute("aria-selected"), "true")
+                self.assertEqual(one_row.get_attribute("aria-selected"), "false")
                 browser.close()
 
     def test_click_transitions_to_manifest_declared_state(self):
@@ -673,7 +679,7 @@ class ReplicaRuntimeTests(unittest.TestCase):
                 self.assertEqual(page.locator(".replica-metadata").count(), 1)
                 browser.close()
 
-    def test_series_list_full_panel_scrolls_with_page_and_stays_clickable(self):
+    def test_series_list_full_panel_scrolls_in_panel_and_stays_clickable(self):
         from PIL import Image
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -687,9 +693,17 @@ class ReplicaRuntimeTests(unittest.TestCase):
             build_replica(flow, root, output)
 
             hub = (output / "index.html").read_text(encoding="utf-8")
-            self.assertIn('style="width:300px;height:200px;overflow-y:auto;overscroll-behavior:contain"', hub)
-            self.assertIn('style="height:200px"', hub)  # page screenshot pinned to the fold
-            self.assertIn('class="series-pane-bg"', hub)
+            # The page itself never scrolls: scrolling is scoped to the series
+            # panel's own .series-scroll region (real FT behavior).
+            self.assertNotIn('<main class="replica" data-viewport-width="300" data-viewport-height="200" style="width:300px;height:200px;overflow-y:auto', hub)
+            self.assertIn(
+                '<div class="series-scroll" style="position:absolute;left:0px;top:0px;width:300px;'
+                'height:200px;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable">',
+                hub,
+            )
+            self.assertIn('<div class="series-content" style="position:relative;height:236px">', hub)
+            # The list entries scroll as live DOM content; no moving panel image.
+            self.assertEqual(hub.count('class="series-pane-bg"'), 0)
             self.assertNotIn('overflow-y:auto;max-height:200px', hub)  # no overlay scroll in tall mode
 
             with ReplicaServer(output) as server, sync_playwright() as playwright:
@@ -697,17 +711,22 @@ class ReplicaRuntimeTests(unittest.TestCase):
                 page = browser.new_page(viewport={"width": 300, "height": 200})
                 page.goto(server.url)
                 self.assertGreaterEqual(
-                    page.locator(".replica").evaluate("el => el.scrollHeight - el.clientHeight"),
+                    page.locator(".series-scroll").evaluate("el => el.scrollHeight - el.clientHeight"),
                     30,
                 )
-                self.assertEqual(page.locator(".series-pane-bg").count(), 1)
+                self.assertEqual(page.locator(".series-pane-bg").count(), 0)
                 # Below-fold row (content y 216) is not reachable before scrolling.
                 pre = page.evaluate(
                     "() => document.elementFromPoint(150, 190)?.closest('[data-replica-series-key]')?.getAttribute('data-replica-series-key') || null"
                 )
                 self.assertIsNone(pre)
-                page.locator(".replica").evaluate("el => { el.scrollTop = el.scrollHeight - el.clientHeight; }")
+                # The report background must stay pinned: scrolling the panel does
+                # not move the replica-bg screenshot at all.
+                bg_before = page.locator(".replica-bg").evaluate("el => el.getBoundingClientRect().top")
+                page.locator(".series-scroll").evaluate("el => { el.scrollTop = el.scrollHeight - el.clientHeight; }")
                 page.wait_for_timeout(200)
+                bg_after = page.locator(".replica-bg").evaluate("el => el.getBoundingClientRect().top")
+                self.assertEqual(bg_before, bg_after)
                 hit = page.evaluate(
                     """() => {
                         const el = document.elementFromPoint(150, 190);

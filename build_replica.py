@@ -275,6 +275,7 @@ def _series_member_html(
     selected: bool,
     disabled: bool,
     below_fold: bool = False,
+    dy: float = 0.0,
 ) -> str:
     """Attach a series route key with accessible option semantics to a member node.
 
@@ -283,9 +284,14 @@ def _series_member_html(
     no pixel background and must render their own DOM content (icon + label)
     instead of staying a transparent hit-target (see the CSS rule
     ``[data-replica-below-fold]{opacity:1}`` in ``_render_document``).
+
+    ``dy`` rebases an absolute page rect into a scroll container's local
+    coordinates (tall-list mode moves the rows inside the series panel's own
+    scrolling region, so each row's ``top`` becomes ``rect.y - dy``).
     """
+    top = snapshot.rect.y if dy == 0 else snapshot.rect.y - dy
     style = (
-        f"position:absolute;left:{snapshot.rect.x}px;top:{snapshot.rect.y}px;"
+        f"position:absolute;left:{snapshot.rect.x}px;top:{top}px;"
         f"width:{snapshot.rect.width}px;height:{snapshot.rect.height}px;"
     )
     attributes = (
@@ -397,6 +403,7 @@ def _render_document(
     selected_series_key: str | None = None,
     series_route_by_identity: dict[str, dict[str, object]] | None = None,
     series_list_asset: str | None = None,
+    menu_strip: dict[str, object] | None = None,
 ) -> str:
     asset = _relative_url(destination, output_root / asset_path)
     viewport_h = float(document.viewport["height"])
@@ -413,13 +420,36 @@ def _render_document(
         for member in region.members:
             member_rect = member.dom.rect
             series_extent = max(series_extent, float(member_rect.y) + float(member_rect.height))
-    # With a full-content list capture the whole (taller) page scrolls so the
-    # panel background and its rows move together like the real viewer; without
-    # one we fall back to a scrollable overlay whose below-fold rows render
-    # their own DOM content over a fixed screenshot.
+    # Real-viewer scroll scoping: only the series panel scrolls; the report /
+    # viewer background stays pinned. With a full-content list capture we build a
+    # dedicated scroll region at the recorded panel rect (origin + the panel's
+    # on-screen height), inside which the tall panel background and the rows move
+    # together. Without one we fall back to a scrollable overlay whose below-fold
+    # rows render their own DOM content over a fixed screenshot.
     has_tall_list = bool(series_list_asset) and series_region is not None
-    page_overflow = has_tall_list and series_extent > viewport_h + 1.0
+    tall_scroll = has_tall_list and series_extent > viewport_h + 1.0
     series_overflow = (not has_tall_list) and series_extent > viewport_h + 1.0
+    series_origin_x = 0.0
+    series_origin_y = 0.0
+    series_pane_w = 0.0
+    series_pane_h = 0.0
+    series_view_h = 0.0
+    if tall_scroll:
+        root_rect = series_region.root.rect
+        series_origin_x = float(root_rect.x)
+        series_origin_y = float(root_rect.y)
+        series_pane_w = float(root_rect.width)
+        # The scroll-stitched panel image (content_height) is the container's full
+        # scrollHeight and can carry header/whitespace above and below the rows;
+        # the *rows'* extent is what should drive how far the panel can scroll so
+        # the last row reaches the bottom of the on-screen window when the user
+        # scrolls to the end (real FT behavior).
+        series_pane_h = max(0.0, series_extent - series_origin_y)
+        series_view_h = viewport_h - series_origin_y
+        if series_view_h <= 1.0 or series_pane_h <= series_view_h + 1.0:
+            # Nothing actually scrolls; degrade to the fixed-page rendering.
+            tall_scroll = False
+            series_origin_x = series_origin_y = series_pane_w = series_pane_h = series_view_h = 0.0
     parts = [
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>Replica</title>",
         "<style>"
@@ -429,6 +459,10 @@ def _render_document(
         ".replica-bg{display:block;width:100%;height:100%;object-fit:fill}"
         ".overlay{position:absolute;inset:0}.overlay>*{box-sizing:border-box}"
         ".overlay>[data-replica-overlay]{opacity:0}.overlay>[data-replica-action]{z-index:1}.overlay>[data-replica-series-key]{z-index:2}.overlay>[data-replica-series-key][data-replica-below-fold]{opacity:1}"
+        "/* Tall-list mode: only the series panel scrolls; its rows scroll as"
+        "rendered DOM content (no moving background image), matching the real FT"
+        "panel where scrolling moves the list entries, not the panel chrome. */"
+        ".overlay .series-scroll [data-replica-series-key]{pointer-events:auto}"
         ".overlay>[data-replica-visible]{opacity:1;z-index:3;background:rgb(20,25,33);border:1px solid rgb(44,52,63);"
         "border-radius:4px;color:rgb(209,228,255);display:flex;align-items:center;justify-content:center;"
         "font:13px/1.4 'Helvetica Neue',Helvetica,sans-serif;cursor:pointer;box-shadow:0 8px 20px rgba(0,0,0,.55)}"
@@ -460,19 +494,16 @@ def _render_document(
         "</style>",
         "</head>",
         (
+            # The page itself never scrolls in the replica: the report/viewer
+            # background stays pinned, exactly like the real FT viewer. Only the
+            # series panel (its own .series-scroll region) or, in fallback mode,
+            # the whole overlay scrolls.
             f'<body><main class="replica" data-viewport-width="{document.viewport["width"]}" '
             f'data-viewport-height="{document.viewport["height"]}" '
-            f'style="width:{document.viewport["width"]}px;height:{viewport_h:.0f}px;'
-            f'overflow-y:auto;overscroll-behavior:contain">'
-            if page_overflow else
-            f'<body><main class="replica" data-viewport-width="{document.viewport["width"]}" '
-            f'data-viewport-height="{document.viewport["height"]}" '
-            f'style="width:{document.viewport["width"]}px;height:{document.viewport["height"]}px">'
+            f'style="width:{document.viewport["width"]}px;height:{viewport_h:.0f}px">'
         ),
         (
-            f'<img class="replica-bg" src="{asset}" alt="Captured visual state"'
-            f' style="height:{viewport_h:.0f}px">'
-            if page_overflow else f'<img class="replica-bg" src="{asset}" alt="Captured visual state">'
+            f'<img class="replica-bg" src="{asset}" alt="Captured visual state">'
         ),
         (
             '<section class="overlay" style="overflow-y:auto;max-height:'
@@ -485,7 +516,17 @@ def _render_document(
             f'style="position:absolute;left:{series_region.root.rect.x}px;'
             f'top:{series_region.root.rect.y}px;width:{series_region.root.rect.width}px;'
             f'height:{document.series_list_content_height}px;pointer-events:none;">'
-            if has_tall_list else ""
+            if (has_tall_list and not tall_scroll) else ""
+        ),
+        (
+            # Real 更多 menu row (tool-button strip) captured from the recorded
+            # menu-open snapshot, painted over the fixed viewer background for the
+            # synthetic btags intermediate state. Purely visual; the clickable
+            # Tags button is a separate transparent hit layer on top.
+            f'<img class="replica-menu-strip" src="{_relative_url(destination, output_root / menu_strip["relpath"])}" '
+            f'style="position:absolute;left:{menu_strip["left"]}px;top:{menu_strip["top"]}px;'
+            f'width:{menu_strip["width"]}px;height:{menu_strip["height"]}px;pointer-events:none;">'
+            if menu_strip else ""
         ),
     ]
     rendered_nodes: set[tuple[str, float, float, float, float]] = set()
@@ -568,6 +609,7 @@ def _render_document(
             rendered_nodes.add((snapshot.outer_html, snapshot.rect.x, snapshot.rect.y, snapshot.rect.width, snapshot.rect.height))
             if snapshot.attributes.get("id"):
                 rendered_element_ids.add(snapshot.attributes["id"])
+    series_chunks: list[str] = []
     for region in document.regions:
         metadata_panel_html_for_region = (
             metadata_panel_html.get(region.region_id)
@@ -607,6 +649,7 @@ def _render_document(
                     if identity_route is not None:
                         series_key = str(identity_route.get("slug"))
                         disabled_route = bool(identity_route.get("disabled"))
+            is_series_region = region.region_type == "series"
             if series_key is not None:
                 route = (series_route or {}).get(series_key, {})
                 member_markup = _series_member_html(
@@ -615,20 +658,39 @@ def _render_document(
                     selected=bool(series_key == selected_series_key),
                     disabled=disabled_route or bool(route.get("disabled")),
                     below_fold=bool(member.dom.rect.y >= viewport_h),
+                    dy=(series_origin_y if tall_scroll and is_series_region else 0.0),
                 )
-                parts.append(_redact_known_series_identities(
+                member_markup = _redact_known_series_identities(
                     member_markup, series_route_by_identity
-                ))
+                )
             else:
                 positioned = _positioned_html(member.dom)
-                if region.region_type == "series":
+                if is_series_region:
                     positioned = _redact_series_snapshot_markup(member.dom, positioned)
-                parts.append(_redact_known_series_identities(
+                member_markup = _redact_known_series_identities(
                     positioned, series_route_by_identity
-                ))
+                )
+            if tall_scroll and is_series_region:
+                series_chunks.append(member_markup)
+            else:
+                parts.append(member_markup)
             rendered_nodes.add(member_key)
             if member.dom.attributes.get("id"):
                 rendered_element_ids.add(member.dom.attributes["id"])
+    if tall_scroll and series_chunks:
+        # The series panel is its own scroll region: only the list rows scroll
+        # as live DOM content (no moving background strip), the report
+        # background stays pinned. Rows are visible from the start so the list
+        # reads like the real panel (scrolling repositions the entries).
+        parts.append(
+            f'<div class="series-scroll" style="position:absolute;'
+            f'left:{series_origin_x:.0f}px;top:{series_origin_y:.0f}px;'
+            f'width:{series_pane_w:.0f}px;height:{series_view_h:.0f}px;'
+            f'overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable">'
+            f'<div class="series-content" style="position:relative;height:{series_pane_h:.0f}px">'
+        )
+        parts.extend(series_chunks)
+        parts.append("</div></div>")
     rendered_metadata_regions: set[str] = set()
     for region in document.regions:
         if (
@@ -738,7 +800,108 @@ def _locator_risk_metadata(flow: ReplicaFlow) -> dict[str, dict[str, object]]:
     return metadata
 
 
-def _augment_meta_two_step(flow: ReplicaFlow, states: dict[str, ReplicaState]) -> None:
+# A full-content (real record) 更多 menu-open snapshot shows the revealed tool
+# button row. On FT the whole row sits in the top-right band x in [~844, 1504)
+# with the Tags button at its right end (measured diffs of before/after
+# snapshots). The strip window is FT-specific by design; other viewers without
+# such a row simply keep the plain per-branch Tags button below.
+_MENU_STRIP_X0 = 844  # measured left edge of the revealed FT tool-button row
+
+def _find_real_tags_menu_source(
+    flow: ReplicaFlow, source_root: Path
+) -> dict[str, object] | None:
+    """Locate the recorded (non-synthetic) 更多 menu-open document.
+
+    Returns the captured ``tool-tags`` button (its real rect + DOM, the only
+    sibling we actually route through) and the snapshot that visually contains
+    the whole revealed tool-button row. ``None`` when no such capture exists
+    (synthetic fixtures / older runs), which degrades ``_augment_meta_two_step``.
+    """
+    for state in flow.states:
+        for document in state.documents or []:
+            if not document.screenshot_asset_relpath:
+                continue
+            for region in document.regions or []:
+                if region.region_type != "metadata" or region.root is None:
+                    continue
+                root = region.root
+                klass = " ".join((root.attributes.get("class", ""), root.attributes.get("id", ""))).lower()
+                if "tool-tags" not in klass or any(
+                    token in klass for token in ("tagsbox", "box-tags", "dicom", "metadata")
+                ):
+                    continue
+                return {
+                    "rect": root.rect,
+                    "outer_html": root.outer_html,
+                    "screenshot_relpath": document.screenshot_asset_relpath,
+                }
+    return None
+
+
+def _make_menu_strip(
+    tags_menu: dict[str, object], source_root: Path, output_root: Path
+) -> dict[str, object] | None:
+    """Crop the real tool-button row out of the menu-open snapshot as an asset.
+
+    The strip is painted under the synthetic Tags button so the intermediate
+    state shows the recorded one-row toolbar with Tags at its right end instead
+    of a lone floating label (P-sibling: only Tags is routed to the Metadata
+    state; the rest of the row is inert pixels). Returns ``None`` to degrade if
+    the source image cannot be opened.
+    """
+    from PIL import Image  # build-time only; availability is runtime-independent
+
+    src = source_root / str(tags_menu["screenshot_relpath"])
+    if not src.exists():
+        jpeg = src.with_suffix(".jpeg")
+        if jpeg.exists():
+            src = jpeg
+        else:
+            return None
+    rect = tags_menu["rect"]
+    try:
+        im = Image.open(src).convert("RGB")
+    except Exception:  # noqa: BLE001 - degrade to the plain Tags button
+        return None
+    width, height = im.size
+    if rect.x < width * 0.5:  # Tags not near the right edge: don't guess the row
+        return None
+    x0 = min(_MENU_STRIP_X0, max(0, width - 1))
+    left = min(int(rect.x) - 4, max(x0, 0))
+    top = max(0, int(rect.y) - 2)
+    right = width
+    bottom = min(height, int(rect.y) + int(rect.height) + 2)
+    if right - left <= 8 or bottom - top <= 4:
+        return None
+    strip = im.crop((left, top, right, bottom))
+    import io
+    buf = io.BytesIO()
+    try:
+        strip.save(buf, format="JPEG", quality=88)
+        payload = buf.getvalue()
+    except Exception:  # noqa: BLE001 - JPEG unsupported degrades gracefully
+        return None
+    digest = hashlib.sha256(payload).hexdigest()[:16]
+    relpath = f"assets/by-hash/menu_strip_{digest}.jpeg"
+    dest = output_root / relpath
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not dest.exists():
+        dest.write_bytes(payload)
+    return {
+        "relpath": relpath,
+        "left": left,
+        "top": top,
+        "width": right - left,
+        "height": bottom - top,
+    }
+
+
+def _augment_meta_two_step(
+    flow: ReplicaFlow,
+    states: dict[str, ReplicaState],
+    tags_menu: dict[str, object] | None = None,
+    menu_strip: dict[str, object] | None = None,
+) -> None:
     """Restore the recorded 更多 -> Tags two-step Metadata open on offline pages.
 
     Two fidelity gaps make the replica diverge from the real page:
@@ -750,8 +913,13 @@ def _augment_meta_two_step(flow: ReplicaFlow, states: dict[str, ReplicaState]) -
       single ``series:<branch>:meta_open`` action jumping straight to the branch
       Metadata state. Insert a per-branch intermediate ``btags_<branch>`` state
       that reuses the branch's own Viewer document + screenshot and adds a
-      visible "Tags" row; route the Viewer's 更多 through it, so opening
+      clickable "Tags" row; route the Viewer's 更多 through it, so opening
       Metadata observes the real two-step interaction.
+
+    ``tags_menu`` / ``menu_strip`` (from ``_find_real_tags_menu_source`` /
+    ``_make_menu_strip``) restore the real one-row toolbar: the Tags button is
+    placed at its captured rect with its real ``tool tool-tags`` markup, and the
+    recorded button-row pixels are painted in as the intermediate state.
     """
     fallback_rect = Rect(1264, 44, 96, 34, "page_viewport_css")
 
@@ -762,6 +930,19 @@ def _augment_meta_two_step(flow: ReplicaFlow, states: dict[str, ReplicaState]) -
         return fallback_rect
 
     def synthetic_tags_target(action_id: str, doc: ReplicaDocument) -> ActionTarget:
+        if tags_menu is not None:
+            # Real toolbar button: exact rect + markup, kept as a transparent
+            # hit-layer (pixels come from the menu strip under it).
+            rect = tags_menu["rect"]
+            dom = DomNodeSnapshot(
+                "a", "Tags",
+                {"class": "tool tool-tags", "title": "Tags", "data-tool": "tags"},
+                rect, str(tags_menu["outer_html"]), {},
+            )
+            return ActionTarget(
+                action_id, "m_tags", "click", "locator", {},
+                None, dom, None, None, None, "execute", None, doc.document_id, None,
+            )
         rect = tags_rect_for(doc)
         dom = DomNodeSnapshot(
             "a", "Tags", {"data-replica-visible": ""},
@@ -824,10 +1005,31 @@ def _augment_meta_two_step(flow: ReplicaFlow, states: dict[str, ReplicaState]) -
         if viewer_doc is None:
             continue
         btags_id = f"btags_{branch.branch_id}"
+        # In the real menu-open state 更多 is highlighted (active). The branch
+        # viewer snapshot predates the click, so mark the copied target active
+        # without mutating the viewer state's own target.
+        branch_targets = []
+        for viewer_target in list(viewer_doc.targets or []):
+            if (
+                viewer_target.action_id == f"series:{branch.branch_id}:meta_open"
+                and viewer_target.dom is not None
+                and "tool-more" in viewer_target.dom.outer_html
+                and "active" not in viewer_target.dom.outer_html
+            ):
+                viewer_target = replace(
+                    viewer_target,
+                    dom=replace(
+                        viewer_target.dom,
+                        outer_html=viewer_target.dom.outer_html.replace(
+                            "tool-more", "tool-more active", 1
+                        ),
+                    ),
+                )
+            branch_targets.append(viewer_target)
         tags_doc = replace(
             viewer_doc,
             document_id=f"{btags_id}__doc",
-            targets=list(viewer_doc.targets or [])
+            targets=branch_targets
             + [synthetic_tags_target(f"series:{branch.branch_id}:tags", viewer_doc)],
         )
         pages = [replace(page, entry_document_id=tags_doc.document_id) for page in viewer_state.pages]
@@ -885,7 +1087,9 @@ def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Pa
     locator_risk_metadata = _locator_risk_metadata(flow)
     (output_root / "locator_mapping.json").write_text(json.dumps(locator_risk_metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     states = {state.state_id: state for state in flow.states}
-    _augment_meta_two_step(flow, states)
+    tags_menu = _find_real_tags_menu_source(flow, source_root)
+    menu_strip = _make_menu_strip(tags_menu, source_root, output_root) if tags_menu else None
+    _augment_meta_two_step(flow, states, tags_menu=tags_menu, menu_strip=menu_strip)
     asset_paths: dict[tuple[str, str], Path] = {}
     series_list_asset_paths: dict[tuple[str, str], Path] = {}
     copied_hashes: set[Path] = set()
@@ -1096,6 +1300,9 @@ def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Pa
                     _relative_url(destination, output_root / series_list_asset_paths[(state.state_id, document.document_id)])
                     if (state.state_id, document.document_id) in series_list_asset_paths else None
                 ),
+                # Only the synthetic per-branch Tags-menu states paint the real
+                # recorded tool-button row over their viewer background.
+                menu_strip=(menu_strip if state.state_id.startswith("btags_") else None),
             ), encoding="utf-8")
     entrypoint = output_root / "index.html"
     if not entrypoint.exists():

@@ -156,9 +156,9 @@ D:/Anaconda/envs/codegen-marker/python.exe out/ftimage/runs/{run_id}/replica/ser
 
 | 检查点 | 期望 |
 |---|---|
-| 序列列表 | 8 行；**滚动到底**（整块面板背景与行一起动）可见 MPR-Cor / **MPR-Sag** 并可点 |
+| 序列列表 | 8 行；**滚动只发生在序列面板内**（`.series-scroll`，报告固定不动），滚动移动的是**列表行本身**（自渲染 DOM，无移动背景图），**滚动到底**可见 MPR-Cor / **MPR-Sag** 并可点 |
 | 点第 1/2/最后一个可见序列 | 各进不同 Viewer（如 MPR-Sag → `bviewer_b007...`） |
-| 分支开 Meta | 点「更多」→ 先进 Tags 菜单中间态 → 点「Tags」→ 才打开该序列 Meta（**两步**，与原站一致） |
+| 分支开 Meta | 点「更多」→ 先进 Tags 菜单中间态（**真实一行工具按钮**，Tags 在行尾）→ 点「Tags」→ 才打开该序列 Meta（**两步**，与原站一致） |
 | Meta 内容 | 是当前序列自己的（带 SeriesNumber / 唯一值） |
 | 关 Meta | 「× 关闭」→ 回到**同一个**分支 Viewer，不是别的分支 |
 | 跨分支 | Viewer 里也可直接点其它序列跳转；`aria-selected` 随当前序列变化 |
