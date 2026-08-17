@@ -1302,6 +1302,20 @@ class StepTwoLayoutCaptureTests(unittest.TestCase):
         self.assertIsNone(replica_batch._layout_variant_id("品字"))
         self.assertIsNone(replica_batch._layout_variant_id(""))
 
+    def test_layout_variant_id_infers_from_title_with_shift_suffix(self):
+        """Dapeng 布局 option button 文本为空，布局规格在 ``title`` 属性
+        （``title="2*2 Shift+4"``）。title 里的 ``Shift+`` 后缀不得干扰推断。"""
+        for title, expected in [
+            ("1*1 Shift+1", "1*1"),
+            ("2*2 Shift+4", "2*2"),
+            ("3*3 Shift+9", "3*3"),
+            ("1*2 Shift+2", "1*2"),
+            ("2*1", "2*1"),
+            ("2*3 Shift+6", "2*3"),
+            ("1*3 Shift+3", "1*3"),
+        ]:
+            self.assertEqual(replica_batch._layout_variant_id(title), expected, title)
+
     def test_sample_layout_background_waits_for_canvas_and_returns_by_hash(self):
         # 画布 width>0 立即满足 + 连续两次 PNG 不变 → 返回 by-hash relpath。
         import io as _io
@@ -1368,6 +1382,7 @@ class StepTwoLayoutCaptureTests(unittest.TestCase):
         # 每个成员点击后画布指纹不变（canvas_hash 返回相同值）→ 全部跳过。
         variant = SimpleNamespace(is_visible=lambda: True, inner_text=lambda: "2*2",
                                    text_content=lambda: "2*2", click=lambda *a, **k: None,
+                                   get_attribute=lambda name: None,
                                    locator=lambda sel: SimpleNamespace(count=lambda: 0))
         root.locator = lambda sel: SimpleNamespace(count=lambda: 3, nth=lambda i: variant)
         target_document = doc
@@ -1383,6 +1398,48 @@ class StepTwoLayoutCaptureTests(unittest.TestCase):
         self.assertEqual(variants, {})
         self.assertEqual(default_layout, "")
         self.assertTrue(any("layout_capture_partial" in message for message in warnings))
+
+    def test_sample_all_layout_variants_infers_from_title_when_text_empty(self):
+        """Dapeng 布局 option：text 为空、规格在 title 属性（缺陷 F 回归锁）。
+        点击后画布变化（canvas_hash 前后不同）→ 稳定采样 → 变体进 layout_variants。"""
+        from replica_models import ReplicaDocument
+        import io as _io
+        from PIL import Image as _PILImage
+        snapshot_png = _io.BytesIO()
+        _PILImage.new("RGB", (8, 8), (10, 20, 30)).save(snapshot_png, "PNG")
+        stable_png = snapshot_png.getvalue()
+        doc = ReplicaDocument(
+            document_id="d_main", page_id="p_000", page_var="page", page_kind="main",
+            parent_document_id=None, frame_selector=None, frame_id=None, frame_name=None,
+            viewport={"width": 800, "height": 600}, device_scale_factor=1.0, screenshot_scale="css",
+            scroll_x=0.0, scroll_y=0.0, screenshot_asset_relpath="assets/d_main.png",
+            screenshot_sha256="h", screenshot_size_bytes=1,
+        )
+        # 布局 option：text()==''、title="2*2 Shift+4"。
+        variant = SimpleNamespace(
+            is_visible=lambda: True,
+            inner_text=lambda: "",
+            text_content=lambda: "",
+            get_attribute=lambda name: "2*2 Shift+4" if name == "title" else None,
+            click=lambda *a, **k: None,
+            locator=lambda sel: SimpleNamespace(count=lambda: 0),
+        )
+        root = SimpleNamespace(count=lambda: 1, first=SimpleNamespace(), locator=lambda sel: SimpleNamespace(count=lambda: 1, nth=lambda i: variant))
+        page = Mock()
+        page.evaluate = Mock(return_value=1024)
+        # canvas 指纹：点击前 111，点击后 222（变化 → 尝试采样）；采样 PNG 稳定返回。
+        with tempfile.TemporaryDirectory() as tmp:
+            hashes = iter([111, 222])
+            def fake_hash(_page):
+                return next(hashes, 222)
+            with patch("batch_capture_replicate._canvas_hash_or_none", side_effect=fake_hash), \
+                 patch("batch_capture_replicate._canvas_png_or_none", return_value=stable_png):
+                variants, default_layout = replica_batch._sample_all_layout_variants(
+                    page, root, doc, Path(tmp),
+                )
+            self.assertIn("2*2", variants, "title 推断出的变体应采到")
+            rel = variants.get("2*2")
+            self.assertTrue(rel and (Path(tmp) / rel).exists(), f"by-hash 资产未落盘: {rel}")
 
 
 if __name__ == "__main__":

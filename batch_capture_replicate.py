@@ -661,10 +661,15 @@ def _sample_all_layout_variants(
         try:
             if not option.is_visible():
                 continue
-            text = (option.inner_text() or option.text_content() or "").strip()
+            # Dapeng 布局选项 button 的文本为空、布局规格在 title 属性里
+            # （``title="2*2 Shift+4"``）；先 title/aria-label，再 innerText 兜底。
+            hint = (
+                option.get_attribute("title") or option.get_attribute("aria-label")
+                or option.inner_text() or option.text_content() or ""
+            ).strip()
         except Exception:
             continue
-        variant_id = _layout_variant_id(text)
+        variant_id = _layout_variant_id(hint)
         if variant_id is None:
             continue  # 无数字文本的图标项（品字等）不入 variants
         before_hash = _canvas_hash_or_none(page)
@@ -991,18 +996,29 @@ class LiveCaptureSession:
                     None,
                 )
                 layout_root = None
+                frame_scope = None  # viewer frame 上下文（布局浮层/画布所在）；异常/无 region 时回落 page
                 # layout region 存在且 root 非 None 时，从 DOM 解析 #cellStyle 容器。
                 # 无 region（无匹配/无布局浮层）则跳过采样，保持兼容老 viewer。
                 if layout_region is not None and layout_region.root is not None:
                     try:
+                        # ⚠ 布局浮层 #cellStyle 在 viewer iframe 内（page1 的
+                        # content_frame），不在顶层 page。用 target_locator 的
+                        # frame 上下文（ancestor::html → 所在 frame 的根）查
+                        # #cellStyle，而不是 page.locator —— 后者跨 frame 查不到
+                        # 导致 layout_root=None、采样永不生效（缺陷 A）。
+                        # viewer iframe 内持有 canvas 的 Frame（有 .evaluate/.locator）；
+                        # 用 Frame 对象而非 locator——采样函数需要 .evaluate 轮询画布。
+                        frame_scope = _find_viewer_frame(page)
+                        scope = frame_scope if frame_scope is not None else page
                         candidates = ["#cellStyle", "[id*='cellStyle' i]", "[class*='cellStyle' i]"]
-                        layout_root = page.locator(candidates[0])
+                        layout_root = scope.locator(candidates[0])
                         if layout_root.count() == 0:
                             layout_root = None
                     except Exception:
                         layout_root = None
                 variants, default_layout = _sample_all_layout_variants(
-                    page, layout_root, target_document, capture_root,
+                    frame_scope if frame_scope is not None else page,
+                    layout_root, target_document, capture_root,
                 )
                 if variants:
                     target_document.layout_variants = variants
@@ -2576,6 +2592,13 @@ def _load_snapshot_state(capture_root: Path, action_id: str, phase: str) -> tupl
             item["series_list_full_asset_relpath"] = str(
                 (phase_root / item["series_list_full_asset_relpath"]).relative_to(capture_root)
             ).replace("\\", "/")
+        # 布局变体背景同样存于 phase 级（a_001_002/after/assets/by-hash/...）；rebase
+        # 到 capture_root，否则 build 侧 asset 复制在 capture_root/assets 下找不到。
+        if item.get("layout_variants"):
+            item["layout_variants"] = {
+                variant: str((phase_root / relpath).relative_to(capture_root)).replace("\\", "/")
+                for variant, relpath in item["layout_variants"].items()
+            }
         documents.append(ReplicaDocument.from_dict(item))
     return pages, documents
 
@@ -2629,6 +2652,17 @@ def _load_branch_topology(capture_root: Path, branch_dir: Path, subdir: str):
                 ).replace("\\", "/")
             except ValueError:
                 pass
+        layout_variants = item.get("layout_variants")
+        if layout_variants:
+            rebased: dict[str, str] = {}
+            for variant, relpath in layout_variants.items():
+                try:
+                    rebased[variant] = str(
+                        (branch_dir / subdir / relpath).resolve().relative_to(capture_root.resolve())
+                    ).replace("\\", "/")
+                except ValueError:
+                    continue
+            item["layout_variants"] = rebased
         documents.append(ReplicaDocument.from_dict(item))
     return pages, documents
 
