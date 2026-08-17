@@ -9,6 +9,7 @@ from playwright.sync_api import sync_playwright
 
 from build_replica import (
     _promote_series_regions_to_earliest_documents,
+    _propagate_layout_variants_across_documents,
     _redact_known_series_identities,
     _reroute_branch_series_regions_to_viewer_documents,
     _series_member_html,
@@ -1537,6 +1538,103 @@ class DeadEndBackTests(unittest.TestCase):
             # 入口状态不应有返回按钮
             entry_html = (output / "index.html").read_text(encoding="utf-8")
             self.assertNotIn("data-replica-back", entry_html)
+
+
+class LayoutVariantPropagationTests(unittest.TestCase):
+    """布局变体向「拥有同一 viewer document 的更早状态」传播——入口/popup
+    viewer 先于录制布局 marker 状态（zscloud s_001 vs s_002），必须也有可点
+    布局按钮，否则「布局调整后无法继续下一步」。"""
+
+    def _layout_region_with_members(self, document_id):
+        """Layout region with clickable 1*1 / 2*2 members (drives data-replica-layout)."""
+        members = [
+            RegionMember(
+                f"{document_id}_layout_000", "layout",
+                DomNodeSnapshot("button", "", {"id": "layout_1_1"},
+                                Rect(360, 40, 40, 40, "page_viewport_css"),
+                                '<button id="layout_1_1">1*1</button>', {}),
+            ),
+            RegionMember(
+                f"{document_id}_layout_001", "layout",
+                DomNodeSnapshot("button", "", {"id": "layout_2_2"},
+                                Rect(400, 40, 40, 40, "page_viewport_css"),
+                                '<button id="layout_2_2">2*2</button>', {}),
+            ),
+        ]
+        root = DomNodeSnapshot("div", "", {"id": "cellStyle"},
+                               Rect(360, 0, 300, 300, "page_viewport_css"),
+                               '<div id="cellStyle"></div>', {})
+        return InteractionRegion(f"{document_id}_layout", "layout", document_id, root, members, None)
+
+    def _build_flow_popup_viewer(self):
+        def doc(document_id, page_id, page_var, variants=None, with_layout_region=False):
+            regions = [self._layout_region_with_members(document_id)] if with_layout_region else []
+            return ReplicaDocument(
+                document_id, page_id, page_var, "popup" if page_var == "page1" else "main",
+                None, "iframe" if page_var == "page1" else None, None, None,
+                {"width": 640, "height": 400}, 1, "css", 0, 0,
+                "assets/main.png", "main", 3,
+                layout_variants=variants,
+                regions=regions,
+            )
+        evidence = StateEvidence(False, False, False, False, 0, 0, 0, 0, "state")
+        page_model = ReplicaPage("p_main", "page", "main", None, None, "d_p_000_root", True, False)
+        popup_model = ReplicaPage("p_001", "page1", "popup", "main", "replica-popup", "d_p_001_root", True, False)
+        # 布局 region 只挂在带 variants 的状态（s_002）上——传播后 s_001 的 popup 页
+        # 也应渲染它（与真机 zscloud 一致：layout region 在 s_002，s_001 无 region）。
+        # 注意：传播复制的是 variants，不复制 region；为测 `data-replica-layout` 渲染，
+        # 让两个状态都带 layout region（region 本身由 region 传播/捕获决定，独立于 variants）。
+        viewer = doc("d_p_001_f_001", "p_001", "page1", with_layout_region=True)
+        viewer_with_variants = doc(
+            "d_p_001_f_001", "p_001", "page1",
+            {"1*1": "assets/l11.png", "2*2": "assets/l22.png"},
+            with_layout_region=True,
+        )
+        s1 = ReplicaState("s_001", 0, "", "page", [page_model, popup_model],
+                          [doc("d_p_000_root", "p_main", "page"), doc("d_p_001_root", "p_001", "page1"), viewer], [], evidence)
+        s2 = ReplicaState("s_002", 1, "", "page", [page_model, popup_model],
+                          [doc("d_p_000_root", "p_main", "page"), doc("d_p_001_root", "p_001", "page1"), viewer_with_variants], [], evidence)
+        return ReplicaFlow(1, "popup-layout", "recorded.py", "hash", "now", {"width": 640, "height": 400},
+                           BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_001", [s1, s2], [])
+
+    def test_variants_propagate_to_earlier_state_owning_same_document(self):
+        flow = self._build_flow_popup_viewer()
+        propagated = _propagate_layout_variants_across_documents(flow)
+        self.assertEqual(propagated, 1)
+        s1_viewer = next(
+            d for d in flow.states[0].documents if d.document_id == "d_p_001_f_001"
+        )
+        self.assertEqual(s1_viewer.layout_variants, {"1*1": "assets/l11.png", "2*2": "assets/l22.png"})
+
+    def test_propagation_idempotent_and_skips_already_populated(self):
+        flow = self._build_flow_popup_viewer()
+        self.assertEqual(_propagate_layout_variants_across_documents(flow), 1)
+        self.assertEqual(_propagate_layout_variants_across_documents(flow), 0)
+
+    def test_propagation_noop_when_no_variants_anywhere(self):
+        flow = self._build_flow_popup_viewer()
+        for state in flow.states:
+            for document in state.documents:
+                document.layout_variants = {}
+        self.assertEqual(_propagate_layout_variants_across_documents(flow), 0)
+
+    def test_build_renders_layout_in_earlier_viewer_state(self):
+        flow = self._build_flow_popup_viewer()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir(parents=True, exist_ok=True)
+            for f in ("main.png", "l11.png", "l22.png"):
+                (root / "assets" / f).write_bytes(b"png")
+            output = root / "replica"
+            build_replica(flow, root, output)
+            # zscloud Dapeng：popup viewer 是 s_001 的 page1 壳页（pages/p_001），
+            # 先于带 layout_variants 的 s_002；传播后 s_001 的 popup 页必须注入布局。
+            s1_html = (output / "pages" / "p_001" / "index.html").read_text(encoding="utf-8")
+            self.assertIn("window.__REPLICA_LAYOUTS__", s1_html)
+            self.assertIn('data-replica-layout="1*1"', s1_html)
+            self.assertIn('data-replica-layout="2*2"', s1_html)
+            s2_html = (output / "states" / "s_002" / "pages" / "p_001" / "index.html").read_text(encoding="utf-8")
+            self.assertIn("window.__REPLICA_LAYOUTS__", s2_html)
 
 
 if __name__ == "__main__":

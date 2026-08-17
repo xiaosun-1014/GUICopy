@@ -1383,6 +1383,37 @@ def _reroute_branch_series_regions_to_viewer_documents(flow: ReplicaFlow) -> int
     return rerouted
 
 
+def _propagate_layout_variants_across_documents(flow: ReplicaFlow) -> int:
+    """Share a captured document's layout variants with every state that owns
+    the same viewer document, so the entry/popup viewer (which precedes the
+    recorded layout-marker state) still shows clickable layout buttons.
+
+    Layout capture attaches ``layout_variants`` to the document in the state
+    after the recorded layout action (e.g. zscloud s_002). The popup viewer the
+    user actually opens is an earlier state (s_001) with the same
+    ``document_id`` but no variants. Copying variants to every state owning the
+    same ``document_id`` (deep-copy so no shared mutable state) makes the layout
+    background-layer switch available from the very first viewer, matching series
+    region promotion. Returns the number of documents backfilled.
+    """
+    by_document: dict[str, dict[str, str]] = {}
+    for state in flow.states:
+        for document in state.documents:
+            if document.layout_variants:
+                by_document[document.document_id] = dict(document.layout_variants)
+    propagated = 0
+    if not by_document:
+        return 0
+    for state in flow.states:
+        for document in state.documents:
+            variants = by_document.get(document.document_id)
+            if not variants or document.layout_variants:
+                continue
+            document.layout_variants = dict(variants)
+            propagated += 1
+    return propagated
+
+
 def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Path:
     """Write screenshots, DOM overlays, iframe trees, and declared state transitions."""
     source_root = Path(source_root)
@@ -1426,6 +1457,10 @@ def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Pa
     # Runs after the entry promotion and before synthetic metadata/Tags states
     # are added; branch states are their only source.
     _reroute_branch_series_regions_to_viewer_documents(flow)
+    # 布局变体向所有拥有同一 viewer document 的状态传播，让入口/popup viewer
+    #（先于录制布局 marker 的状态）也有可点的布局按钮（同 series 提升思路）。
+    # 在 asset 复制前执行，使每个 state 的变体资产都被按需复制。
+    _propagate_layout_variants_across_documents(flow)
     tags_menu = _find_real_tags_menu_source(flow, source_root)
     menu_strip = _make_menu_strip(tags_menu, source_root, output_root) if tags_menu else None
     _augment_meta_two_step(flow, states, tags_menu=tags_menu, menu_strip=menu_strip)
