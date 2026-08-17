@@ -532,7 +532,12 @@ def _canvas_hash_or_none(page: object) -> int | None:
 
 
 def _canvas_png_or_none(page: object) -> bytes | None:
-    """Return the largest visible canvas PNG (or None), for visual stability sampling."""
+    """Return the largest visible canvas PNG (or None), for visual stability sampling.
+
+    ⚠ Dapeng viewer 的页面里有 38 个 68×68 序列缩略图 canvas ——「最大 canvas」
+    会截到缩略图而非主影像。这是视觉稳定性采样用（点击后画布是否变化），
+    不是布局背景的来源；布局背景应截 viewer 根元素（见 _html_root_png_or_none）。
+    """
     try:
         count = page.locator("canvas").count()
     except Exception:
@@ -557,6 +562,23 @@ def _canvas_png_or_none(page: object) -> bytes | None:
         best = page.locator("canvas").nth(0)
     try:
         return best.screenshot(type="png")
+    except Exception:
+        return None
+
+
+def _html_root_png_or_none(scope: object) -> bytes | None:
+    """Return a full-page PNG of the viewer scope's ``<html>`` root (or None).
+
+    布局变体背景用这个而不是单个 canvas：Dapeng 的主影像画布是 div 背景 /
+    svg 容器，不是大 canvas；截 html 根得到整个 1×1/2×2 布局的完整画面
+    （~1888×880），铺满 replica-bg 才是「布局切换」的正确视觉效果。
+    ``scope`` 是 bound 到 viewer frame 的 locator/FrameLocator（有 .locator）。
+    """
+    try:
+        html_root = scope.locator("html")
+        if html_root.count() == 0:
+            return None
+        return html_root.first.screenshot(type="png", animations="disabled")
     except Exception:
         return None
 
@@ -597,27 +619,41 @@ def _sample_layout_background(
     """
     deadline = time.monotonic() + stability_timeout_s
     previous: bytes | None = None
-    seen_blank_canvas = False
+    seen_nonempty = False
     while time.monotonic() <= deadline:
-        try:
-            canvas_width = int(
-                page.evaluate(
-                    """() => {
-                        const canvases = Array.from(document.querySelectorAll('canvas'));
-                        const visible = canvases.filter(c => c.getBoundingClientRect().width > 0);
-                        return visible.length ? Math.max(...visible.map(c => c.width)) : 0;
-                    }"""
-                )
-            )
-        except Exception:
-            canvas_width = 0
-        if canvas_width > 0:
-            seen_blank_canvas = True
-        if seen_blank_canvas:
-            current = canvas_screenshot_fn()
+        # ⚠ 稳定性取决于「截图是否非空且连续两次不变」——不依赖 canvas 定位
+        # （Dapeng 主影像画布是 div/svg 而非大 canvas；顶层 page 跨 frame 也查不到）。
+        # 背景截图是 viewer html 根整页，布局切换后整页画面变化即视为不稳定的
+        # 前兆，回到稳定 = 连续两次 PNG 相同。
+        current = canvas_screenshot_fn()
+        if current is not None:
+            # 非空白判定 OR：截图尺寸近似整页（>50×50）或页面有可见 canvas。
+            shot_big = False
+            try:
+                import io as _io
+                from PIL import Image as _Image
+                with _Image.open(_io.BytesIO(current)) as im:
+                    _w, _h = im.size
+                shot_big = _w > 50 and _h > 50
+            except Exception:
+                shot_big = False
+            canvas_ok = False
+            try:
+                canvas_ok = int(
+                    page.evaluate(
+                        """() => {
+                            const canvases = Array.from(document.querySelectorAll('canvas'));
+                            return canvases.some(c => c.getBoundingClientRect().width > 0) ? 1 : 0;
+                        }"""
+                    )
+                ) > 0
+            except Exception:
+                canvas_ok = False
+            seen_nonempty = shot_big or canvas_ok
+        if seen_nonempty:
+            if current is not None and previous is not None and current == previous:
+                return _save_png_by_hash(current, capture_root, document_id, variant_id)
             if current is not None:
-                if previous is not None and current == previous:
-                    return _save_png_by_hash(current, capture_root, document_id, variant_id)
                 previous = current
         time.sleep(poll_interval_s)
     return None
@@ -629,15 +665,17 @@ def _sample_all_layout_variants(
     target_document: ReplicaDocument,
     capture_root: Path,
     log: Callable[[str], None] = lambda message: sys.stderr.write(message + "\n"),
+    viewer_scope: object | None = None,
 ) -> tuple[dict[str, str], str]:
     """(步骤 2) 连点采样所有可见布局选项的背景帧，回填 ``layout_variants``。
 
     输入 ``layout_root`` 是已解析的 ``#cellStyle`` 容器 locator（可能为 None），
     ``target_document`` 是布局 region 所在的 document（回填 ``layout_variants`` +
-    ``default_layout``）。返回 ``(variants, default_layout)``：
+    ``default_layout``）。``viewer_scope`` 是 bound 到 viewer frame 的
+    locator/FrameLocator（背景截图用它截整页 html 根）。返回 ``(variants, default_layout)``：
     - 对每个可见布局选项成员，点击 → 等画布稳定（canvas.width>0 轮询 + 1.5s 上限，
-      勿用纯固定 sleep）→ 截 viewer 背景 → by-hash 落盘；
-    - variant_id 从成员文本推断（``*1 Shift+1`` -> ``1*1``，``2*2`` -> ``2*2``）；
+      勿用纯固定 sleep）→ 截 viewer 整页背景 → by-hash 落盘；
+    - variant_id 从成员文本/title 推断（``*1 Shift+1`` -> ``1*1``，``2*2`` -> ``2*2``）；
     - 单个选项失败（画布无变化/浮层不可见）不入 variants，记 warning，绝不阻断整组；
     - 仅当所有变体都失败时降级为 partial（记 ``layout_capture_partial`` 到 log）。
     """
@@ -646,6 +684,19 @@ def _sample_all_layout_variants(
     if layout_root is None:
         log("layout capture skipped: #cellStyle 容器不可解析")
         return variants, raw_default
+    # 背景截图：优先 viewer html 根（整页布局画面），退化为最大 canvas（稳定性采样）。
+    def background_shot() -> bytes | None:
+        if viewer_scope is not None:
+            shot = _html_root_png_or_none(viewer_scope)
+            if shot is not None:
+                return shot
+        return _canvas_png_or_none(page)
+
+    def current_hash() -> int | None:
+        shot = background_shot()
+        if shot is None:
+            return None
+        return hashlib.sha256(shot).digest()[:8]
     try:
         members = layout_root.locator("button, a, [role='button'], [role='menuitem'], li, [class*='cell']")
         count = members.count()
@@ -672,26 +723,26 @@ def _sample_all_layout_variants(
         variant_id = _layout_variant_id(hint)
         if variant_id is None:
             continue  # 无数字文本的图标项（品字等）不入 variants
-        before_hash = _canvas_hash_or_none(page)
+        before_hash = current_hash()
         try:
             option.click(trial=True)
             option.click()
         except Exception:
             continue  # 点击失败：该变体跳过，不阻断
-        if before_hash is not None and _canvas_hash_or_none(page) == before_hash:
+        if before_hash is not None and current_hash() == before_hash:
             # 点击后画布指纹未变化：该布局选项在当前序列/层级下无内容或切换失败，
             # 直接跳过该变体（降级），绝不阻断整个 marker 组。
             log(f"layout variant skipped (canvas hash unchanged): {variant_id}")
             continue
         sampled = _sample_layout_background(
             page,
-            lambda: _canvas_png_or_none(page),
+            background_shot,
             capture_root,
             target_document.document_id,
             variant_id,
         )
         if sampled is None:
-            log(f"layout variant failed (canvas unchanged/不可见): {variant_id}")
+            log(f"layout variant failed (稳定帧/背景不可得): {variant_id}")
             continue
         variants[variant_id] = sampled
         if variant_id not in captured:
@@ -990,39 +1041,52 @@ class LiveCaptureSession:
             # 再写 topology.json（asdict 序列化时带这两个字段）。真实连点仅在浏览器可访问时生效；
             # 任何失败都降级（该变体不入 variants / 全部失败记 layout_capture_partial），
             # 绝不阻断整个 marker 组。
-            if marker_label == "序列布局切换" and phase == "after":
-                layout_region = next(
-                    (region for region in target_document.regions if region.region_type == "layout"),
-                    None,
-                )
-                layout_root = None
-                frame_scope = None  # viewer frame 上下文（布局浮层/画布所在）；异常/无 region 时回落 page
-                # layout region 存在且 root 非 None 时，从 DOM 解析 #cellStyle 容器。
-                # 无 region（无匹配/无布局浮层）则跳过采样，保持兼容老 viewer。
-                if layout_region is not None and layout_region.root is not None:
-                    try:
-                        # ⚠ 布局浮层 #cellStyle 在 viewer iframe 内（page1 的
-                        # content_frame），不在顶层 page。用 target_locator 的
-                        # frame 上下文（ancestor::html → 所在 frame 的根）查
-                        # #cellStyle，而不是 page.locator —— 后者跨 frame 查不到
-                        # 导致 layout_root=None、采样永不生效（缺陷 A）。
-                        # viewer iframe 内持有 canvas 的 Frame（有 .evaluate/.locator）；
-                        # 用 Frame 对象而非 locator——采样函数需要 .evaluate 轮询画布。
-                        frame_scope = _find_viewer_frame(page)
-                        scope = frame_scope if frame_scope is not None else page
-                        candidates = ["#cellStyle", "[id*='cellStyle' i]", "[class*='cellStyle' i]"]
-                        layout_root = scope.locator(candidates[0])
-                        if layout_root.count() == 0:
+            try:
+                # ⚠ 布局采样是 live 交互增强；任何异常只降级，绝不外抛——
+                # 外抛会让 after 快照丢失（a_001_002 空 after），action 无快照对
+                # 被跳过，整个布局 marker 组消失（Z1 模式）。
+                if marker_label == "序列布局切换" and phase == "after":
+                    layout_region = next(
+                        (region for region in target_document.regions if region.region_type == "layout"),
+                        None,
+                    )
+                    layout_root = None
+                    viewer_scope = None  # bound 到 viewer frame 的 locator（布局浮层/整页截图所在）
+                    # layout region 存在且 root 非 None 时，从 DOM 解析 #cellStyle 容器。
+                    # 无 region（无匹配/无布局浮层）则跳过采样，保持兼容老 viewer。
+                    if layout_region is not None and layout_region.root is not None:
+                        try:
+                            # ⚠ 布局浮层 #cellStyle 在 viewer iframe 内（page1 的
+                            # content_frame）。headed 回放下 _find_viewer_frame 能
+                            # 从 page.frames 拿到真 viewer 帧（有 evaluate/locator）；
+                            # 兜底再用录制 locator 的 xpath=ancestor::html。
+                            viewer_scope = _find_viewer_frame(page)
+                            if viewer_scope is None or getattr(viewer_scope, "locator", None) is None:
+                                viewer_scope = None
+                                if target_locator is not None:
+                                    try:
+                                        scope_candidate = target_locator.locator("xpath=ancestor::html")
+                                        if scope_candidate.count() > 0:
+                                            viewer_scope = scope_candidate.first
+                                    except Exception:
+                                        viewer_scope = None
+                            scope = viewer_scope if viewer_scope is not None else page
+                            candidates = ["#cellStyle", "[id*='cellStyle' i]", "[class*='cellStyle' i]"]
+                            layout_root = scope.locator(candidates[0])
+                            if layout_root.count() == 0:
+                                layout_root = None
+                        except Exception:
                             layout_root = None
-                    except Exception:
-                        layout_root = None
-                variants, default_layout = _sample_all_layout_variants(
-                    frame_scope if frame_scope is not None else page,
-                    layout_root, target_document, capture_root,
-                )
-                if variants:
-                    target_document.layout_variants = variants
-                    target_document.default_layout = default_layout
+                    variants, default_layout = _sample_all_layout_variants(
+                        page,
+                        layout_root, target_document, capture_root,
+                        viewer_scope=viewer_scope,
+                    )
+                    if variants:
+                        target_document.layout_variants = variants
+                        target_document.default_layout = default_layout
+            except Exception as layout_error:
+                sys.stderr.write(f"layout capture degraded: {type(layout_error).__name__}: {layout_error}\n")
         (capture_root / "topology.json").write_text(
             json.dumps({"pages": [asdict(item) for item in pages], "documents": [asdict(item) for item in documents]}, ensure_ascii=False, indent=2),
             encoding="utf-8",

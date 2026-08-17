@@ -1389,7 +1389,9 @@ class StepTwoLayoutCaptureTests(unittest.TestCase):
         page = Mock()
         page.evaluate = Mock(return_value=0)
 
-        with patch("batch_capture_replicate._canvas_hash_or_none", return_value=123):
+        # 背景截图不可得（_canvas_png_or_none 返回 None）→ 每个选项采样失败 →
+        # variants 空 + layout_capture_partial，绝不抛异常。
+        with patch("batch_capture_replicate._canvas_png_or_none", return_value=None):
             variants, default_layout = replica_batch._sample_all_layout_variants(
                 page, root, target_document, Path("C:/tmp/nonexistent_capture_root"),
                 log=warnings.append,
@@ -1405,9 +1407,14 @@ class StepTwoLayoutCaptureTests(unittest.TestCase):
         from replica_models import ReplicaDocument
         import io as _io
         from PIL import Image as _PILImage
-        snapshot_png = _io.BytesIO()
-        _PILImage.new("RGB", (8, 8), (10, 20, 30)).save(snapshot_png, "PNG")
-        stable_png = snapshot_png.getvalue()
+        # 点击前：小缩略图（模拟 Dapeng 缩略 canvas，hash 变化以检测布局切换）；
+        # 点击后：200×200 整页截图（>50px 满足 shot_big，进入稳定采样）。
+        small_png_buf = _io.BytesIO()
+        _PILImage.new("RGB", (8, 8), (10, 20, 30)).save(small_png_buf, "PNG")
+        small_png = small_png_buf.getvalue()
+        big_png_buf = _io.BytesIO()
+        _PILImage.new("RGB", (200, 200), (40, 50, 60)).save(big_png_buf, "PNG")
+        big_png = big_png_buf.getvalue()
         doc = ReplicaDocument(
             document_id="d_main", page_id="p_000", page_var="page", page_kind="main",
             parent_document_id=None, frame_selector=None, frame_id=None, frame_name=None,
@@ -1427,13 +1434,12 @@ class StepTwoLayoutCaptureTests(unittest.TestCase):
         root = SimpleNamespace(count=lambda: 1, first=SimpleNamespace(), locator=lambda sel: SimpleNamespace(count=lambda: 1, nth=lambda i: variant))
         page = Mock()
         page.evaluate = Mock(return_value=1024)
-        # canvas 指纹：点击前 111，点击后 222（变化 → 尝试采样）；采样 PNG 稳定返回。
         with tempfile.TemporaryDirectory() as tmp:
-            hashes = iter([111, 222])
-            def fake_hash(_page):
-                return next(hashes, 222)
-            with patch("batch_capture_replicate._canvas_hash_or_none", side_effect=fake_hash), \
-                 patch("batch_capture_replicate._canvas_png_or_none", return_value=stable_png):
+            # 背景截图序列：点击前 small → 点击后 big（恒等于大图）→ 稳定采样落盘
+            shots = iter([small_png, big_png])
+            def fake_shot(_page):
+                return next(shots, big_png)
+            with patch("batch_capture_replicate._canvas_png_or_none", side_effect=fake_shot):
                 variants, default_layout = replica_batch._sample_all_layout_variants(
                     page, root, doc, Path(tmp),
                 )
