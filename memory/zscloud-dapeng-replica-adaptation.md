@@ -62,6 +62,8 @@ zs 的序列列表（`#HLeftThumnail li.ui-draggable`）在 iframe viewer 内，
 > 2. **title 推断**（缺陷 F）：Dapeng 布局 button 文本为空、规格在 `title`（`title="2*2 Shift+4"`）；改用 `get_attribute("title")`/`aria-label` 优先、`innerText` 兜底。
 > 3. **relpath rebase**（缺陷 G）：`layout_variants` 的 phase 级资产（`snapshots/a_001_001/after/assets/by-hash/...`）需在 `_load_snapshot_state`/`_load_branch_topology` rebase 到 capture 相对，否则 build 复制时找不到资产、`__REPLICA_LAYOUTS__` 不注入。
 > **已知剩余**：真机只采到 `1*1`（布局浮层打开时点击 2*2/3*3 等后 canvas 指纹未变化 → 被降级跳过），build 侧渲染 `1*1` 可点 + 其余 `aria-disabled`（不假装可点）。若要做全部布局可点，需在采样时对「点击后 canvas 指纹不变」的选项放宽判定（如确认切换到多视图布局时画布是否真不变），或接受当前 1*1 可点。
+>
+> **已知补充（2026-08-17 提交 7c10783）**：**早期状态（s_001，布局 marker 之前）的 layout region 浮层未展开**——布局选项成员（`layout_1_1` 等）rect 全 0，渲染成 (0,0,0,0) 挤在左上角不可点（即使 `__REPLICA_LAYOUTS__` 已注入）。修复：`_propagate_layout_variants_across_documents` 在传 variants 的同时，对「无可推断且 rect 非 0 的布局选项成员」的 layout region，用同一 document 后续状态（浮层完整展开，如 s_002）的 region 深拷贝替换（判定用 `_infer_layout_id` + rect>0，避免 40×40 切换按钮本体掩盖折叠浮层）。验证：s_001 viewer 布局按钮落到真实坐标（1*1 在 x=31,y=510），点击切背景不导航、序列后续可点跳分支。
 > **How to check**：`test_nested_frame_series_uses_scroll_harvest`（scrollTop 恢复 `4` 断言）是既有失败（干净基线也挂 `0 != 4`），与 R 系列无关，未修。
 
 ## 已跑通的中山产物
