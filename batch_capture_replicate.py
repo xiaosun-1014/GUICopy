@@ -504,6 +504,200 @@ def _series_scope_root(target_locator: object, container_selector: str | None = 
     return scope.locator("body")
 
 
+def _layout_variant_id(member_text: str) -> str | None:
+    """Infer a layout variant id from a layout-option member's text.
+
+    ``*1 Shift+1`` -> ``1*1``（``*N`` 简写 = 1×N）；``2*2`` -> ``2*2``；
+    ``1*2`` -> ``1*2``；``1×2`` / ``3x3`` 统一归一为 ``N*N``。
+    优先级：先匹配 ``N*N``（数字乘数字，含半角 ``*``/``x``/``X`` 与全角 ``×``），
+    再无则匹配 ``*N``（星号+数字=1×N）。
+    匹配不到（如多列品字布局只有图标无数字文本）返回 None，由调用方跳过该成员。
+    """
+    text = member_text or ""
+    match = re.search(r"(\d+)\s*[*xX×]\s*(\d+)", text)
+    if match:
+        return f"{match.group(1)}*{match.group(2)}"
+    shorthand = re.search(r"(?:^|\s)\*\s*(\d+)(?:\s|$)", text)
+    if shorthand:
+        return f"1*{shorthand.group(1)}"
+    return None
+
+
+def _canvas_hash_or_none(page: object) -> int | None:
+    """Return a canvas fingerprint (or None) used to detect post-click change."""
+    try:
+        return canvas_hash(page)
+    except Exception:
+        return None
+
+
+def _canvas_png_or_none(page: object) -> bytes | None:
+    """Return the largest visible canvas PNG (or None), for visual stability sampling."""
+    try:
+        count = page.locator("canvas").count()
+    except Exception:
+        return None
+    if count == 0:
+        return None
+    best = None
+    best_area = -1
+    for index in range(min(count, 20)):
+        try:
+            canvas = page.locator("canvas").nth(index)
+            box = canvas.bounding_box()
+            if not box or box["width"] <= 0 or box["height"] <= 0:
+                continue
+            area = box["width"] * box["height"]
+            if area > best_area:
+                best = canvas
+                best_area = area
+        except Exception:
+            continue
+    if best is None:
+        best = page.locator("canvas").nth(0)
+    try:
+        return best.screenshot(type="png")
+    except Exception:
+        return None
+
+
+def _save_png_by_hash(png_bytes: bytes, capture_root: Path, document_id: str, variant_id: str) -> str | None:
+    """Persist a layout background PNG under ``assets/by-hash/<sha256>.jpeg``.
+
+    返回相对 ``capture_root`` 的 relpath；失败返回 None。复用 capture_page_topology 的
+    by-hash 落盘语义：JPEG + SHA-256 命名，重复内容只存一份。
+    """
+    try:
+        digest = hashlib.sha256(png_bytes).hexdigest()
+        asset_dir = capture_root / "assets" / "by-hash"
+        asset_dir.mkdir(parents=True, exist_ok=True)
+        jpeg_path = asset_dir / f"{digest}.jpeg"
+        if not jpeg_path.exists():
+            with Image.open(io.BytesIO(png_bytes)) as image:
+                image.convert("RGB").save(jpeg_path, format="JPEG", quality=95, optimize=True)
+        return str(jpeg_path.relative_to(capture_root)).replace("\\", "/")
+    except Exception:
+        return None
+
+
+def _sample_layout_background(
+    page: object,
+    canvas_screenshot_fn: Callable[[], bytes | None],
+    capture_root: Path,
+    document_id: str,
+    variant_id: str,
+    poll_interval_s: float = 0.15,
+    stability_timeout_s: float = 1.5,
+) -> str | None:
+    """Sample one layout variant's stable viewer background, saving by-hash.
+
+    轮询等待画布稳定：``canvas.width > 0``（画布已重建）是前置条件；满足后连续两次
+    PNG（像素级）不可变即稳定。上限 ``stability_timeout_s``，超时返回 None（该变体失败，
+    不入 ``layout_variants``，绝不阻断整个 marker 组）。
+    """
+    deadline = time.monotonic() + stability_timeout_s
+    previous: bytes | None = None
+    seen_blank_canvas = False
+    while time.monotonic() <= deadline:
+        try:
+            canvas_width = int(
+                page.evaluate(
+                    """() => {
+                        const canvases = Array.from(document.querySelectorAll('canvas'));
+                        const visible = canvases.filter(c => c.getBoundingClientRect().width > 0);
+                        return visible.length ? Math.max(...visible.map(c => c.width)) : 0;
+                    }"""
+                )
+            )
+        except Exception:
+            canvas_width = 0
+        if canvas_width > 0:
+            seen_blank_canvas = True
+        if seen_blank_canvas:
+            current = canvas_screenshot_fn()
+            if current is not None:
+                if previous is not None and current == previous:
+                    return _save_png_by_hash(current, capture_root, document_id, variant_id)
+                previous = current
+        time.sleep(poll_interval_s)
+    return None
+
+
+def _sample_all_layout_variants(
+    page: object,
+    layout_root: object | None,
+    target_document: ReplicaDocument,
+    capture_root: Path,
+    log: Callable[[str], None] = lambda message: sys.stderr.write(message + "\n"),
+) -> tuple[dict[str, str], str]:
+    """(步骤 2) 连点采样所有可见布局选项的背景帧，回填 ``layout_variants``。
+
+    输入 ``layout_root`` 是已解析的 ``#cellStyle`` 容器 locator（可能为 None），
+    ``target_document`` 是布局 region 所在的 document（回填 ``layout_variants`` +
+    ``default_layout``）。返回 ``(variants, default_layout)``：
+    - 对每个可见布局选项成员，点击 → 等画布稳定（canvas.width>0 轮询 + 1.5s 上限，
+      勿用纯固定 sleep）→ 截 viewer 背景 → by-hash 落盘；
+    - variant_id 从成员文本推断（``*1 Shift+1`` -> ``1*1``，``2*2`` -> ``2*2``）；
+    - 单个选项失败（画布无变化/浮层不可见）不入 variants，记 warning，绝不阻断整组；
+    - 仅当所有变体都失败时降级为 partial（记 ``layout_capture_partial`` 到 log）。
+    """
+    variants: dict[str, str] = {}
+    raw_default = target_document.default_layout or ""
+    if layout_root is None:
+        log("layout capture skipped: #cellStyle 容器不可解析")
+        return variants, raw_default
+    try:
+        members = layout_root.locator("button, a, [role='button'], [role='menuitem'], li, [class*='cell']")
+        count = members.count()
+    except Exception as exc:
+        log(f"layout capture error: {type(exc).__name__}: {exc}")
+        return variants, raw_default
+    captured: list[str] = []
+    for index in range(count):
+        try:
+            option = members.nth(index)
+        except Exception:
+            continue
+        try:
+            if not option.is_visible():
+                continue
+            text = (option.inner_text() or option.text_content() or "").strip()
+        except Exception:
+            continue
+        variant_id = _layout_variant_id(text)
+        if variant_id is None:
+            continue  # 无数字文本的图标项（品字等）不入 variants
+        before_hash = _canvas_hash_or_none(page)
+        try:
+            option.click(trial=True)
+            option.click()
+        except Exception:
+            continue  # 点击失败：该变体跳过，不阻断
+        if before_hash is not None and _canvas_hash_or_none(page) == before_hash:
+            # 点击后画布指纹未变化：该布局选项在当前序列/层级下无内容或切换失败，
+            # 直接跳过该变体（降级），绝不阻断整个 marker 组。
+            log(f"layout variant skipped (canvas hash unchanged): {variant_id}")
+            continue
+        sampled = _sample_layout_background(
+            page,
+            lambda: _canvas_png_or_none(page),
+            capture_root,
+            target_document.document_id,
+            variant_id,
+        )
+        if sampled is None:
+            log(f"layout variant failed (canvas unchanged/不可见): {variant_id}")
+            continue
+        variants[variant_id] = sampled
+        if variant_id not in captured:
+            captured.append(variant_id)
+    if captured and not raw_default:
+        raw_default = captured[0]
+    if not variants:
+        log("layout_capture_partial: 所有布局变体均未捕获到稳定背景")
+    return variants, raw_default
+
+
 def _resolve_locator_recipe(recipe: LocatorRecipe, pages: dict[str, object]) -> object | None:
     """Re-resolve a serialized LocatorRecipe into a live Playwright Locator.
 
@@ -649,6 +843,8 @@ def _locate_series_row(
                     snapshot = capture_locator_snapshot(item)
                 except Exception:
                     continue
+                if snapshot is None:
+                    continue  # 该行瞬变无匹配：_matches_descriptor 不能收 None
                 if _matches_descriptor(snapshot, descriptor):
                     return item, step
             try:
@@ -771,7 +967,8 @@ class LiveCaptureSession:
                     )
             else:
                 region = capture_interaction_region(target_locator.locator("xpath=.."), marker_region_type(marker_label), target_document.document_id)
-            target_document.regions.append(region)
+            if region is not None:
+                target_document.regions.append(region)
             if marker_label == "序列选择" and target_locator is not None:
                 container = _series_scope_root(
                     target_locator,
@@ -783,19 +980,59 @@ class LiveCaptureSession:
                 if rel:
                     target_document.series_list_full_asset_relpath = rel
                     target_document.series_list_content_height = content_h
+            # (步骤 2) 布局捕获扩展：对「序列布局切换」marker 的 after 快照，连点采样
+            # 所有可见布局选项的背景帧，回填 target_document.layout_variants / default_layout，
+            # 再写 topology.json（asdict 序列化时带这两个字段）。真实连点仅在浏览器可访问时生效；
+            # 任何失败都降级（该变体不入 variants / 全部失败记 layout_capture_partial），
+            # 绝不阻断整个 marker 组。
+            if marker_label == "序列布局切换" and phase == "after":
+                layout_region = next(
+                    (region for region in target_document.regions if region.region_type == "layout"),
+                    None,
+                )
+                layout_root = None
+                # layout region 存在且 root 非 None 时，从 DOM 解析 #cellStyle 容器。
+                # 无 region（无匹配/无布局浮层）则跳过采样，保持兼容老 viewer。
+                if layout_region is not None and layout_region.root is not None:
+                    try:
+                        candidates = ["#cellStyle", "[id*='cellStyle' i]", "[class*='cellStyle' i]"]
+                        layout_root = page.locator(candidates[0])
+                        if layout_root.count() == 0:
+                            layout_root = None
+                    except Exception:
+                        layout_root = None
+                variants, default_layout = _sample_all_layout_variants(
+                    page, layout_root, target_document, capture_root,
+                )
+                if variants:
+                    target_document.layout_variants = variants
+                    target_document.default_layout = default_layout
         (capture_root / "topology.json").write_text(
             json.dumps({"pages": [asdict(item) for item in pages], "documents": [asdict(item) for item in documents]}, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
         if target_locator is not None:
+            # 步骤 1：不再静默吞多匹配/无匹配。capture_locator_snapshot 内部已做
+            # ``.first`` 归一（多匹配不再抛 strict-mode）且 count()==0 返回 None。
+            # 这里只对「真·无匹配 / evaluate 异常」显式记录 warning：target.json 缺失
+            # 会让 build 侧标 ``missing_target_evidence``，使离线转场无载体可审计。
+            target = None
+            closure = None
             try:
                 target = capture_locator_snapshot(target_locator)
+            except Exception as exc:
+                sys.stderr.write(f"snapshot error: {action_id} → {type(exc).__name__}: {exc}\n")
+            if target is None:
+                sys.stderr.write(f"snapshot missing: {action_id} → 该 action 的离线转场无载体\n")
+            else:
                 (capture_root / "target.json").write_text(json.dumps(asdict(target), ensure_ascii=False, indent=2), encoding="utf-8")
-                closure = capture_selector_closure(target_locator, action_id)
-                (capture_root / "selector_closure.json").write_text(json.dumps(asdict(closure), ensure_ascii=False, indent=2), encoding="utf-8")
-            except Exception:
-                pass
+                try:
+                    closure = capture_selector_closure(target_locator, action_id)
+                except Exception as exc:
+                    sys.stderr.write(f"selector closure error: {action_id} → {type(exc).__name__}: {exc}\n")
+                if closure is not None:
+                    (capture_root / "selector_closure.json").write_text(json.dumps(asdict(closure), ensure_ascii=False, indent=2), encoding="utf-8")
 
     def before(self, action_id: str, page: object, locator_factory: object | None = None, marker_label: str = "") -> None:
         self._ensure_series_cfg(page)
@@ -870,6 +1107,10 @@ class LiveCaptureSession:
             identity_attrs=self._series_cfg.get("identity_attrs"),
         )
         root_snapshot = capture_locator_snapshot(root)
+        if root_snapshot is None:
+            # root 真·无匹配：跳过整个 series vector 添加（调用方 _capture_viewer_topology
+            # 已有外层 try/except 兜底，这里不再让 InteractionRegion 收 None root）。
+            return descriptor.member_id
         viewer_doc.regions.append(InteractionRegion(
             f"{viewer_doc.document_id}_series", "series", viewer_doc.document_id,
             root_snapshot, members, evidence,
@@ -2681,10 +2922,17 @@ def build_flow_from_snapshots(script_path: str | Path, capture_root: str | Path,
         raise ValueError("recording contains no successfully captured marked actions")
     first_pages, first_documents = _load_snapshot_state(capture_root, actions[0].action_id, "before")
     states = [ReplicaState("s_000", 0, "", "page", first_pages, first_documents, [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry_snapshot"))]
+    # 步骤 1：显式追踪「有快照对但 target.json 缺失」的 action —— target 本可捕获却
+    # 缺失（多匹配/无匹配/捕获异常被降级），离线转场失去可点载体，必须在
+    # pipeline_report 里显式可见（build_flow_from_snapshots 把 warnings 序列化进 manifest）。
+    missing_target_actions: list[str] = []
     for index, action in enumerate(actions, start=1):
         before_pages, before_documents = _load_snapshot_state(capture_root, action.action_id, "before")
         _refresh_delayed_state(states[-1], before_pages, before_documents)
         target = _load_target_snapshot(capture_root, action.action_id)
+        # target 本可捕获（有完整快照对）却缺失 target.json → 该 action 的离线转场无载体
+        if target is None and _has_snapshot_pair(capture_root, action.action_id):
+            missing_target_actions.append(action.action_id)
         closure = _load_selector_closure(capture_root, action.action_id)
         if target and states[-1].documents:
             document = states[-1].documents[-1] if action.locator and action.locator.frame_chain else states[-1].documents[0]
@@ -2707,6 +2955,7 @@ def build_flow_from_snapshots(script_path: str | Path, capture_root: str | Path,
     viewport = first_pages[0].entry_document_id and first_documents[0].viewport if first_documents else {"width": 0, "height": 0}
     _skip_popup_shell_state(states)
     warnings = [f"action_capture_failed:{action_id}" for action_id in skipped_actions]
+    warnings.extend(f"missing_target_evidence:{action_id}" for action_id in missing_target_actions)
 
     # Phase 6: merge any Phase-5 series-branch snapshots into the flow as
     # ordinary ReplicaState / ReplicaDocument (schema v2). Each successful /

@@ -258,6 +258,16 @@ class ReplicaDocument:
     # relative to the same root as ``screenshot_asset_relpath``.
     series_list_full_asset_relpath: str | None = None
     series_list_content_height: int = 0
+    # Layout variants: ``{layout_id: background asset relpath}`` where each
+    # variant is a background screenshot of the same state under a different
+    # series layout (1x1 / 2x2 / MPR ...). The builder injects these as
+    # ``window.__REPLICA_LAYOUTS__`` so clicking a layout button swaps only the
+    # background image (``img.replica-bg``) without navigating -- layout and
+    # series selection stay decoupled. ``default_layout`` names the layout the
+    # entry state was actually captured in. Both default-fill so legacy
+    # manifests without layout captures decode unchanged.
+    layout_variants: dict[str, str] = field(default_factory=dict)
+    default_layout: str = ""
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "ReplicaDocument":

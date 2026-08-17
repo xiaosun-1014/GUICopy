@@ -1172,5 +1172,218 @@ def run(page):
             finalize.assert_not_called()
 
 
+class StepOneTargetSnapshotTests(unittest.TestCase):
+    """步骤 1：multi-match / 无匹配 target 捕获不静默丢失，target.json 落盘受控。
+
+    全部用 fake locator，不依赖真实浏览器。
+    """
+
+    def test_capture_locator_snapshot_multimatch_returns_first(self):
+        # count()>1 的 fake locator：capture_locator_snapshot 归一 .first 返回非空，
+        # 不再抛 strict-mode（防 Z1 静默吞）。
+        from capture_snapshot import capture_locator_snapshot
+
+        payload = {
+            "tag_name": "li", "text": "x",
+            "attributes": {"id": "row"},
+            "rect": {"x": 0, "y": 0, "width": 10, "height": 10},
+            "outer_html": "<li id='row'>x</li>",
+            "computed_style": {"display": "block"},
+        }
+        first = SimpleNamespace()
+        first.evaluate = lambda fn, *a: payload
+        root = SimpleNamespace()
+        root.count = lambda: 2
+        root.first = first
+
+        snapshot = capture_locator_snapshot(root)
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.tag_name, "li")
+
+    def test_capture_locator_snapshot_no_match_returns_none(self):
+        from capture_snapshot import capture_locator_snapshot
+
+        root = SimpleNamespace()
+        root.count = lambda: 0
+
+        self.assertIsNone(capture_locator_snapshot(root))
+
+    def test_missing_target_evidence_is_reported_in_flow_warnings(self):
+        # 有完整快照对（before+after topology）但 target.json 缺失 → build 侧必须把
+        # missing_target_evidence 标进 flow.warnings（pipeline_report 可见），
+        # 让「target 本可捕获却缺失/被静默丢」显式可审计。
+        source = '''from playwright.sync_api import sync_playwright
+
+def run(page):
+    # [MARKER: 序列选择]
+    page.locator("#series").click()
+'''
+        with tempfile.TemporaryDirectory() as tmp, sync_playwright() as playwright:
+            root = Path(tmp)
+            script = root / "recorded.py"
+            script.write_text(source, encoding="utf-8")
+            session = LiveCaptureSession(root / "capture")
+            browser = playwright.chromium.launch()
+            page = browser.new_page()
+            page.set_content('<div id="series">Series</div>')
+            target = lambda: page.locator("#series")
+            session.before("a_000_001", page, target, "序列选择")
+            target().click()
+            session.after("a_000_001", page, target, "序列选择")
+            # 模拟 multi-match/无匹配被静默丢 target：删掉 before+after 两个 target.json
+            # （_load_target_snapshot 会 before 优先、无则 fallback after），保留快照对。
+            for phase in ("before", "after"):
+                (root / "capture" / "snapshots" / "a_000_001" / phase / "target.json").unlink()
+
+            flow = build_flow_from_snapshots(script, root / "capture")
+
+            self.assertIn("missing_target_evidence:a_000_001", flow.warnings)
+            browser.close()
+
+    def test_multimatch_action_target_json_is_written_not_silently_dropped(self):
+        # 走 LiveCaptureSession._capture 的 target 落盘路径，用**真实**
+        # capture_locator_snapshot：multi-match locator 现在被 .first 归一，
+        # 不再抛 strict-mode，因此 target.json 被写入而非静默丢弃（Z1 修复）。
+        dom_payload = {
+            "tag_name": "div", "text": "target",
+            "attributes": {"id": "series"},
+            "rect": {"x": 0, "y": 0, "width": 100, "height": 20},
+            "outer_html": "<div id='series'>target</div>",
+            "computed_style": {"display": "block"},
+        }
+        first = SimpleNamespace()
+
+        def first_evaluate(fn, *args):
+            source = str(fn)
+            # frame-owner probe 的 JS 含 frameElement；selector closure 的 JS 含 ancestors；
+            # 其余（DOM snapshot）返回完整 payload。
+            if "frameElement" in source:
+                return {"id": None, "name": None}
+            if "ancestors" in source:
+                return {"outer": "<div id='series'>target</div>", "ancestors": 1,
+                        "siblings": 0, "sources": []}
+            return dom_payload
+        first.evaluate = first_evaluate
+        target_locator = SimpleNamespace()
+        target_locator.count = lambda: 3
+        target_locator.first = first
+        target_locator.locator = lambda sel: SimpleNamespace(count=lambda: 0)
+        page = Mock()
+        page.context = SimpleNamespace(pages=[page])
+        page.viewport_size = {"width": 800, "height": 600}
+        page.is_closed = lambda: False
+        page.wait_for_timeout = lambda ms: None
+        page.url = "https://example.com/film/#/shared"
+        page.evaluate = Mock(return_value=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            session = LiveCaptureSession(Path(tmp))
+            capture_dir = Path(tmp) / "snapshots" / "a_000_001" / "after"
+            capture_dir.mkdir(parents=True, exist_ok=True)  # topology 写入前目录需存在
+            with patch("batch_capture_replicate.capture_page_topology", return_value=([], [])) as topo:
+                session._capture("a_000_001", "after", page, lambda: target_locator, "报告截图")
+            # target_locator.count()==3 是 multi-match；capture_locator_snapshot 内部归一
+            # .first、不抛 strict-mode —— target.json 被写入而非静默丢弃。
+            self.assertTrue((capture_dir / "target.json").exists())
+            self.assertTrue((capture_dir / "selector_closure.json").exists())
+            topo.assert_called_once()
+
+
+class StepTwoLayoutCaptureTests(unittest.TestCase):
+    """步骤 2：布局捕获的控制流单测（fake locator，不依赖真实站点）。
+
+    覆盖变体推断、连点顺序、稳定采样、降级策略；真实连点只在浏览器可访问时执行。
+    """
+
+    def test_layout_variant_id_infers_from_text(self):
+        self.assertEqual(replica_batch._layout_variant_id("*1 Shift+1"), "1*1")
+        self.assertEqual(replica_batch._layout_variant_id("2*2"), "2*2")
+        self.assertEqual(replica_batch._layout_variant_id("1×2"), "1*2")
+        self.assertEqual(replica_batch._layout_variant_id("3x3"), "3*3")
+        self.assertIsNone(replica_batch._layout_variant_id("品字"))
+        self.assertIsNone(replica_batch._layout_variant_id(""))
+
+    def test_sample_layout_background_waits_for_canvas_and_returns_by_hash(self):
+        # 画布 width>0 立即满足 + 连续两次 PNG 不变 → 返回 by-hash relpath。
+        import io as _io
+        from PIL import Image as _PILImage
+        buf = _io.BytesIO()
+        _PILImage.new("RGB", (8, 8), (10, 20, 30)).save(buf, "PNG")
+        stable_png = buf.getvalue()
+        page = Mock()
+        page.evaluate = Mock(return_value=1024)
+
+        def canvas_png():
+            return stable_png
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rel = replica_batch._sample_layout_background(
+                page, canvas_png, root, "d_main", "2*2",
+            )
+            self.assertIsNotNone(rel)
+            self.assertTrue((root / rel).exists())
+            self.assertIn("assets/by-hash/", rel)
+
+    def test_sample_layout_background_timeout_returns_none(self):
+        # 画布始终 width=0 → 超时返回 None（该变体失败，不阻断）。
+        import io as _io
+        from PIL import Image as _PILImage
+        buf = _io.BytesIO()
+        _PILImage.new("RGB", (8, 8), (10, 20, 30)).save(buf, "PNG")
+        page = Mock()
+        page.evaluate = Mock(return_value=0)
+
+        def canvas_png():
+            return buf.getvalue()
+        with tempfile.TemporaryDirectory() as tmp:
+            rel = replica_batch._sample_layout_background(
+                page, canvas_png, Path(tmp), "d_main", "1*1",
+                poll_interval_s=0.02, stability_timeout_s=0.1,
+            )
+            self.assertIsNone(rel)
+
+    def test_sample_all_layout_variants_degrades_when_all_fail(self):
+        # 所有布局选项点击后画布无变化 → layout_variants 为空 + log 记 layout_capture_partial，
+        # 绝不抛异常。
+        from replica_models import ReplicaDocument
+        warnings: list[str] = []
+        doc = ReplicaDocument(
+            document_id="d_main", page_id="p_000", page_var="page", page_kind="main",
+            parent_document_id=None, frame_selector=None, frame_id=None, frame_name=None,
+            viewport={"width": 800, "height": 600}, device_scale_factor=1.0, screenshot_scale="css",
+            scroll_x=0.0, scroll_y=0.0, screenshot_asset_relpath="assets/d_main.png",
+            screenshot_sha256="h", screenshot_size_bytes=1,
+        )
+        payload = {
+            "tag_name": "button", "text": "2*2",
+            "attributes": {"id": "layout_2_2"},
+            "rect": {"x": 0, "y": 0, "width": 30, "height": 30},
+            "outer_html": "<button id='layout_2_2'>2*2</button>",
+            "computed_style": {"display": "block"},
+        }
+        first = SimpleNamespace()
+        first.evaluate = lambda fn, *a: payload
+        root = SimpleNamespace()
+        root.count = lambda: 3
+        root.first = first
+        # 每个成员点击后画布指纹不变（canvas_hash 返回相同值）→ 全部跳过。
+        variant = SimpleNamespace(is_visible=lambda: True, inner_text=lambda: "2*2",
+                                   text_content=lambda: "2*2", click=lambda *a, **k: None,
+                                   locator=lambda sel: SimpleNamespace(count=lambda: 0))
+        root.locator = lambda sel: SimpleNamespace(count=lambda: 3, nth=lambda i: variant)
+        target_document = doc
+        page = Mock()
+        page.evaluate = Mock(return_value=0)
+
+        with patch("batch_capture_replicate._canvas_hash_or_none", return_value=123):
+            variants, default_layout = replica_batch._sample_all_layout_variants(
+                page, root, target_document, Path("C:/tmp/nonexistent_capture_root"),
+                log=warnings.append,
+            )
+
+        self.assertEqual(variants, {})
+        self.assertEqual(default_layout, "")
+        self.assertTrue(any("layout_capture_partial" in message for message in warnings))
+
+
 if __name__ == "__main__":
     unittest.main()
