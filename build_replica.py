@@ -1057,6 +1057,131 @@ def _augment_meta_two_step(
                 transition.to_state_id = btags_id
 
 
+def _promote_series_regions_to_earliest_documents(flow: ReplicaFlow) -> int:
+    """Mirror the recorded series list onto the earliest main-path state that
+    owns the same viewer document.
+
+    A viewer whose series click lands late in the recording (e.g. zscloud's
+    popup viewer: the recorded dblclick happens at s_004, after s_001-s_003)
+    only ends up with a ``series`` InteractionRegion in the later states, so the
+    replica's *entry* viewer exposes no clickable series list even though every
+    branch was captured. FT (series click early) already carries the list in its
+    entry viewer document. Promoting the first main-path series region to the
+    first main-path state that owns the same ``document_id`` makes any replica
+    with captured branches show the clickable list from entry. Branch states
+    (``bviewer_``/``bmeta_``/``btags_``) are never sources or targets: their
+    series regions already render in each branch viewer. Returns the number of
+    documents promoted.
+    """
+    branch_state_ids = {
+        state_id
+        for branch in flow.series_branches
+        for state_id in (branch.viewer_state_id, branch.metadata_state_id, branch.return_state_id)
+        if state_id
+    }
+    main_states = sorted(
+        (state for state in flow.states if state.state_id not in branch_state_ids),
+        key=lambda state: state.ordinal,
+    )
+    first_owner: dict[str, ReplicaState] = {}
+    first_series: dict[str, tuple[ReplicaState, InteractionRegion]] = {}
+    for state in main_states:
+        for document in state.documents:
+            first_owner.setdefault(document.document_id, state)
+            if document.document_id in first_series:
+                continue
+            series_region = next(
+                (region for region in document.regions if region.region_type == "series"),
+                None,
+            )
+            if series_region is not None:
+                first_series[document.document_id] = (state, series_region)
+    promoted = 0
+    for document_id, (source_state, series_region) in first_series.items():
+        target_state = first_owner.get(document_id)
+        if target_state is None or target_state is source_state:
+            continue
+        target_document = next(
+            (document for document in target_state.documents if document.document_id == document_id),
+            None,
+        )
+        if target_document is None:
+            continue
+        if any(region.region_type == "series" for region in target_document.regions):
+            continue
+        # Deep-copy so the promoted overlay never mutates the captured source
+        # region (which keeps rendering in its own later states).
+        target_document.regions.append(copy.deepcopy(series_region))
+        promoted += 1
+    return promoted
+
+
+def _reroute_branch_series_regions_to_viewer_documents(flow: ReplicaFlow) -> int:
+    """Re-home branch-viewer series regions that landed on the *outer* document.
+
+    ``_capture_viewer_topology`` appends each branch's captured series region to
+    the first topology document (``docs_out[0]``). For a popup-style viewer whose
+    main page is a shell/share page and whose viewer lives in a ``page1`` iframe
+    (e.g. zscloud's Dapeng), that first document is the main page, so the region
+    renders onto the share-page background nobody visits while the viewer
+    iframe document the user actually reaches exposes no clickable list (the
+    mirror image of the main path, where the list correctly sits on
+    ``d_p_001_f_001``). This migrates each branch's series region onto the
+    branch document whose leaf id matches a main-path series document, so the
+    branch viewer becomes clickable again. Only branch-viewer states are
+    sources; main-path and synthetic metadata/Tags states are never touched.
+    Returns the number of regions re-homed.
+    """
+    branch_state_ids = {
+        state_id
+        for branch in flow.series_branches
+        for state_id in (branch.viewer_state_id, branch.metadata_state_id, branch.return_state_id)
+        if state_id
+    }
+    main_series_leaf_ids: set[str] = {
+        document.document_id.rsplit("__", 1)[-1]
+        for state in flow.states
+        if state.state_id not in branch_state_ids
+        for document in state.documents
+        if any(region.region_type == "series" for region in document.regions)
+    }
+    if not main_series_leaf_ids:
+        return 0
+    rerouted = 0
+    for branch in flow.series_branches:
+        if not branch.viewer_state_id:
+            continue
+        state = next(
+            (candidate for candidate in flow.states if candidate.state_id == branch.viewer_state_id),
+            None,
+        )
+        if state is None:
+            continue
+        for document in state.documents:
+            for region in list(document.regions):
+                if region.region_type != "series":
+                    continue
+                if document.document_id.rsplit("__", 1)[-1] in main_series_leaf_ids:
+                    # Already on a viewer document matched by the main path.
+                    continue
+                target = next(
+                    (
+                        candidate
+                        for candidate in state.documents
+                        if candidate.document_id != document.document_id
+                        and candidate.document_id.rsplit("__", 1)[-1] in main_series_leaf_ids
+                    ),
+                    None,
+                )
+                if target is None:
+                    continue
+                document.regions.remove(region)
+                region.document_id = target.document_id
+                target.regions.append(region)
+                rerouted += 1
+    return rerouted
+
+
 def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Path:
     """Write screenshots, DOM overlays, iframe trees, and declared state transitions."""
     source_root = Path(source_root)
@@ -1087,6 +1212,19 @@ def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Pa
     locator_risk_metadata = _locator_risk_metadata(flow)
     (output_root / "locator_mapping.json").write_text(json.dumps(locator_risk_metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     states = {state.state_id: state for state in flow.states}
+    # Route every captured series list onto the earliest state owning the same
+    # viewer document, so the entry viewer is clickable from the start (see
+    # _promote_series_regions_to_earliest_documents). Runs before the branch
+    # metadata/Tags augmentation so synthetic branch states are never the source
+    # or target of a promotion, and before rendering so the promoted region
+    # participates in series-key / route binding.
+    _promote_series_regions_to_earliest_documents(flow)
+    # Re-home branch-viewer series regions that capture attached to the outer
+    # (share-page) document of a popup-style viewer, so each branch viewer the
+    # user actually reaches exposes its own clickable list (zscloud Dapeng).
+    # Runs after the entry promotion and before synthetic metadata/Tags states
+    # are added; branch states are their only source.
+    _reroute_branch_series_regions_to_viewer_documents(flow)
     tags_menu = _find_real_tags_menu_source(flow, source_root)
     menu_strip = _make_menu_strip(tags_menu, source_root, output_root) if tags_menu else None
     _augment_meta_two_step(flow, states, tags_menu=tags_menu, menu_strip=menu_strip)

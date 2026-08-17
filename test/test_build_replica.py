@@ -1,3 +1,4 @@
+import copy
 import json
 import re
 import tempfile
@@ -6,7 +7,13 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-from build_replica import _redact_known_series_identities, _series_member_html, build_replica
+from build_replica import (
+    _promote_series_regions_to_earliest_documents,
+    _redact_known_series_identities,
+    _reroute_branch_series_regions_to_viewer_documents,
+    _series_member_html,
+    build_replica,
+)
 from replay_helpers import ReplicaServer
 from replay_helpers import sha256_file
 from replay_helpers import series_key_slug
@@ -815,6 +822,280 @@ class BuildReplicaTests(unittest.TestCase):
 
             with self.assertRaisesRegex(FileNotFoundError, "screenshot"):
                 build_replica(flow, root, output)
+
+
+def _series_member(member_id: str, text: str, y: float) -> RegionMember:
+    return RegionMember(
+        member_id,
+        "series",
+        DomNodeSnapshot(
+            "li",
+            text,
+            {"id": f"uid-{member_id}"},
+            Rect(30, y, 400, 24, "page_viewport_css"),
+            f'<li id="uid-{member_id}" data-series-uid="{member_id}">{text}</li>',
+            {"display": "block"},
+        ),
+    )
+
+
+class SeriesPromotionTests(unittest.TestCase):
+    """zs-style late series click: entry viewer state must still expose the
+    captured series list after build (mirrors FT, where the entry viewer already
+    carries it). See build_replica._promote_series_regions_to_earliest_documents.
+    """
+
+    def _build_flow_late_series(self):
+        root_series = DomNodeSnapshot(
+            "div",
+            "",
+            {"id": "HLeftThumnail"},
+            Rect(20, 30, 420, 200, "page_viewport_css"),
+            '<div id="HLeftThumnail"></div>',
+            {"display": "block"},
+        )
+        series = InteractionRegion(
+            "r_series",
+            "series",
+            "d_main",
+            root_series,
+            [
+                _series_member("d_p_000_root_series_000", "Series 1", 40),
+                _series_member("d_p_000_root_series_001", "Series 2", 70),
+            ],
+            None,
+        )
+        page_model = ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)
+        evidence = StateEvidence(False, False, False, False, 0, 0, 0, 0, "state")
+        document_late = ReplicaDocument(
+            "d_main", "p_main", "page", "main", None, None, None, None,
+            {"width": 640, "height": 400}, 1, "css", 0, 0,
+            "assets/main.png", "main", 3,
+            regions=[series],
+        )
+        document_early = ReplicaDocument(
+            "d_main", "p_main", "page", "main", None, None, None, None,
+            {"width": 640, "height": 400}, 1, "css", 0, 0,
+            "assets/main.png", "main", 3,
+        )
+        branch_state = ReplicaDocument(
+            "d_main", "p_main", "page", "main", None, None, None, None,
+            {"width": 640, "height": 400}, 1, "css", 0, 0,
+            "assets/main.png", "main", 3,
+        )
+        states = [
+            ReplicaState("s_000", 0, "", "page", [page_model], [document_early], [], evidence),
+            ReplicaState("s_001", 1, "", "page", [page_model], [document_late], [], evidence),
+            ReplicaState("bviewer_b000", 2, "", "page", [page_model], [branch_state], [], evidence),
+            ReplicaState("bviewer_b001", 3, "", "page", [page_model], [branch_state], [], evidence),
+        ]
+        branches = [
+            SeriesBranch(
+                "b000", "series-key-000", "Series 1", 0, "d_main",
+                "d_p_000_root_series_000", None, "dblclick",
+                "bviewer_b000", None, None, "captured", None,
+            ),
+            SeriesBranch(
+                "b001", "series-key-001", "Series 2", 1, "d_main",
+                "d_p_000_root_series_001", None, "dblclick",
+                "bviewer_b001", None, None, "captured", None,
+            ),
+        ]
+        flow = ReplicaFlow(
+            1, "zs-late", "recorded.py", "hash", "now", {"width": 640, "height": 400},
+            BootstrapPlan(1, 1, True, {}),
+            [],  # popup_expectations
+            CaptureTimingProfile(),
+            "s_000",
+            states,
+            [],  # warnings
+            branches,  # series_branches
+        )
+        return flow
+
+    def test_late_series_region_is_promoted_to_entry_viewer(self):
+        flow = self._build_flow_late_series()
+        promoted = _promote_series_regions_to_earliest_documents(flow)
+        self.assertEqual(promoted, 1)
+        entry_doc = next(
+            document for document in flow.states[0].documents
+            if document.document_id == "d_main"
+        )
+        self.assertEqual(
+            len([r for r in entry_doc.regions if r.region_type == "series"]), 1
+        )
+        # The later state keeps its own (un-mutated) region.
+        late_doc = next(
+            document for document in flow.states[1].documents
+            if document.document_id == "d_main"
+        )
+        self.assertEqual(len(late_doc.regions), 1)
+
+    def test_promotion_idempotent(self):
+        flow = self._build_flow_late_series()
+        self.assertEqual(_promote_series_regions_to_earliest_documents(flow), 1)
+        self.assertEqual(_promote_series_regions_to_earliest_documents(flow), 0)
+
+    def test_entry_already_with_series_is_never_re_promoted(self):
+        flow = self._build_flow_late_series()
+        # Give the entry state its own series region: nothing to promote.
+        entry_doc = flow.states[0].documents[0]
+        entry_doc.regions.append(copy.deepcopy(flow.states[1].documents[0].regions[0]))
+        self.assertEqual(_promote_series_regions_to_earliest_documents(flow), 0)
+
+    def test_build_renders_series_keys_in_entry_html(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir()
+            (root / "assets" / "main.png").write_bytes(b"png")
+            flow = self._build_flow_late_series()
+            output = root / "replica"
+            build_replica(flow, root, output)
+            entry_html = (output / "index.html").read_text(encoding="utf-8")
+            keys = re.findall(r'data-replica-series-key="([^"]+)"', entry_html)
+            # Served HTML only ever carries the public slug (never the raw
+            # series_key, which may be a real UID).
+            self.assertEqual(
+                sorted(keys),
+                sorted([series_key_slug("series-key-000"), series_key_slug("series-key-001")]),
+            )
+            self.assertIn("__REPLICA_SERIES_ROUTE__", entry_html)
+
+
+class SeriesRerouteTests(unittest.TestCase):
+    """Popup-style viewer (zscloud Dapeng): branch series regions captured onto
+    the *outer* main-page document ``__d_p_000_root`` must be re-homed onto the
+    branch's own viewer document ``__d_p_001_f_001`` so the branch viewer the
+    user actually reaches is clickable. See
+    build_replica._reroute_branch_series_regions_to_viewer_documents.
+    """
+
+    def _build_flow_popup_viewer(self):
+        def snap(elm_id, tag, x, y, w, h, text):
+            return DomNodeSnapshot(
+                tag, text, {"id": elm_id},
+                Rect(x, y, w, h, "page_viewport_css"),
+                f'<{tag} id="{elm_id}">{text}</{tag}>',
+                {"display": "block"},
+            )
+
+        def doc(document_id, page_id, page_var, parent=None):
+            return ReplicaDocument(
+                document_id, page_id, page_var, "popup" if page_var == "page1" else "main",
+                parent, "iframe" if parent else None, None, None,
+                {"width": 640, "height": 400}, 1, "css", 0, 0,
+                "assets/main.png", "main", 3,
+            )
+
+        page_model = ReplicaPage("p_main", "page", "main", None, None, "d_p_000_root", True, False)
+        popup_model = ReplicaPage("p_001", "page1", "popup", "main", "replica-popup", "d_p_001_root", True, False)
+        evidence = StateEvidence(False, False, False, False, 0, 0, 0, 0, "state")
+
+        # 主路径：viewer document d_p_001_f_001 正确带 series region（基准）。
+        main_series = InteractionRegion(
+            "d_p_001_f_001_series", "series", "d_p_001_f_001",
+            snap("mainbody", "body", 0, 0, 640, 400, "Liang,Jie"),
+            [_series_member("b000_series_li", "Series A", 40)],
+            None,
+        )
+        main_viewer_doc = doc("d_p_001_f_001", "p_001", "page1", parent="d_p_001_root")
+        main_viewer_doc.regions.append(main_series)
+        main_state = ReplicaState(
+            "s_001", 0, "", "page", [page_model, popup_model],
+            [doc("d_p_000_root", "p_main", "page"), doc("d_p_001_root", "p_001", "page1"), main_viewer_doc],
+            [], evidence,
+        )
+
+        branch_states = []
+        branches = []
+        for index, (viewer_tail, branch_id, key, label, member_id) in enumerate([
+            ("b000_a098f660dfb9", "b000", "series-key-000", "Series A", "b000_series_li"),
+            ("b001_b7a5ac6223f5", "b001", "series-key-001", "Series B", "b001_series_li"),
+        ]):
+            outer_doc = doc(f"{viewer_tail}__d_p_000_root", "p_main", "page")
+            # 错位：series region 挂在外层主 document（模拟 _capture_viewer_topology 挂 docs_out[0]）。
+            outer_doc.regions.append(InteractionRegion(
+                f"{viewer_tail}__series", "series", f"{viewer_tail}__d_p_000_root",
+                snap("HLeftThumnail", "div", 20, 30, 420, 200, "Scout\nMPR\n101\n1幅"),
+                [copy.deepcopy(_series_member(f"{branch_id}_series_li", label, 40))],
+                None,
+            ))
+            viewer_doc = doc(f"{viewer_tail}__d_p_001_f_001", "p_001", "page1", parent=f"{viewer_tail}__d_p_001_root")
+            branch_page = ReplicaPage("p_main", "page", "main", None, None, f"{viewer_tail}__d_p_000_root", True, False)
+            branch_popup = ReplicaPage("p_001", "page1", "popup", "main", "replica-popup", f"{viewer_tail}__d_p_001_root", True, False)
+            branch_state = ReplicaState(
+                f"bviewer_{branch_id}", index + 1, "", "page", [branch_page, branch_popup],
+                [
+                    outer_doc,
+                    doc(f"{viewer_tail}__d_p_001_root", "p_001", "page1"),
+                    viewer_doc,
+                ],
+                [], evidence,
+            )
+            branch_states.append(branch_state)
+            branches.append(SeriesBranch(
+                branch_id, key, label, index, "d_p_001_f_001", member_id,
+                None, "dblclick", f"bviewer_{branch_id}", None, None, "captured", None,
+            ))
+
+        flow = ReplicaFlow(
+            1, "zs-popup", "recorded.py", "hash", "now", {"width": 640, "height": 400},
+            BootstrapPlan(1, 1, True, {}), [],
+            CaptureTimingProfile(), "s_000", [main_state] + branch_states,
+            [], branches,
+        )
+        return flow
+
+    def _branch_docs(self, flow, branch_id):
+        state = next(st for st in flow.states if st.state_id == f"bviewer_{branch_id}")
+        outer = next(d for d in state.documents if d.document_id.endswith("__d_p_000_root"))
+        viewer = next(d for d in state.documents if d.document_id.endswith("__d_p_001_f_001"))
+        return state, outer, viewer
+
+    def test_branch_series_region_is_rerouted_to_viewer_document(self):
+        flow = self._build_flow_popup_viewer()
+        self.assertEqual(_reroute_branch_series_regions_to_viewer_documents(flow), 2)
+        for branch_id in ("b000", "b001"):
+            _, outer, viewer = self._branch_docs(flow, branch_id)
+            self.assertEqual(len([r for r in viewer.regions if r.region_type == "series"]), 1)
+            self.assertEqual(len([r for r in outer.regions if r.region_type == "series"]), 0)
+            # 归属 document_id 一并更新，保持 region 与宿主 document 一致。
+            self.assertEqual(viewer.regions[0].document_id, viewer.document_id)
+
+    def test_reroute_idempotent(self):
+        flow = self._build_flow_popup_viewer()
+        self.assertEqual(_reroute_branch_series_regions_to_viewer_documents(flow), 2)
+        self.assertEqual(_reroute_branch_series_regions_to_viewer_documents(flow), 0)
+
+    def test_reroute_skips_when_region_already_on_viewer_document(self):
+        flow = self._build_flow_popup_viewer()
+        # 先给分支 viewer document 一个正确归属的 series region：不应再被搬走或重复。
+        # （直接把错位的 region 手工放对位置，模拟已在正确 document）
+        for branch_id in ("b000", "b001"):
+            _, outer, viewer = self._branch_docs(flow, branch_id)
+            region = outer.regions[0]
+            outer.regions.remove(region)
+            region.document_id = viewer.document_id
+            viewer.regions.append(region)
+        self.assertEqual(_reroute_branch_series_regions_to_viewer_documents(flow), 0)
+
+    def test_build_renders_branch_series_keys_in_viewer_document_html(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir()
+            (root / "assets" / "main.png").write_bytes(b"png")
+            flow = self._build_flow_popup_viewer()
+            output = root / "replica"
+            build_replica(flow, root, output)
+            # 分支 viewer iframe document：可点序列热区（只暴露 public slug）。
+            viewer_html = (
+                output / "states" / "bviewer_b000" / "documents" / "b000_a098f660dfb9__d_p_001_f_001" / "index.html"
+            ).read_text(encoding="utf-8")
+            keys = re.findall(r'data-replica-series-key="([^"]+)"', viewer_html)
+            self.assertEqual(keys, [series_key_slug("series-key-000")])
+            # 外层主 document（分享页背景，无人在此交互）不应再渲染序列热区。
+            outer_html = (output / "states" / "bviewer_b000" / "index.html").read_text(encoding="utf-8")
+            self.assertEqual(re.findall(r'data-replica-series-key="[^"]+"', outer_html), [])
 
 
 if __name__ == "__main__":
