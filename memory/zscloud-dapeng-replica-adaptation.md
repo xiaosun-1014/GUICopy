@@ -45,8 +45,24 @@ zs 的序列列表（`#HLeftThumnail li.ui-draggable`）在 iframe viewer 内，
 
 改 `processed_script_{医院}.py`（删 marker 块 / 加 wait 行）后 sha 变化，`replica_annotations.json` 需重建。用 `main_gui.build_annotations_from_source(new_source, [])`（基于 `agent.parse_markers` 重新扫 marker、行号自动更新、fresh UUID 亦可），写回 json 即与脚本 sha 强绑定。**注意 `ReplicaFlow` 构造位置**：字段顺序是 `...states, warnings, series_branches`，把 branches 传错到 warnings 位会让 `SeriesBranch` 混进 report JSON（`is not JSON serializable`）。
 
+## 6. 布局与序列解耦（R1-R4，2026-08-17 本轮）——方案 A「背景层替换」
+
+中山复刻原问题：布局被烘焙进「选序列后的每一帧」（所有 `bviewer_b00X` 都是 1×1）；点序列 = 整页跳 1×1 分支帧；`s_003` 是死胡同；布局浮层除录制的 `*1 Shift+1` 外不可点；入口布局按钮与第 4 序列项重叠误触。本轮修复（提交 `4e4b947`/`7122349`/`b7a03d9`）：
+
+- **R1 治本（方案 A）**：布局实现为**同状态内背景 `<img class="replica-bg">` 替换**，不产生新状态、不改变路由。build 注入 `window.__REPLICA_LAYOUTS__`（布局 id→by-hash 相对 URL）；布局按钮渲染 `data-replica-layout`（RUNTIME 点击只换背景 src，series 热区常驻与其解耦）；series 命中逻辑完全不变。
+- **R2（a_002_001 target 缺失→s_003 死胡同）**：`capture_locator_snapshot`/`capture_selector_closure` 多元素 locator 归一 `.first`（不再 strict-mode 抛异常被 `except:pass` 吞），`count()==0` 返回 None；全部调用方补 None 分支；`_capture` 里 target 缺失显式记 warning；`build_flow_from_snapshots` 把 `missing_target_evidence:<action_id>` 进 `flow.warnings`（pipeline_report 可见）。**重录后 a_002_001 的 target.json 正常落盘**。
+- **R3 布局成员三态化**：`_render_document` 对 layout region 成员按「variant 可推+有背景 → `data-replica-layout` 可点 / variant 可推无背景 → `aria-disabled` / 推不出 → 纯装饰」处理；legacy（无 `layout_variants`）不注入不回归。`_promote_series_regions_to_earliest_documents` 扩展为提升到「每个无 series region 的主路径状态」。
+- **R4 防误触**：布局按钮 `z-index:3` 高于 series-key `z-index:2`（重叠命中优先布局）；series 行与可点布局按钮 rect 相交时裁剪重叠带（`_series_member_html` 的 `clip_rect`）。
+- **步骤 3 死胡同兜底**：无 out transition 且有可交互内容的非入口状态注入 `data-replica-back` 回前一可交互状态（仅死胡同时，普通中间态行为不变）。
+
+**重录验收（run `20260817T200555Z-layout-fix`）**：`discovered=4 / 3 captured + 1 partial / 0 failed / reached_end`；**无 `missing_target_evidence`**（a_002_001 target 落盘）；headless 全链路：主 viewer 3 热区 → 点序列跳分支 → 分支内层 viewer iframe 4 热区可再切 → 两步 Meta。序列数量守恒（不新增假分支）。
+
+> ⚠ **布局变体采样（增强项）未采到**：`_sample_all_layout_variants` 按 `page.locator("#cellStyle")` 找布局容器，但真实 Dapeng viewer 布局浮层的 root 可能是 `body`（layout marker 的 after 快照把 region 挂到外层 `d_p_000_root`，628 个成员、无 cellStyle id），导致 `layout_root=None` → 变体空 → build 侧布局按钮 **disabled**（不假装可点，符合计划降级语义）。**真正的布局浮层（16 成员：`layout_1_1`/`layout_1_2`/`layout_2_1`/`layout_2_2`/`layout_1_3`/`layout_2_3`/`layout_3_3`/`triangle_layout` 等精确 rect）实际记录在 s_004（序列选择 marker 的 after 快照）的 viewer document `d_p_001_f_001` 里**。若要做布局可点，需改在「有精确 layout region 的 doc」上采样各布局背景（Dapeng 布局按钮是工具栏内联组而非独立浮层，见 `_tmp_probe_layout*` 探索；计划 §步骤6 的「布局切完 1.5s 稳定」可复用 `skills/zscloud-film-capture/references/known-issues.md:376-388`）。
+> **How to check**：`test_nested_frame_series_uses_scroll_harvest`（scrollTop 恢复 `4` 断言）是既有失败（干净基线也挂 `0 != 4`），与 R 系列无关，未修。
+
 ## 已跑通的中山产物
 
 `out/zscloud/runs/20260817T053551Z-c3a374/replica/index.html`（4 分支 3 captured 1 partial(b000 `no_visual_change_evidence` 无害降级)；#5 修复后 headless 端到端全链路验收通过：查看影像 → 点序列 key → 切分支 → **分支内再切序列（b000→b001）** → 两步 meta_open(Tags)）。
 
 > 复刻验证注意：分支内序列热区必须数 `iframe` 里 `[data-replica-series-key]` 元素（≥1）才算可切，光凭 manifest 里 region 存在会误判「分支可点」（#5 教训）。
+> 复刻路径注意：viewer 系列热区在内层文档 `<state>/documents/<doc_id>/index.html`（非顶层 state index.html）；验收要先走对嵌套路径。
