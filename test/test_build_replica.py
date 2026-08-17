@@ -1098,5 +1098,446 @@ class SeriesRerouteTests(unittest.TestCase):
             self.assertEqual(re.findall(r'data-replica-series-key="[^"]+"', outer_html), [])
 
 
+def _layout_member(member_id: str, text: str, tag: str = "li", y: float = 40.0, elm_id: str = "", x: float = 360.0) -> RegionMember:
+    """Build a layout region member; elm_id defaults to the member_id."""
+    resolved_id = elm_id or "layout-{}".format(member_id)
+    body = text if text else '<i class="icon"></i>'
+    outer = "<{tag} id=\"{rid}\">{body}</{tag}>".format(tag=tag, rid=resolved_id, body=body)
+    dom = DomNodeSnapshot(
+        tag, text, {"id": resolved_id},
+        Rect(x, y, 100, 28, "page_viewport_css"),
+        outer,
+        {"display": "block"},
+    )
+    return RegionMember(member_id, "layout", dom)
+
+
+def _layout_region(document_id: str, members: list[RegionMember]) -> InteractionRegion:
+    root = DomNodeSnapshot(
+        "div", "", {"id": "layoutMenu"},
+        Rect(340, 20, 140, 160, "page_viewport_css"),
+        '<div id="layoutMenu"></div>', {"display": "block"},
+    )
+    return InteractionRegion(
+        f"{document_id}_layout", "layout", document_id, root, members, None,
+    )
+
+
+class LayoutVariantTests(unittest.TestCase):
+    """步骤4/5：布局 region 全部成员三态化 + __REPLICA_LAYOUTS__ 注入 + series
+    热区裁剪 + z-index 语义化（方案 A「背景层替换」，布局与序列解耦）。
+    """
+
+    def _flow(self, layout_variants="default", layout_members=None, series_members=None, series_branch=False):
+        """``layout_variants``: "default" fills the fixture pair, else passes as-is
+        (None / {} prune layout support entirely — legacy-run shape).
+
+        ``series_branch``: attach a real SeriesBranch so the series row routes to
+        a public ``data-replica-series-key`` (mirrors the hub->viewer wiring).
+        """
+        page_model = ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)
+        evidence = StateEvidence(False, False, False, False, 0, 0, 0, 0, "state")
+        layout_region = _layout_region(
+            "d_main",
+            layout_members if layout_members is not None else [
+                _layout_member("m11", "1*1", elm_id="layout_1_1", y=40.0),
+                _layout_member("m22", "2*2", elm_id="layout_2_2", y=70.0),
+                _layout_member("micon", "", elm_id="ic-layout", y=100.0),
+            ],
+        )
+        regions = []
+        if series_members is not None:
+            regions.append(
+                InteractionRegion(
+                    "d_main_series", "series", "d_main",
+                    DomNodeSnapshot(
+                        "div", "", {"id": "HLeftThumnail", "role": "listbox"},
+                        Rect(20, 30, 420, 200, "page_viewport_css"),
+                        '<div id="HLeftThumnail" role="listbox"></div>', {"display": "block"},
+                    ),
+                    series_members, None,
+                )
+            )
+        regions = regions + [layout_region]
+        variants = (
+            {"1*1": "assets/lay11.png", "2*2": "assets/lay22.png"}
+            if layout_variants == "default" else layout_variants
+        )
+        doc = ReplicaDocument(
+            "d_main", "p_main", "page", "main", None, None, None, None,
+            {"width": 640, "height": 400}, 1, "css", 0, 0,
+            "assets/main.png", "main", 3,
+            regions=regions,
+            layout_variants=variants,
+            default_layout="2*2" if variants else "",
+        )
+        states = [
+            ReplicaState(
+                "s_000", 0, "", "page", [page_model], [doc], [],
+                StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry"),
+            )
+        ]
+        branches = []
+        if series_branch and series_members:
+            first_member = series_members[0]
+            branches.append(SeriesBranch(
+                "branch_000", "series-key-000", "Series 1", 0, "d_main",
+                first_member.member_id, None, "click",
+                None, None, None, "captured", None,
+            ))
+        return ReplicaFlow(
+            1, "layout", "recorded.py", "hash", "now", {"width": 640, "height": 400},
+            BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000", states, [],
+            branches,
+        )
+
+    def test_layout_variants_injected_and_layout_members_clickable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assets = root / "assets"
+            assets.mkdir()
+            (assets / "main.png").write_bytes(b"main-bytes")
+            (assets / "lay11.png").write_bytes(b"layout-1x1-bytes")
+            (assets / "lay22.png").write_bytes(b"layout-2x2-bytes")
+            series_members = [
+                _series_member("d_p_000_root_series_000", "Series 1", 40),
+            ]
+            flow = self._flow(series_members=series_members, series_branch=True)
+            output = root / "replica"
+            build_replica(flow, root, output)
+            rendered = (output / "index.html").read_text(encoding="utf-8")
+
+            # __REPLICA_LAYOUTS__ 注入（normalized 键 → by-hash 相对 URL）
+            self.assertIn("window.__REPLICA_LAYOUTS__", rendered)
+            self.assertIn('"1*1"', rendered)
+            self.assertIn('"2*2"', rendered)
+            # 布局变体资产按 by-hash 复制并引用（内容哈希出现在 URL 中）
+            lay11_path = output / "assets" / "by-hash" / f"{sha256_file(assets / 'lay11.png')}.png"
+            lay22_path = output / "assets" / "by-hash" / f"{sha256_file(assets / 'lay22.png')}.png"
+            self.assertTrue(lay11_path.exists())
+            self.assertTrue(lay22_path.exists())
+            self.assertIn(f"assets/by-hash/{lay11_path.name}", rendered)
+            self.assertIn(f"assets/by-hash/{lay22_path.name}", rendered)
+
+            # 三态：
+            # 1) 可点：layout_1_1 → data-replica-layout="1*1"；2*2 → "2*2"
+            self.assertIn('data-replica-layout="1*1"', rendered)
+            self.assertIn('data-replica-layout="2*2"', rendered)
+            # 2) 纯装饰：ic-layout 无 variant，无 data-replica-layout
+            icon_li = re.search(r'<li[^>]*id="ic-layout"[^>]*>.*?</li>', rendered)
+            self.assertIsNotNone(icon_li)
+            self.assertNotIn("data-replica-layout", icon_li.group(0))
+            self.assertIn('data-replica-overlay=""', icon_li.group(0))
+            # 3) series 热区与布局选项共存
+            self.assertIn(f'data-replica-series-key="{series_key_slug("series-key-000")}"', rendered)
+            self.assertIn('data-replica-layout', rendered)
+
+    def test_layout_variants_absent_legacy_run_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assets = root / "assets"
+            assets.mkdir()
+            (assets / "main.png").write_bytes(b"main-bytes")
+            series_members = [_series_member("d_p_000_root_series_000", "Series 1", 40)]
+            layout_members = [_layout_member("m11", "1*1", elm_id="layout_1_1", y=40.0)]
+            flow = self._flow(
+                layout_variants=None,
+                layout_members=layout_members,
+                series_members=series_members,
+                series_branch=True,
+            )
+            output = root / "replica"
+            build_replica(flow, root, output)
+            rendered = (output / "index.html").read_text(encoding="utf-8")
+            self.assertNotIn("__REPLICA_LAYOUTS__", rendered)
+            # 无布局背景：layout 成员降级为纯装饰（无 data-replica-layout= 属性；
+            # CSS 选择器里出现的 [data-replica-layout] 是规则名，不算成员属性）
+            self.assertNotIn('data-replica-layout="', rendered)
+            # series 热区保持可用（老 run 行为不变）
+            self.assertIn(f'data-replica-series-key="{series_key_slug("series-key-000")}"', rendered)
+
+    def test_layout_id_inference_handles_zscloud_spellings(self):
+        from build_replica import _infer_layout_id
+        # 常规 a*b / axb
+        self.assertEqual(
+            _infer_layout_id(DomNodeSnapshot("div", "2*2", {"id": "lg2"}, Rect(0, 0, 1, 1, "c"), "<div></div>", {})),
+            "2*2",
+        )
+        self.assertEqual(
+            _infer_layout_id(DomNodeSnapshot("div", "2x2", {"id": "lg2"}, Rect(0, 0, 1, 1, "c"), "<div></div>", {})),
+            "2*2",
+        )
+        # zscloud：``*1 Shift+1`` 文本 → 1*1
+        self.assertEqual(
+            _infer_layout_id(DomNodeSnapshot("div", "*1 Shift+1", {"id": "lg_1"}, Rect(0, 0, 1, 1, "c"), "<div></div>", {})),
+            "1*1",
+        )
+        # ``layout_1_1`` id → 1*1
+        self.assertEqual(
+            _infer_layout_id(DomNodeSnapshot("div", "", {"id": "layout_2_2"}, Rect(0, 0, 1, 1, "c"), "<div></div>", {})),
+            "2*2",
+        )
+        # 纯图标 → None（纯装饰）
+        self.assertIsNone(
+            _infer_layout_id(DomNodeSnapshot("i", "", {"id": "ic-layout"}, Rect(0, 0, 1, 1, "c"), "<i></i>", {})),
+        )
+
+    def test_layout_option_zindex_above_series_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assets = root / "assets"
+            assets.mkdir()
+            (assets / "main.png").write_bytes(b"main-bytes")
+            (assets / "lay11.png").write_bytes(b"lay")
+            flow = self._flow()
+            output = root / "replica"
+            build_replica(flow, root, output)
+            rendered = (output / "index.html").read_text(encoding="utf-8")
+            layout_z = re.search(r'\.overlay>\[data-replica-layout\]\{z-index:3', rendered)
+            series_z = re.search(r'\.overlay>\[data-replica-series-key\]\{z-index:2', rendered)
+            self.assertIsNotNone(layout_z)
+            self.assertIsNotNone(series_z)
+
+    def test_layout_folder_defaults_disabled_layout_when_variant_missing(self):
+        # disabled 态：variant 可推但无对应布局背景 → aria-disabled（不假装可点）
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assets = root / "assets"
+            assets.mkdir()
+            (assets / "main.png").write_bytes(b"main-bytes")
+            (assets / "lay11.png").write_bytes(b"lay")
+            layout_members = [
+                _layout_member("m11", "1*1", elm_id="layout_1_1", y=40.0),
+                _layout_member("m33", "3*3", elm_id="layout_3_3", y=70.0),
+            ]
+            # layout_variants 只有 1*1；3*3 无背景 → disabled
+            flow = self._flow(
+                layout_variants={"1*1": "assets/lay11.png"},
+                layout_members=layout_members,
+                series_members=[],
+            )
+            output = root / "replica"
+            build_replica(flow, root, output)
+            rendered = (output / "index.html").read_text(encoding="utf-8")
+            self.assertIn('data-replica-layout="1*1"', rendered)
+            self.assertIn('data-replica-layout="3*3"', rendered)
+            self.assertIn('data-replica-layout="3*3"', rendered)
+            three = re.search(r'data-replica-layout="3\*3"[^>]*', rendered)
+            self.assertIsNotNone(three)
+            self.assertIn('aria-disabled="true"', three.group(0))
+
+
+class SeriesHotspotClippingTests(unittest.TestCase):
+    """步骤5 去重叠：series 热区裁剪掉与布局按钮重叠的命中带。"""
+
+    def _flow_with_overlap(self):
+        page_model = ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)
+        evidence = StateEvidence(False, False, False, False, 0, 0, 0, 0, "state")
+        # 序列项 y∈[30,54) x∈[10,310)，布局按钮 y∈[40,68) x∈[40,140)
+        # → 重叠带 y∈[40,54)
+        layout_region = _layout_region(
+            "d_main",
+            [
+                _layout_member("m22", "2*2", elm_id="layout_2_2", y=40.0, x=40.0),
+            ],
+        )
+        series_member = RegionMember(
+            "d_p_000_root_series_000", "series",
+            DomNodeSnapshot(
+                "li", "Series 1", {"id": "uids0"},
+                Rect(10, 30, 300, 24, "page_viewport_css"),
+                '<li id="uids0" data-series-uid="130">Series 1</li>',
+                {"display": "block"},
+            ),
+        )
+        series_region = InteractionRegion(
+            "r_series_clip", "series", "d_main",
+            DomNodeSnapshot(
+                "div", "", {"id": "HLeftThumnail"},
+                Rect(0, 0, 400, 200, "page_viewport_css"),
+                '<div id="HLeftThumnail"></div>', {"display": "block"},
+            ),
+            [series_member], None,
+        )
+        doc = ReplicaDocument(
+            "d_main", "p_main", "page", "main", None, None, None, None,
+            {"width": 640, "height": 400}, 1, "css", 0, 0,
+            "assets/main.png", "main", 3,
+            regions=[series_region, layout_region],
+            layout_variants={"2*2": "assets/lay22.png"},
+            default_layout="2*2",
+        )
+        states = [
+            ReplicaState(
+                "s_000", 0, "", "page", [page_model], [doc], [], evidence,
+            )
+        ]
+        branches = [SeriesBranch(
+            "branch_000", "series-key-000", "Series 1", 0, "d_main",
+            "d_p_000_root_series_000", None, "click",
+            None, None, None, "captured", None,
+        )]
+        return ReplicaFlow(
+            1, "overlap", "recorded.py", "hash", "now", {"width": 640, "height": 400},
+            BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000", states, [],
+            branches,
+        )
+
+    def test_overlapping_series_row_clipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assets = root / "assets"
+            assets.mkdir()
+            (assets / "main.png").write_bytes(b"main-bytes")
+            (assets / "lay22.png").write_bytes(b"lay22-bytes")
+            flow = self._flow_with_overlap()
+            output = root / "replica"
+            build_replica(flow, root, output)
+            rendered = (output / "index.html").read_text(encoding="utf-8")
+            slug = series_key_slug("series-key-000")
+            series_style = re.search(
+                r'data-replica-series-key="{}" style="([^"]+)"'.format(slug), rendered
+            )
+            self.assertIsNotNone(series_style)
+            style = series_style.group(1)
+            top = float(re.search(r"top:([\d.]+)px", style).group(1))
+            height = float(re.search(r"height:([\d.]+)px", style).group(1))
+            # 序列项 y∈[30,54)，布局按钮 y∈[40,68) → 重叠带 y∈[40,54) 在序列项底部，
+            # 序列项热区裁剪后只保留顶部非重叠带 [30,40)，height=10。
+            self.assertAlmostEqual(top, 30.0)
+            self.assertAlmostEqual(height, 10.0)
+            # 布局按钮仍可点
+            self.assertIn('data-replica-layout="2*2"', rendered)
+
+
+class MultiStateSeriesPromotionTests(unittest.TestCase):
+    """步骤3：同一 document 的所有无 series region 的主路径状态都被提升。"""
+
+    def test_promotion_covers_all_post_layout_states(self):
+        root_series = DomNodeSnapshot(
+            "div", "", {"id": "HLeftThumnail"},
+            Rect(20, 30, 420, 200, "page_viewport_css"),
+            '<div id="HLeftThumnail"></div>', {"display": "block"},
+        )
+        series = InteractionRegion(
+            "r_series", "series", "d_main", root_series,
+            [
+                _series_member("d_p_000_root_series_000", "Series 1", 40),
+                _series_member("d_p_000_root_series_001", "Series 2", 70),
+            ],
+            None,
+        )
+        page_model = ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)
+        evidence = StateEvidence(False, False, False, False, 0, 0, 0, 0, "state")
+
+        def doc():
+            return ReplicaDocument(
+                "d_main", "p_main", "page", "main", None, None, None, None,
+                {"width": 640, "height": 400}, 1, "css", 0, 0,
+                "assets/main.png", "main", 3,
+            )
+
+        s001_doc = doc()
+        s002_doc = doc()
+        s003_doc = doc()
+        series_doc = doc()
+        series_doc.regions.append(copy.deepcopy(series))
+        states = [
+            ReplicaState("s_000", 0, "", "page", [page_model], [doc()], [], evidence),
+            ReplicaState("s_001", 1, "", "page", [page_model], [s001_doc], [], evidence),
+            ReplicaState("s_002", 2, "", "page", [page_model], [s002_doc], [], evidence),
+            ReplicaState("s_003", 3, "", "page", [page_model], [s003_doc], [], evidence),
+            ReplicaState("s_004", 4, "", "page", [page_model], [series_doc], [], evidence),
+        ]
+        flow = ReplicaFlow(
+            1, "zs-late-multi", "recorded.py", "hash", "now", {"width": 640, "height": 400},
+            BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000", states, [],
+        )
+        promoted = _promote_series_regions_to_earliest_documents(flow)
+        # s_000..s_003 四个无 series 的状态（含入口 s_000）都被提升
+        self.assertEqual(promoted, 4)
+        for idx, expected in ((0, "s_000"), (1, "s_001"), (2, "s_002"), (3, "s_003")):
+            cand = flow.states[idx].documents[0]
+            self.assertEqual(
+                len([r for r in cand.regions if r.region_type == "series"]), 1,
+                f"{expected} 应被提升出 series region",
+            )
+        # s_004 本身有 region，不被重复提升
+        self.assertEqual(len(series_doc.regions), 1)
+
+
+class DeadEndBackTests(unittest.TestCase):
+    """步骤3 死胡同兜底：无 out transition 的非入口状态渲染 data-replica-back。"""
+
+    def _flow_dead_end(self):
+        page_model = ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)
+        evidence = StateEvidence(False, False, False, False, 0, 0, 0, 0, "state")
+
+        def doc():
+            return ReplicaDocument(
+                "d_main", "p_main", "page", "main", None, None, None, None,
+                {"width": 640, "height": 400}, 1, "css", 0, 0,
+                "assets/main.png", "main", 3,
+            )
+
+        entry_doc = doc()
+        entry_doc.regions.append(
+            InteractionRegion(
+                "r_series_entry", "series", "d_main",
+                DomNodeSnapshot("div", "", {"id": "HLeftThumnail"}, Rect(0, 0, 300, 100, "page_viewport_css"),
+                                '<div id="HLeftThumnail"></div>', {"display": "block"}),
+                [_series_member("d_p_000_root_series_000", "Series 1", 30)], None,
+            )
+        )
+        # 前一可交互状态 s_002 带 series region（真实 promotion 后一致）
+        mid_doc = doc()
+        mid_doc.regions.append(
+            InteractionRegion(
+                "r_series_mid", "series", "d_main",
+                DomNodeSnapshot("div", "", {"id": "HLeftThumnail"}, Rect(0, 0, 300, 100, "page_viewport_css"),
+                                '<div id="HLeftThumnail"></div>', {"display": "block"}),
+                [_series_member("d_p_000_root_series_000", "Series 1", 30)], None,
+            )
+        )
+        # s_003：非入口、无 out transition、有 series region（死胡同）
+        dead_doc = doc()
+        dead_doc.regions.append(
+            InteractionRegion(
+                "r_series_dead", "series", "d_main",
+                DomNodeSnapshot("div", "", {"id": "HLeftThumnail"}, Rect(0, 0, 300, 100, "page_viewport_css"),
+                                '<div id="HLeftThumnail"></div>', {"display": "block"}),
+                [_series_member("d_p_000_root_series_000", "Series 1", 30)], None,
+            )
+        )
+        states = [
+            ReplicaState("s_000", 0, "", "page", [page_model], [entry_doc], [], evidence),
+            ReplicaState("s_001", 1, "", "page", [page_model], [doc()], [], evidence),
+            ReplicaState("s_002", 2, "", "page", [page_model], [mid_doc], [], evidence),
+            ReplicaState("s_003", 3, "", "page", [page_model], [dead_doc], [], evidence),
+        ]
+        return ReplicaFlow(
+            1, "dead-end", "recorded.py", "hash", "now", {"width": 640, "height": 400},
+            BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_000", states, [],
+        )
+
+    def test_dead_end_state_gets_back_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assets = root / "assets"
+            assets.mkdir()
+            (assets / "main.png").write_bytes(b"main-bytes")
+            flow = self._flow_dead_end()
+            output = root / "replica"
+            build_replica(flow, root, output)
+            dead_html = (output / "states" / "s_003" / "index.html").read_text(encoding="utf-8")
+            # 死胡同状态获得返回入口（data-replica-back → s_002 相对路径）
+            match = re.search(r'data-replica-back="([^"]+)"', dead_html)
+            self.assertIsNotNone(match, "s_003 死胡同应有 data-replica-back")
+            self.assertIn("s_002/index.html", match.group(1))
+            # 入口状态不应有返回按钮
+            entry_html = (output / "index.html").read_text(encoding="utf-8")
+            self.assertNotIn("data-replica-back", entry_html)
+
+
 if __name__ == "__main__":
     unittest.main()

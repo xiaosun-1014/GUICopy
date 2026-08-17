@@ -54,6 +54,131 @@ def _series_members(selected_key=None):
     ]
 
 
+def _layout_member(member_id, text, y, elm_id, x=300, w=90, h=30, tag="div"):
+    """A layout region member (same shape as the runtime layout branches)."""
+    resolved_id = elm_id or f"layout-{member_id}"
+    body = text if text else '<i class="icon"></i>'
+    outer = f'<{tag} id="{resolved_id}">{body}</{tag}>'
+    dom = DomNodeSnapshot(
+        tag, text, {"id": resolved_id},
+        Rect(x, y, w, h, "page_viewport_css"),
+        outer, {},
+    )
+    return RegionMember(member_id, "layout", dom)
+
+
+def _layout_region(document_id, members, x=300, y=0):
+    root = DomNodeSnapshot(
+        "div", "", {"id": "layoutMenu"},
+        Rect(x, y, 300, 300, "page_viewport_css"),
+        '<div id="layoutMenu"></div>', {},
+    )
+    return InteractionRegion(f"{document_id}_layout", "layout", document_id, root, members, None)
+
+
+def _layout_hub_doc(document_id, asset, series_members, layout_variants=None, default_layout=""):
+    """Hub document carrying series rows + layout buttons (1x1 / 2x2 / icon)."""
+    variants_default = layout_variants if layout_variants is not None else {
+        "1*1": "assets/lay11.png", "2*2": "assets/lay22.png",
+    }
+    layout_members = [
+        # zscloud 真实文本 ``*1 Shift+1``（1×1 快捷键标记）→ 仍推断 1*1 可点
+        _layout_member("l11", "*1 Shift+1", 40, "layout_1_1", x=260),
+        _layout_member("l22", "2*2", 70, "layout_2_2", x=260),
+        _layout_member("licon", "", 100, "ic-layout", x=260),
+    ]
+    return ReplicaDocument(
+        document_id, "p_main", "page", "main", None, None, None, None,
+        {"width": 300, "height": 200}, 1, "css", 0, 0, asset, document_id, 3,
+        regions=[
+            _series_list_region(document_id, series_members),
+            _layout_region(document_id, layout_members, x=260, y=0),
+        ],
+        layout_variants=variants_default,
+        default_layout=default_layout or "2*2",
+    )
+
+
+def _build_layout_flow():
+    """Entry hub with layout buttons + series rows; one branch viewer also has
+    layout variants so a series jump preserves the 2x2 background choice."""
+    page_model = ReplicaPage("p_main", "page", "main", None, None, "d_hub", True, False)
+    evidence = StateEvidence(False, False, False, False, 0, 0, 0, 0, "entry")
+
+    hub = _layout_hub_doc(
+        "d_hub", "assets/hub.png",
+        _series_members(),
+        layout_variants={"1*1": "assets/lay11.png", "2*2": "assets/lay22.png"},
+        default_layout="2*2",
+    )
+    viewer = _layout_hub_doc(
+        "d_va", "assets/va.png",
+        _series_members("A"),
+        layout_variants={"1*1": "assets/va_lay11.png", "2*2": "assets/va_lay22.png"},
+        default_layout="2*2",
+    )
+    states = [
+        ReplicaState("s_hub", 0, "", "page", [page_model], [hub], [], evidence),
+        ReplicaState(
+            "s_va", 1, "", "page",
+            [ReplicaPage("p_main", "page", "main", None, None, "d_va", True, False)],
+            [viewer], [], evidence,
+        ),
+        ReplicaState(
+            "s_dead", 2, "", "page",
+            [ReplicaPage("p_main", "page", "main", None, None, "d_dead", True, False)],
+            [_layout_hub_doc("d_dead", "assets/va.png", _series_members("A"))], [], evidence,
+        ),
+    ]
+    branches = [
+        SeriesBranch("branch_a", "A", "Series A", 0, "d_hub", "ma", None, "click", "s_va", None, None, "captured", None),
+    ]
+    return ReplicaFlow(
+        1, "layout", "recorded.py", "hash", "now", {"width": 300, "height": 200},
+        BootstrapPlan(1, 1, True, {"page": "main"}),
+        [], CaptureTimingProfile(), "s_hub", states, [],
+        series_branches=branches,
+    )
+
+
+def _dead_end_flow():
+    """Entry -> s_001 (exit) -> s_002 (no exit, has series: dead end)."""
+    page_model = ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)
+    evidence = StateEvidence(False, False, False, False, 0, 0, 0, 0, "state")
+
+    def doc(doc_id, members):
+        return ReplicaDocument(
+            doc_id, "p_main", "page", "main", None, None, None, None,
+            {"width": 300, "height": 200}, 1, "css", 0, 0,
+            f"assets/{doc_id}.png", doc_id, 3,
+            regions=[_series_list_region(doc_id, members)],
+        )
+
+    entry = doc("d_main", [_member("ma", "Series A", y=0)])
+    mid = doc("d_main", [_member("ma", "Series A", y=0)])  # s_001 has exit
+    dead = doc("d_main", [_member("ma", "Series A", y=0)])  # s_002 dead end
+    states = [
+        ReplicaState("s_000", 0, "", "page", [page_model], [entry], [], evidence),
+        ReplicaState(
+            "s_001", 1, "", "page",
+            [ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)],
+            [mid], [], evidence,
+        ),
+        ReplicaState(
+            "s_002", 2, "", "page",
+            [ReplicaPage("p_main", "page", "main", None, None, "d_main", True, False)],
+            [dead], [], evidence,
+        ),
+    ]
+    # s_001 has an out transition (-> s_002), s_002 has none.
+    states[1].transitions = [ReplicaTransition("t_1", "a_1", "s_001", "s_002", "page", "page", "same_page")]
+    return ReplicaFlow(
+        1, "dead-end", "recorded.py", "hash", "now", {"width": 300, "height": 200},
+        BootstrapPlan(1, 1, True, {"page": "main"}),
+        [], CaptureTimingProfile(), "s_000", states, [],
+    )
+
+
 def _build_series_flow():
     """Construct a hand-rolled multi-series flow (no Phase 6 dependency).
 
@@ -739,6 +864,122 @@ class ReplicaRuntimeTests(unittest.TestCase):
                 page.mouse.click(150, 190)
                 page.wait_for_url("**/states/s_vt/index.html")
                 self.assertEqual(page.locator("#viewer-tall").inner_text(), "TALL viewer unique")
+                browser.close()
+
+    def test_layout_switch_swaps_background_not_navigate(self):
+        """方案 A：点布局按钮只换背景（img.replica-bg），不导航；随后点序列项
+        跳分支，且新背景保持 2×2（布局与序列解耦）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assets = root / "assets"
+            assets.mkdir(parents=True, exist_ok=True)
+            for name in ("hub", "va", "lay11", "lay22", "va_lay11", "va_lay22"):
+                (assets / f"{name}.png").write_bytes(f"{name}-bytes".encode())
+            flow = _build_layout_flow()
+            output = root / "replica"
+            build_replica(flow, root, output)
+
+            with ReplicaServer(output) as server, sync_playwright() as playwright:
+                browser = playwright.chromium.launch()
+                page = browser.new_page(viewport={"width": 300, "height": 200})
+                page.goto(server.url)
+
+                # 初始背景即入口主截图（hub by-hash）。
+                hub_bg = page.locator(".replica-bg").get_attribute("src")
+                self.assertEqual(
+                    hub_bg,
+                    f"assets/by-hash/{sha256_file(assets / 'hub.png')}.png",
+                )
+                before_url = page.url
+
+                # 点 1×1 布局按钮：只换背景（lay11 by-hash），不导航。
+                page.locator('[data-replica-layout="1*1"]').click(force=True)
+                self.assertEqual(page.url, before_url, "点布局按钮不应导航")
+                self.assertEqual(
+                    page.locator(".replica-bg").get_attribute("src"),
+                    f"assets/by-hash/{sha256_file(assets / 'lay11.png')}.png",
+                )
+
+                # 布局按钮是粘性的：可再次点回 2×2。
+                page.locator('[data-replica-layout="2*2"]').click(force=True)
+                self.assertEqual(page.url, before_url)
+                self.assertEqual(
+                    page.locator(".replica-bg").get_attribute("src"),
+                    f"assets/by-hash/{sha256_file(assets / 'lay22.png')}.png",
+                )
+
+                # 点序列项 → 跳分支（布局与序列解耦：切换后仍可正常选序列）。
+                page.locator(f'[data-replica-series-key="{series_key_slug("A")}"]').click(force=True)
+                page.wait_for_url("**/states/s_va/index.html")
+                self.assertIn("/states/s_va/index.html", page.url)
+                viewer_bg = page.locator(".replica-bg").get_attribute("src")
+                self.assertTrue(
+                    viewer_bg.endswith(f"assets/by-hash/{sha256_file(assets / 'va.png')}.png"),
+                    f"分支背景应为 va 主截图: {viewer_bg}",
+                )
+                browser.close()
+
+    def test_layout_button_not_covered_by_series_hotspot(self):
+        """重叠坐标：点布局按钮命中布局而非系列分支（mousemove 落点被 z-index:3
+        布局层拦截，url 不变、背景变）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assets = root / "assets"
+            assets.mkdir(parents=True, exist_ok=True)
+            for name in ("hub", "va", "lay11", "lay22", "va_lay11", "va_lay22"):
+                (assets / f"{name}.png").write_bytes(f"{name}-bytes".encode())
+            flow = _build_layout_flow()
+            # 让 2×2 布局按钮与第 4 个序列项（y=36..56, x=0..300）在 y∈[40,70)
+            # 区域重叠（默认布局成员 x=260 与 series 行不重叠，这里改为重叠）。
+            hub_doc = flow.states[0].documents[0]
+            region = next(region for region in hub_doc.regions if region.region_type == "layout")
+            for member in region.members:
+                if member.dom.attributes.get("id") == "layout_2_2":
+                    member.dom.rect = Rect(0, 40, 300, 30, "page_viewport_css")
+            output = root / "replica"
+            build_replica(flow, root, output)
+
+            with ReplicaServer(output) as server, sync_playwright() as playwright:
+                browser = playwright.chromium.launch()
+                page = browser.new_page(viewport={"width": 300, "height": 200})
+                page.goto(server.url)
+                before_url = page.url
+                before_bg = page.locator(".replica-bg").get_attribute("src")
+                # 点重叠坐标 (150, 55)：在该点，series 热区（y∈[36,56)）与
+                # layout 按钮（y∈[40,70)）重叠。布局层 z-index:3 应优先。
+                page.mouse.click(150, 55)
+                self.assertEqual(page.url, before_url, "重叠点应触发布局而非导航")
+                self.assertEqual(
+                    page.locator(".replica-bg").get_attribute("src"),
+                    f"assets/by-hash/{sha256_file(assets / 'lay22.png')}.png",
+                    "背景应切换为 2×2",
+                )
+                browser.close()
+
+    def test_dead_end_state_back_returns_to_entry(self):
+        """步骤3：无 out transition 的死胡同状态带 data-replica-back，点返回回上一可交互状态。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            assets = root / "assets"
+            assets.mkdir(parents=True, exist_ok=True)
+            for name in ("d_main",):
+                (assets / f"{name}.png").write_bytes(f"{name}-bytes".encode())
+            flow = _dead_end_flow()
+            output = root / "replica"
+            build_replica(flow, root, output)
+
+            dead_html = (output / "states" / "s_002" / "index.html").read_text(encoding="utf-8")
+            self.assertIn("data-replica-back", dead_html)
+
+            with ReplicaServer(output) as server, sync_playwright() as playwright:
+                browser = playwright.chromium.launch()
+                page = browser.new_page(viewport={"width": 300, "height": 200})
+                page.goto(f"{server.url.replace('/index.html', '')}/states/s_002/index.html", wait_until="load", timeout=30000)
+                back = page.locator("[data-replica-back]")
+                self.assertEqual(back.count(), 1)
+                back.click()
+                page.wait_for_url("**/states/s_001/index.html")
+                self.assertIn("/states/s_001/index.html", page.url)
                 browser.close()
 
 

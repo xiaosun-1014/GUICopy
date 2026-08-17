@@ -153,6 +153,20 @@ window.addEventListener('resize', fitReplicaToViewport);
 if (window.visualViewport) window.visualViewport.addEventListener('resize', fitReplicaToViewport);
 fitReplicaToViewport();
 document.addEventListener('click', event => {
+  // 布局按钮是「粘性按钮」（点了还要能再点），所以必须先于 series /
+  // action 命中：只换同一状态内的背景 img.replica-bg，不导航、不消失。
+  const layoutEl = event.target.closest('[data-replica-layout]');
+  if (layoutEl) {
+    event.preventDefault();
+    const layoutId = layoutEl.getAttribute('data-replica-layout');
+    const layoutUrls = window.__REPLICA_LAYOUTS__ || {};
+    const url = layoutUrls[layoutId];
+    if (url) {
+      const bg = document.querySelector('img.replica-bg');
+      if (bg) bg.src = url;      // 只换背景，保持当前 series 热区与布局系列解耦
+    }
+    return;
+  }
   const seriesEl = event.target.closest('[data-replica-series-key]');
   if (seriesEl) {
     applyReplicaSeriesRoute(seriesEl, event);
@@ -276,6 +290,7 @@ def _series_member_html(
     disabled: bool,
     below_fold: bool = False,
     dy: float = 0.0,
+    clip_rect: "Rect | None" = None,
 ) -> str:
     """Attach a series route key with accessible option semantics to a member node.
 
@@ -288,11 +303,39 @@ def _series_member_html(
     ``dy`` rebases an absolute page rect into a scroll container's local
     coordinates (tall-list mode moves the rows inside the series panel's own
     scrolling region, so each row's ``top`` becomes ``rect.y - dy``).
+
+    ``clip_rect`` (步骤5 去重叠) trims the row's hit area so an overlapping
+    interactive layout button wins the overlap band. ``clip_rect`` must already
+    be in the same coordinate space as the row's rendered rect (i.e. it should
+    carry the same ``dy`` rebase the caller applies via ``top``).
     """
     top = snapshot.rect.y if dy == 0 else snapshot.rect.y - dy
+    box_left = snapshot.rect.x
+    box_top = top
+    box_width = snapshot.rect.width
+    box_height = snapshot.rect.height
+    if clip_rect is not None:
+        # 勤俭裁剪：只剔除重叠带，序列项其余命中区保留。
+        x0 = float(clip_rect.x)
+        y0 = float(clip_rect.y)
+        x1 = x0 + float(clip_rect.width)
+        y1 = y0 + float(clip_rect.height)
+        hit_x0, hit_y0 = float(box_left), float(box_top)
+        hit_x1, hit_y1 = hit_x0 + float(box_width), hit_y0 + float(box_height)
+        ix0, iy0 = max(hit_x0, x0), max(hit_y0, y0)
+        ix1, iy1 = min(hit_x1, x1), min(hit_y1, y1)
+        if ix1 > ix0 and iy1 > iy0:
+            # 交集在垂直方向的位置决定剪顶部还是底部：顶部重叠带把 top 下移，
+            # 底部重叠带把 height 缩短。水平方向不剪（布局按钮通常只占一小段）。
+            if iy0 - hit_y0 <= hit_y1 - iy1:
+                hit_y0 = iy1
+            else:
+                hit_y1 = iy0
+        box_top = hit_y0
+        box_height = max(0.0, hit_y1 - hit_y0)
     style = (
-        f"position:absolute;left:{snapshot.rect.x}px;top:{top}px;"
-        f"width:{snapshot.rect.width}px;height:{snapshot.rect.height}px;"
+        f"position:absolute;left:{box_left}px;top:{box_top}px;"
+        f"width:{box_width}px;height:{box_height}px;"
     )
     attributes = (
         f' data-replica-overlay="" data-replica-series-key="{html.escape(series_key, quote=True)}"'
@@ -315,6 +358,82 @@ def _series_member_html(
 
 def _relative_url(source_file: Path, destination_file: Path) -> str:
     return Path(os.path.relpath(destination_file, source_file.parent)).as_posix()
+
+
+def _normalize_layout_id(text: str) -> str | None:
+    """Normalize a layout spec to the canonical ``a*b`` form.
+
+    ``1x1`` / ``1 X 1`` / ``1*1`` all collapse to ``1*1`` so the captured member
+    text can be matched against ``layout_variants`` keys regardless of the
+    separator the viewer's CSS class names / text happen to use.
+    """
+    match = re.match(r"\s*(\d+)\s*[*xX]\s*(\d+)\s*$", text)
+    if not match:
+        return None
+    return f"{match.group(1)}*{match.group(2)}"
+
+
+def _infer_layout_id(dom: DomNodeSnapshot) -> str | None:
+    """Infer a layout variant id from a layout region member's DOM.
+
+    Accepts several real-world spellings and collapses them to ``a*b``:
+
+    - ``2*2`` / ``2x2`` / ``2 X 2`` (text or element id)
+    - ``layout_1_1`` / ``layout-1-1`` (underscore/hyphen separated digits in id)
+    - ``*1 Shift+1`` (zscloud records the 1x1 shortcut with a leading star as
+      the member's visible text -- still layout 1x1)
+
+    Falls back to ``None`` when the member is a plain icon / irregularly named
+    and should stay purely decorative.
+    """
+    sources = [
+        dom.text or "",
+        dom.attributes.get("id") or "",
+    ]
+    norm_sources = [source.replace("-", " ").replace("_", " ") for source in sources]
+    for source in sources + norm_sources:
+        # ``*1 Shift+1`` 风格：星号前导的单个数字 → 正方形布局 N*N。
+        match = re.search(r"^\s*[*xX]\s*(\d+)", source)
+        if match:
+            return f"{match.group(1)}*{match.group(1)}"
+        # ``2*2`` / ``2x2`` / ``layout 1 1`` → a*b。
+        match = re.search(r"(\d+)\s*[*xX]\s*(\d+)", source)
+        if match:
+            return f"{match.group(1)}*{match.group(2)}"
+        # 下划线/连字符分隔（``layout_1_1`` 已在 norm_sources 里变空格）：
+        # 两个相邻数字视为行列（1 1 → 1*1）。
+        match = re.search(r"(\d+)\s+(\d+)\b", source)
+        if match and source.startswith("layout"):
+            return f"{match.group(1)}*{match.group(2)}"
+    return None
+
+
+def _layout_member_html(
+    snapshot: DomNodeSnapshot,
+    variant_id: str,
+    disabled: bool = False,
+) -> str:
+    """Render a layout region member as a clickable background-variant switcher.
+
+    Clicking it swaps only ``img.replica-bg`` (via the RUNTIME
+    ``data-replica-layout`` branch — no navigation), keeping layout selection
+    decoupled from series routing. ``disabled`` members (variant inferred but no
+    captured background) render as inert ``aria-disabled`` options.
+    """
+    attributes = ' data-replica-overlay=""'
+    attributes += f' data-replica-layout="{variant_id}"'
+    if disabled:
+        attributes += ' aria-disabled="true"'
+    role_attr = ' role="option"'
+    if ' role=' not in snapshot.outer_html and ' role=' not in " ".join(snapshot.attributes):
+        attributes += role_attr
+    style = (
+        f"position:absolute;left:{snapshot.rect.x}px;top:{snapshot.rect.y}px;"
+        f"width:{snapshot.rect.width}px;height:{snapshot.rect.height}px;"
+    )
+    return snapshot.outer_html.replace(
+        f"<{snapshot.tag_name}", f"<{snapshot.tag_name}{attributes} style=\"{style}\"", 1
+    )
 
 
 def _is_metadata_panel(region: InteractionRegion) -> bool:
@@ -404,6 +523,7 @@ def _render_document(
     series_route_by_identity: dict[str, dict[str, object]] | None = None,
     series_list_asset: str | None = None,
     menu_strip: dict[str, object] | None = None,
+    layout_variants: dict[str, str] | None = None,
 ) -> str:
     asset = _relative_url(destination, output_root / asset_path)
     viewport_h = float(document.viewport["height"])
@@ -459,6 +579,12 @@ def _render_document(
         ".replica-bg{display:block;width:100%;height:100%;object-fit:fill}"
         ".overlay{position:absolute;inset:0}.overlay>*{box-sizing:border-box}"
         ".overlay>[data-replica-overlay]{opacity:0}.overlay>[data-replica-action]{z-index:1}.overlay>[data-replica-series-key]{z-index:2}.overlay>[data-replica-series-key][data-replica-below-fold]{opacity:1}"
+        "/* 布局按钮 z-index:3 高于 series-key(2)：重叠区命中优先布局（方案 A）"
+        "布局与序列解耦：同状态内换背景，不导航。data-replica-visible 同为 3，"
+        "两者上一状态不同时出现，不冲突。 */"
+        ".overlay>[data-replica-layout]{z-index:3;cursor:pointer;border-radius:3px}"
+        ".overlay>[data-replica-layout]:hover{outline:2px solid rgba(120,170,255,.5);outline-offset:-2px}"
+        ".overlay>[data-replica-layout][aria-disabled=\"true\"]{cursor:not-allowed;opacity:.45;filter:grayscale(.6);pointer-events:none}"
         "/* Tall-list mode: only the series panel scrolls; its rows scroll as"
         "rendered DOM content (no moving background image), matching the real FT"
         "panel where scrolling moves the list entries, not the panel chrome. */"
@@ -466,8 +592,8 @@ def _render_document(
         ".overlay>[data-replica-visible]{opacity:1;z-index:3;background:rgb(20,25,33);border:1px solid rgb(44,52,63);"
         "border-radius:4px;color:rgb(209,228,255);display:flex;align-items:center;justify-content:center;"
         "font:13px/1.4 'Helvetica Neue',Helvetica,sans-serif;cursor:pointer;box-shadow:0 8px 20px rgba(0,0,0,.55)}"
-        ".overlay>[data-replica-overlay]:not([data-replica-action]):not([data-replica-input]):not([data-replica-series-key]):not([role]):not(button):not(input):not(select):not(textarea):not(canvas):not(a){pointer-events:none}"
-        ".overlay>[data-replica-action],.overlay>[data-replica-input],.overlay>[data-replica-series-key],.overlay>[data-replica-overlay][role],.overlay>[data-replica-overlay][data-testid],.overlay>[data-replica-overlay]button,.overlay>[data-replica-overlay]input,.overlay>[data-replica-overlay]select,.overlay>[data-replica-overlay]textarea,.overlay>[data-replica-overlay]canvas,.overlay>[data-replica-overlay]a{pointer-events:auto}"
+        ".overlay>[data-replica-overlay]:not([data-replica-layout]):not([data-replica-action]):not([data-replica-input]):not([data-replica-series-key]):not([role]):not(button):not(input):not(select):not(textarea):not(canvas):not(a){pointer-events:none}"
+        ".overlay>[data-replica-layout],.overlay>[data-replica-action],.overlay>[data-replica-input],.overlay>[data-replica-series-key],.overlay>[data-replica-overlay][role],.overlay>[data-replica-overlay][data-testid],.overlay>[data-replica-overlay]button,.overlay>[data-replica-overlay]input,.overlay>[data-replica-overlay]select,.overlay>[data-replica-overlay]textarea,.overlay>[data-replica-overlay]canvas,.overlay>[data-replica-overlay]a{pointer-events:auto}"
         ".overlay>[data-replica-input]{opacity:1;caret-color:rgb(255,255,255)}"
         ".replica-metadata{background:rgb(3,6,9);color:rgb(209,228,255);"
         "font:14px/1.35 'Helvetica Neue',Helvetica,'Microsoft YaHei',Arial,sans-serif;"
@@ -529,6 +655,30 @@ def _render_document(
             if menu_strip else ""
         ),
     ]
+    # 布局可点成员的 rect 与布局字典（第一趟预算，先于成员渲染）：供 series 热区
+    # 裁剪使用——重叠带命中优先布局按钮（z-index:3 > series-key:2 的双保险）。
+    # 所有 key 统一 normalize 成 ``a*b`` 形式，与 _infer_layout_id 的输出一致，
+    # 保证 __REPLICA_LAYOUTS__ 的键、data-replica-layout 的取值、layout 区域成员
+    # 的映射三点对齐（兼容 ``1*1``/``1x1``/``layout_1_1`` 等任意来源）。
+    layout_lookup: dict[str, str] = {}
+    clip_layout_rects: list[Rect] = []
+    if layout_variants:
+        for raw_key, url in layout_variants.items():
+            normalized = _normalize_layout_id(raw_key) or _normalize_layout_id(str(raw_key).replace("_", " "))
+            if normalized:
+                layout_lookup[normalized] = url
+        # 方案 A「背景层替换」：同状态下注入布局字典（normalized key → 相对 URL），
+        # 点击布局按钮只改 img.replica-bg 的 src，不产生新状态、不改变路由。
+        parts.append(
+            f"<script>window.__REPLICA_LAYOUTS__={json.dumps(layout_lookup, ensure_ascii=False)};</script>"
+        )
+        for region in document.regions:
+            if region.region_type != "layout":
+                continue
+            for member in region.members:
+                variant_id = _infer_layout_id(member.dom)
+                if variant_id is not None and _normalize_layout_id(variant_id) in layout_lookup:
+                    clip_layout_rects.append(member.dom.rect)
     rendered_nodes: set[tuple[str, float, float, float, float]] = set()
     rendered_element_ids: set[str] = set()
     metadata_panel_html = {
@@ -650,7 +800,29 @@ def _render_document(
                         series_key = str(identity_route.get("slug"))
                         disabled_route = bool(identity_route.get("disabled"))
             is_series_region = region.region_type == "series"
+            is_layout_region = region.region_type == "layout"
             if series_key is not None:
+                # 步骤5 去重叠：series 热区裁剪，避免与可交互布局按钮重叠；只裁
+                # 本行与任一布局可点成员相交的重叠带（顶部下移 / 底部缩短）。
+                clip_rect = None
+                if clip_layout_rects:
+                    item_top = member.dom.rect.y
+                    item_bottom = float(member.dom.rect.y) + float(member.dom.rect.height)
+                    for laid in clip_layout_rects:
+                        lo = float(laid.y)
+                        hi = float(laid.y) + float(laid.height)
+                        if (
+                            float(laid.x) < float(member.dom.rect.x) + float(member.dom.rect.width)
+                            and float(laid.x) + float(laid.width) > float(member.dom.rect.x)
+                            and lo < item_bottom
+                            and hi > item_top
+                        ):
+                            rebased = Rect(
+                                float(laid.x), float(laid.y) - (series_origin_y if tall_scroll and is_series_region else 0.0),
+                                float(laid.width), float(laid.height), laid.coordinate_space,
+                            )
+                            clip_rect = rebased
+                            break
                 route = (series_route or {}).get(series_key, {})
                 member_markup = _series_member_html(
                     member.dom,
@@ -659,7 +831,37 @@ def _render_document(
                     disabled=disabled_route or bool(route.get("disabled")),
                     below_fold=bool(member.dom.rect.y >= viewport_h),
                     dy=(series_origin_y if tall_scroll and is_series_region else 0.0),
+                    clip_rect=clip_rect,
                 )
+                member_markup = _redact_known_series_identities(
+                    member_markup, series_route_by_identity
+                )
+            elif is_layout_region:
+                # 兼容性「默认关闭」：没有本页布局字典（__REPLICA_LAYOUTS__ 未注入）
+                # 时，layout region 成员一律走纯装饰（老 run 行为不变）。只有方案 A
+                # 落地（layout_lookup 非空）才做三态化。
+                if not layout_lookup:
+                    positioned = _positioned_html(member.dom)
+                    member_markup = _redact_known_series_identities(
+                        positioned, series_route_by_identity
+                    )
+                    parts.append(member_markup)
+                    rendered_nodes.add(member_key)
+                    if member.dom.attributes.get("id"):
+                        rendered_element_ids.add(member.dom.attributes["id"])
+                    continue
+                # 步骤4 布局 region 全部成员三态化：
+                #   可点 —— variant 可推出且存在对应布局背景 → data-replica-layout
+                #   disabled —— variant 可推出但无背景 → aria-disabled（不假装可点）
+                #   纯装饰 —— variant 推不出（命名不规则/纯图标）→ 保持 data-replica-overlay
+                variant_id = _infer_layout_id(member.dom)
+                normalized = _normalize_layout_id(variant_id) if variant_id else None
+                if normalized is not None and normalized in layout_lookup:
+                    member_markup = _layout_member_html(member.dom, normalized)
+                elif normalized is not None:
+                    member_markup = _layout_member_html(member.dom, normalized, disabled=True)
+                else:
+                    member_markup = _positioned_html(member.dom)
                 member_markup = _redact_known_series_identities(
                     member_markup, series_route_by_identity
                 )
@@ -1058,20 +1260,21 @@ def _augment_meta_two_step(
 
 
 def _promote_series_regions_to_earliest_documents(flow: ReplicaFlow) -> int:
-    """Mirror the recorded series list onto the earliest main-path state that
-    owns the same viewer document.
+    """Mirror the recorded series list onto every main-path state that owns the
+    same viewer document and has no series region yet.
 
     A viewer whose series click lands late in the recording (e.g. zscloud's
     popup viewer: the recorded dblclick happens at s_004, after s_001-s_003)
     only ends up with a ``series`` InteractionRegion in the later states, so the
     replica's *entry* viewer exposes no clickable series list even though every
     branch was captured. FT (series click early) already carries the list in its
-    entry viewer document. Promoting the first main-path series region to the
-    first main-path state that owns the same ``document_id`` makes any replica
-    with captured branches show the clickable list from entry. Branch states
-    (``bviewer_``/``bmeta_``/``btags_``) are never sources or targets: their
-    series regions already render in each branch viewer. Returns the number of
-    documents promoted.
+    entry viewer document. Promoting a main-path series region to *every* main
+    path state that owns the same ``document_id`` without a series region (not
+    just the earliest one, 步骤3) makes any replica with captured branches show
+    the clickable list from entry through all intermediate layout states
+    (s_001/s_002/s_003). Branch states (``bviewer_``/``bmeta_``/``btags_``) are
+    never sources or targets: their series regions already render in each branch
+    viewer. Returns the number of documents promoted.
     """
     branch_state_ids = {
         state_id
@@ -1083,11 +1286,9 @@ def _promote_series_regions_to_earliest_documents(flow: ReplicaFlow) -> int:
         (state for state in flow.states if state.state_id not in branch_state_ids),
         key=lambda state: state.ordinal,
     )
-    first_owner: dict[str, ReplicaState] = {}
     first_series: dict[str, tuple[ReplicaState, InteractionRegion]] = {}
     for state in main_states:
         for document in state.documents:
-            first_owner.setdefault(document.document_id, state)
             if document.document_id in first_series:
                 continue
             series_region = next(
@@ -1098,21 +1299,21 @@ def _promote_series_regions_to_earliest_documents(flow: ReplicaFlow) -> int:
                 first_series[document.document_id] = (state, series_region)
     promoted = 0
     for document_id, (source_state, series_region) in first_series.items():
-        target_state = first_owner.get(document_id)
-        if target_state is None or target_state is source_state:
-            continue
-        target_document = next(
-            (document for document in target_state.documents if document.document_id == document_id),
-            None,
-        )
-        if target_document is None:
-            continue
-        if any(region.region_type == "series" for region in target_document.regions):
-            continue
-        # Deep-copy so the promoted overlay never mutates the captured source
-        # region (which keeps rendering in its own later states).
-        target_document.regions.append(copy.deepcopy(series_region))
-        promoted += 1
+        for target_state in main_states:
+            if target_state is source_state:
+                continue
+            target_document = next(
+                (document for document in target_state.documents if document.document_id == document_id),
+                None,
+            )
+            if target_document is None:
+                continue
+            if any(region.region_type == "series" for region in target_document.regions):
+                continue
+            # Deep-copy so the promoted overlay never mutates the captured source
+            # region (which keeps rendering in its own later states).
+            target_document.regions.append(copy.deepcopy(series_region))
+            promoted += 1
     return promoted
 
 
@@ -1230,6 +1431,8 @@ def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Pa
     _augment_meta_two_step(flow, states, tags_menu=tags_menu, menu_strip=menu_strip)
     asset_paths: dict[tuple[str, str], Path] = {}
     series_list_asset_paths: dict[tuple[str, str], Path] = {}
+    # 方案 A：layout variant -> by-hash asset Path，映射键 (state_id, doc_id)。
+    layout_asset_paths: dict[tuple[str, str], dict[str, Path]] = {}
     copied_hashes: set[Path] = set()
     total_asset_bytes = 0
     for state in flow.states:
@@ -1259,6 +1462,25 @@ def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Pa
                         shutil.copy2(tall_visual, tall_dest)
                         total_asset_bytes += tall_dest.stat().st_size
                     copied_hashes.add(tall_dest)
+            # 方案 A 布局变体背景：每个 layout_variants 资产也按 by-hash 复制，
+            # 供 __REPLICA_LAYOUTS__ 引用（同状态背景层替换）。
+            if document.layout_variants:
+                layout_variant_paths: dict[str, Path] = {}
+                for variant, variant_relpath in document.layout_variants.items():
+                    layout_source = source_root / variant_relpath
+                    layout_visual = layout_source.with_suffix(".jpeg") if layout_source.with_suffix(".jpeg").exists() else layout_source
+                    if not layout_visual.exists():
+                        continue
+                    layout_hash = sha256_file(layout_visual)
+                    layout_rel = Path("assets") / "by-hash" / f"{layout_hash}{layout_visual.suffix or '.png'}"
+                    layout_dest = output_root / layout_rel
+                    if layout_dest not in copied_hashes:
+                        layout_dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(layout_visual, layout_dest)
+                        total_asset_bytes += layout_dest.stat().st_size
+                    copied_hashes.add(layout_dest)
+                    layout_variant_paths[variant] = layout_rel
+                layout_asset_paths[(state.state_id, document.document_id)] = layout_variant_paths
     build_warnings: list[str] = []
     if total_asset_bytes >= ASSET_CONFIRM_BYTES:
         build_warnings.append(f"asset_size_confirmation_required:{total_asset_bytes}")
@@ -1367,34 +1589,86 @@ def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Pa
                 for target in document.targets
                 if target.action_id in transitions
             }
+            def _state_entry_abs(candidate: ReplicaState) -> Path | None:
+                """Resolve a state's active entry document to an absolute path."""
+                candidate_main_page = next(
+                    (page for page in candidate.pages if page.page_var == "page"),
+                    candidate.pages[0] if candidate.pages else None,
+                )
+                candidate_page = next(
+                    (page for page in candidate.pages if page.page_var == candidate.active_page_var),
+                    candidate_main_page,
+                )
+                if candidate_page is None:
+                    return None
+                candidate_doc = next(
+                    (d for d in candidate.documents if d.document_id == candidate_page.entry_document_id),
+                    candidate.documents[0] if candidate.documents else None,
+                )
+                if candidate_doc is None:
+                    return None
+                candidate_main_entry_id = candidate_main_page.entry_document_id if candidate_main_page else ""
+                return _state_root(flow, candidate, output_root) / _document_path(candidate_doc, candidate_main_entry_id)
+
+            def _ordinal_predecessor_abs(candidate: ReplicaState) -> Path | None:
+                """Absolute path of the candidate's immediate ordinal predecessor."""
+                ordered_by_ordinal = sorted(flow.states, key=lambda s: s.ordinal)
+                position = [i for i, s in enumerate(ordered_by_ordinal) if s.state_id == candidate.state_id]
+                if not position or position[0] == 0:
+                    return None
+                return _state_entry_abs(ordered_by_ordinal[position[0] - 1])
+
+            # 死胡同兜底判定（步骤3）：非入口、无 out transition、仍有可交互内容
+            # （series region / 布局按钮），且非 metadata / branch 状态——纯兜底，
+            # 只对「无任何可点击出口」的状态注入返回入口，其余状态行为完全不变。
+            state_has_exit = bool(state.transitions)
+            state_has_interactive = any(
+                any(region.region_type in {"series", "layout"} for region in doc.regions)
+                for doc in state.documents
+            )
+            is_branch_state = state.state_id.startswith(("bviewer_", "bmeta_", "btags_"))
+            is_dead_end = (
+                state.state_id != flow.entry_state_id
+                and not state_has_exit
+                and state_has_interactive
+                and not active_page_has_metadata
+                and not is_branch_state
+            )
             back_abs = None
             if state.state_id != flow.entry_state_id and branch_metadata_return is not None:
                 back_abs = branch_metadata_return
-            elif state.state_id != flow.entry_state_id:
-                ordered = sorted(flow.states, key=lambda s: s.ordinal)
-                position = [i for i, s in enumerate(ordered) if s.state_id == state.state_id]
+            elif state.state_id != flow.entry_state_id and is_dead_end:
+                # 回「前一可交互状态」：回溯序数，跳到最近一个「可交互」的状态——
+                # 可交互 = 入口、或尚有出口、或带 series/layout 内容（可点列表 /
+                # 布局按钮）。保证 s_003 之类的死角能回到能继续操作的状态。
+                ordered_by_ordinal = sorted(flow.states, key=lambda s: s.ordinal)
+                position = [i for i, s in enumerate(ordered_by_ordinal) if s.state_id == state.state_id]
                 if position and position[0] > 0:
-                    prev_state = ordered[position[0] - 1]
-                    prev_main_page = next(
-                        (page for page in prev_state.pages if page.page_var == "page"),
-                        prev_state.pages[0] if prev_state.pages else None,
-                    )
-                    prev_page = next(
-                        (page for page in prev_state.pages if page.page_var == prev_state.active_page_var),
-                        prev_main_page,
-                    )
-                    if prev_page is not None:
-                        prev_doc = next(
-                            (d for d in prev_state.documents if d.document_id == prev_page.entry_document_id),
-                            prev_state.documents[0] if prev_state.documents else None,
+                    for candidate in reversed(ordered_by_ordinal[: position[0]]):
+                        candidate_exit = bool(candidate.transitions)
+                        candidate_has_content = any(
+                            any(region.region_type in {"series", "layout"} for region in doc.regions)
+                            for doc in candidate.documents
                         )
-                        if prev_doc is not None:
-                            prev_main_entry_id = prev_main_page.entry_document_id if prev_main_page else ""
-                            back_abs = _state_root(flow, prev_state, output_root) / _document_path(prev_doc, prev_main_entry_id)
+                        if (
+                            candidate.state_id == flow.entry_state_id
+                            or candidate_exit
+                            or candidate_has_content
+                        ):
+                            back_abs = _state_entry_abs(candidate)
+                            break
+            elif state.state_id != flow.entry_state_id:
+                # 普通中间态（含 metadata）：保持现存 ordinal 前驱回退语义。
+                back_abs = _ordinal_predecessor_abs(state)
             back_target = _relative_url(destination, back_abs) if back_abs is not None else None
             show_metadata_back = (
                 document.document_id == active_entry_document_id
                 and active_page_has_metadata
+            )
+            show_dead_end_back = (
+                document.document_id == active_entry_document_id
+                and is_dead_end
+                and back_abs is not None
             )
             series_route = _series_route_for(destination)
             # A branch's source_member_id is a stable member identifier that
@@ -1429,7 +1703,7 @@ def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Pa
                 document_paths,
                 asset_paths[(state.state_id, document.document_id)],
                 document_transitions,
-                back_target if show_metadata_back else None,
+                back_target if (show_metadata_back or show_dead_end_back) else None,
                 series_route=series_route if series_route else None,
                 series_key_by_member=series_key_by_member or None,
                 selected_series_key=selected_series_key,
@@ -1441,6 +1715,19 @@ def build_replica(flow: ReplicaFlow, source_root: Path, output_root: Path) -> Pa
                 # Only the synthetic per-branch Tags-menu states paint the real
                 # recorded tool-button row over their viewer background.
                 menu_strip=(menu_strip if state.state_id.startswith("btags_") else None),
+                # 方案 A：把 document.layout_variants 的资产 relpath resolve 成相对
+                # destination 的 URL，供同状态背景层替换（__REPLICA_LAYOUTS__）。
+                layout_variants=(
+                    {
+                        variant: _relative_url(
+                            destination,
+                            output_root / layout_asset_paths[(state.state_id, document.document_id)][variant],
+                        )
+                        for variant in document.layout_variants
+                        if variant in layout_asset_paths.get((state.state_id, document.document_id), {})
+                    }
+                    if document.layout_variants else None
+                ),
             ), encoding="utf-8")
     entrypoint = output_root / "index.html"
     if not entrypoint.exists():
