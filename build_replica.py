@@ -1397,20 +1397,61 @@ def _propagate_layout_variants_across_documents(flow: ReplicaFlow) -> int:
     region promotion. Returns the number of documents backfilled.
     """
     by_document: dict[str, dict[str, str]] = {}
+    # 「带有效（非全 0 rect）layout region」的首个 state document —— 浮层完整展开时
+    # 成员 rect 才非 0；早期状态（布局 marker 前）浮层未展开，成员 rect 全 0，
+    # 渲染成 (0,0,0,0) 挤在角落 → 布局按钮不可点（zscloud s_001 vs s_002）。
+    layout_region_by_document: dict[str, InteractionRegion] = {}
     for state in flow.states:
         for document in state.documents:
             if document.layout_variants:
                 by_document[document.document_id] = dict(document.layout_variants)
+            if document.document_id in layout_region_by_document:
+                continue
+            layout_region = next(
+                (region for region in document.regions if region.region_type == "layout"),
+                None,
+            )
+            if layout_region is None:
+                continue
+            # 有效 = 至少一个「布局选项成员」（可推断 variant）rect 非 0；按钮本体
+            # (butt-cellStyleN_N, 40x40) 不能算 —— 浮层未展开时它也在但选项全 0。
+            if any(
+                (member.dom.rect.width > 0 and member.dom.rect.height > 0)
+                and _infer_layout_id(member.dom) is not None
+                for member in layout_region.members
+            ):
+                layout_region_by_document[document.document_id] = layout_region
     propagated = 0
-    if not by_document:
+    if not (by_document or layout_region_by_document):
         return 0
     for state in flow.states:
         for document in state.documents:
             variants = by_document.get(document.document_id)
-            if not variants or document.layout_variants:
-                continue
-            document.layout_variants = dict(variants)
-            propagated += 1
+            if variants and not document.layout_variants:
+                document.layout_variants = dict(variants)
+                propagated += 1
+            # 早期状态的 layout region 若「没有任何可推断且 rect 非 0 的布局选项成员」
+            # （浮层未展开），用后续状态的完整 region 深拷贝替换，让布局按钮在正确
+            # 坐标渲染（zscloud s_001：选项 rect 全 0 → 挤在左上角不可点）。
+            target_region = next(
+                (region for region in document.regions if region.region_type == "layout"),
+                None,
+            )
+            if target_region is not None and not any(
+                (member.dom.rect.width > 0 and member.dom.rect.height > 0)
+                and _infer_layout_id(member.dom) is not None
+                for member in target_region.members
+            ):
+                source_region = layout_region_by_document.get(document.document_id)
+                if source_region is None or source_region is target_region:
+                    continue
+                index = next(
+                    (i for i, region in enumerate(document.regions) if region is target_region),
+                    None,
+                )
+                if index is not None:
+                    document.regions[index] = copy.deepcopy(source_region)
+                    propagated += 1
     return propagated
 
 

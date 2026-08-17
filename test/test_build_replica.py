@@ -1636,6 +1636,34 @@ class LayoutVariantPropagationTests(unittest.TestCase):
             s2_html = (output / "states" / "s_002" / "pages" / "p_001" / "index.html").read_text(encoding="utf-8")
             self.assertIn("window.__REPLICA_LAYOUTS__", s2_html)
 
+    def test_early_state_zero_rect_layout_region_is_replaced_by_later_full_region(self):
+        """早期状态（布局 marker 前）的 layout region 浮层未展开：布局选项成员
+        rect 全 0 → 渲染成 (0,0) 挤在角落不可点。传播必须用后续状态的完整 region
+        （选项 rect 非 0）深拷贝替换，让布局按钮落在正确坐标（zscloud s_001 vs s_002）。"""
+        flow = self._build_flow_popup_viewer()
+        # 复刻真机：s_001 的 layout region 选项 rect 全 0（浮层未展开），仅按钮本体 40x40
+        s1_viewer = next(
+            d for d in flow.states[0].documents if d.document_id == "d_p_001_f_001"
+        )
+        lr1 = next(r for r in s1_viewer.regions if r.region_type == "layout")
+        for member in lr1.members:
+            if member.dom.attributes.get("id", "").startswith("layout_"):
+                member.dom.rect = Rect(0, 0, 0, 0, "region_content_css")
+        # buttons 本体保留 40x40 → 旧判定会误判 region 有效；新判定看可推断选项 rect
+        propagated = _propagate_layout_variants_across_documents(flow)
+        self.assertGreaterEqual(propagated, 2)  # variants + region 替换各计 1
+        replaced = next(
+            d for d in flow.states[0].documents if d.document_id == "d_p_001_f_001"
+        )
+        lr1_after = next(r for r in replaced.regions if r.region_type == "layout")
+        layout_1_1 = next(
+            m for m in lr1_after.members
+            if m.dom.attributes.get("id") == "layout_1_1"
+        )
+        self.assertTrue(layout_1_1.dom.rect.width > 0, "layout_1_1 rect 应被补全为非 0")
+        # fixture 中 layout_1_1 坐标来自 s_002 的完整 region（x=360），非 0 占位
+        self.assertEqual(layout_1_1.dom.rect.x, 360.0)
+
 
 if __name__ == "__main__":
     unittest.main()
