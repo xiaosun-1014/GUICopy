@@ -1,9 +1,10 @@
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from playwright.sync_api import sync_playwright
 
-from capture_snapshot import capture_interaction_region, capture_locator_snapshot, capture_marker_interaction_region, capture_marker_panel_region, dom_snapshot_from_payload, sanitize_html
+from capture_snapshot import capture_interaction_region, capture_locator_snapshot, capture_marker_interaction_region, capture_marker_panel_region, capture_selector_closure, dom_snapshot_from_payload, sanitize_html
 
 
 class CaptureSnapshotTests(unittest.TestCase):
@@ -165,6 +166,91 @@ class CaptureSnapshotTests(unittest.TestCase):
             browser.close()
 
         self.assertIsNone(region)
+
+
+def _fake_payload(tag: str = "div") -> dict:
+    """A minimal evaluate payload the fake locators return (mirrors the DOM
+    contract of ``capture_locator_snapshot``'s browser-side expression)."""
+    return {
+        "tag_name": tag,
+        "text": "x",
+        "attributes": {"id": "fake"},
+        "rect": {"x": 1, "y": 2, "width": 10, "height": 10},
+        "outer_html": f"<{tag} id='fake'>x</{tag}>",
+        "computed_style": {"display": "block"},
+    }
+
+
+class CaptureSnapshotFakeLocatorTests(unittest.TestCase):
+    """步骤 1 多匹配/无匹配防护：fake locator 单测，不依赖真实浏览器。
+
+    真实浏览器仅用于验证「单匹配路径不受影响」（test_capture_locator_snapshot_reads_a_real_playwright_element）。
+    """
+
+    def test_capture_locator_snapshot_multimatch_returns_first(self):
+        # count()>1 的 fake locator：capture_locator_snapshot 必须归一 .first，
+        # 返回非空快照（不抛 strict-mode 异常）。
+        payload = _fake_payload("li")
+        first = SimpleNamespace()
+
+        def first_evaluate(fn, *args):
+            return payload
+        first.evaluate = first_evaluate
+        root = SimpleNamespace()
+        root.count = lambda: 2
+        root.first = first
+
+        snapshot = capture_locator_snapshot(root, "page_viewport_css")
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.tag_name, "li")
+        self.assertEqual(snapshot.rect.coordinate_space, "page_viewport_css")
+
+    def test_capture_locator_snapshot_no_match_returns_none(self):
+        root = SimpleNamespace()
+        root.count = lambda: 0
+        root.first = None
+
+        self.assertIsNone(capture_locator_snapshot(root, "page_viewport_css"))
+        # 不抛异常是契约的一部分：count()==0 → None，调用方显式处理。
+
+    def test_capture_locator_snapshot_single_match_still_reads_payload(self):
+        # 单匹配路径不受影响：evaluate 原样返回 payload。
+        payload = _fake_payload("button")
+        locator = SimpleNamespace()
+        locator.count = lambda: 1
+        locator.first = None
+
+        def evaluate(fn, *args):
+            return payload
+        locator.evaluate = evaluate
+
+        snapshot = capture_locator_snapshot(locator)
+        self.assertEqual(snapshot.tag_name, "button")
+
+    def test_capture_selector_closure_multimatch_returns_first(self):
+        # capture_selector_closure 同源 risk：多匹配归一 .first，count()==0 返回 None。
+        first = SimpleNamespace()
+
+        def first_evaluate(fn, *args):
+            return {"outer": "<div>outer</div>", "ancestors": 2, "siblings": 3, "sources": ["aria-label"]}
+        first.evaluate = first_evaluate
+
+        root = SimpleNamespace()
+        root.count = lambda: 5
+        root.first = first
+
+        closure = capture_selector_closure(root, "a_001")
+        self.assertIsNotNone(closure)
+        self.assertEqual(closure.action_id, "a_001")
+        self.assertEqual(closure.required_ancestor_count, 2)
+        self.assertEqual(closure.required_sibling_count, 3)
+
+    def test_capture_selector_closure_no_match_returns_none(self):
+        root = SimpleNamespace()
+        root.count = lambda: 0
+
+        self.assertIsNone(capture_selector_closure(root, "a_001"))
 
 
 if __name__ == "__main__":

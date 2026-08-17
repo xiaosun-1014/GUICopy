@@ -131,8 +131,20 @@ def dom_snapshot_from_payload(payload: Mapping[str, Any], coordinate_space: str)
     )
 
 
-def capture_locator_snapshot(locator: Any, coordinate_space: str = "page_viewport_css") -> DomNodeSnapshot:
-    """Capture the locator's selector-relevant DOM state in its own frame context."""
+def capture_locator_snapshot(locator: Any, coordinate_space: str = "page_viewport_css") -> DomNodeSnapshot | None:
+    """Capture the locator's selector-relevant DOM state in its own frame context.
+
+    多元素 locator 归一 ``.first``，避免 strict-mode evaluate 抛异常被上层静默吞掉
+    （Z1：序列列表 ``#HLeftThumnail li.ui-draggable`` 多匹配 -> target.json 不落盘）。
+    仅当 count()==0（真·无匹配）时返回 None，调用方需显式处理；count() 本身抛异常
+    （元素被移除等）原样外抛，由调用方自己的 try/except 决定——绝不吞真实的
+    evaluate/选择器错误，保持「有匹配返回真快照、无匹配才 None」的清晰契约。
+    """
+    count = locator.count()
+    if count == 0:
+        return None  # ← 真·无匹配，调用方需处理
+    if count > 1:
+        locator = locator.first  # ← 多匹配归一，返回仍非空
     payload = locator.evaluate(
         """element => {
             const rect = element.getBoundingClientRect();
@@ -161,8 +173,17 @@ def capture_locator_snapshot(locator: Any, coordinate_space: str = "page_viewpor
     return dom_snapshot_from_payload(payload, coordinate_space)
 
 
-def capture_selector_closure(locator: Any, action_id: str) -> SelectorClosure:
-    """Preserve minimal structural evidence needed to audit an offline locator."""
+def capture_selector_closure(locator: Any, action_id: str) -> SelectorClosure | None:
+    """Preserve minimal structural evidence needed to audit an offline locator.
+
+    与 ``capture_locator_snapshot`` 同源的 strict-mode 风险：多元素 locator 归一
+    ``.first``；count()==0 时返回 None（调用方决定不写 selector_closure.json）。
+    """
+    count = locator.count()
+    if count == 0:
+        return None
+    if count > 1:
+        locator = locator.first
     payload = locator.evaluate(
         """element => {
             let ancestors = 0;
@@ -175,9 +196,14 @@ def capture_selector_closure(locator: Any, action_id: str) -> SelectorClosure:
     return SelectorClosure(action_id, sanitize_html(payload["outer"]), int(payload["ancestors"]), int(payload["siblings"]), list(payload["sources"]))
 
 
-def capture_interaction_region(root_locator: Any, region_type: str, document_id: str) -> InteractionRegion:
-    """Capture a region root and all native/ARIA controls required for offline replay."""
+def capture_interaction_region(root_locator: Any, region_type: str, document_id: str) -> InteractionRegion | None:
+    """Capture a region root and all native/ARIA controls required for offline replay.
+
+    root 无匹配（capture_locator_snapshot 返回 None）时返回 None，调用方跳过该 region。
+    """
     root = capture_locator_snapshot(root_locator)
+    if root is None:
+        return None  # 真·无匹配：调用方不 append 该 region
     controls = root_locator.locator("button, input, select, textarea, canvas, [role], [data-testid], [id], [class]")
     members = []
     if root.tag_name in {"button", "input", "select", "textarea", "canvas"} or "role" in root.attributes or "data-testid" in root.attributes:
@@ -185,6 +211,8 @@ def capture_interaction_region(root_locator: Any, region_type: str, document_id:
     for index in range(controls.count()):
         locator = controls.nth(index)
         snapshot = capture_locator_snapshot(locator, "region_content_css")
+        if snapshot is None:
+            continue  # 单成员无匹配：跳过该成员，不让 None 泄漏进 RegionMember
         members.append(RegionMember(f"{document_id}_{region_type}_{index:03d}", snapshot.tag_name, snapshot))
     return InteractionRegion(f"{document_id}_{region_type}", region_type, document_id, root, members, None)
 
@@ -300,6 +328,8 @@ def discover_series_candidates(
         while True:
             for index in range(items.count()):
                 snapshot = capture_locator_snapshot(items.nth(index), "region_content_css")
+                if snapshot is None:
+                    continue  # 该行瞬变无匹配：跳过，不影响其余行枚举
                 identity_key, stable, _ = _series_identity(snapshot, id_attrs)
                 if identity_key not in discovered:
                     discovered[identity_key] = {
@@ -374,17 +404,20 @@ def capture_series_interaction_region(
     max_scroll_steps: int = 40,
     item_selector: str | None = None,
     identity_attrs: Sequence[str] | None = None,
-) -> InteractionRegion:
+) -> InteractionRegion | None:
     """Harvest scrollable series rows as a region, restoring scroll position afterward.
 
     Delegates to :func:`discover_series_candidates` (the single scroll-harvest
     algorithm) and packages its region members into an ``InteractionRegion``.
+    root 无匹配时返回 None，调用方跳过该 region。
     """
     _, members, evidence = discover_series_candidates(
         root_locator, document_id, max_scroll_steps=max_scroll_steps,
         item_selector=item_selector, identity_attrs=identity_attrs,
     )
     root = capture_locator_snapshot(root_locator)
+    if root is None:
+        return None
     return InteractionRegion(f"{document_id}_series", "series", document_id, root, members, evidence)
 
 
@@ -421,7 +454,7 @@ def capture_marker_interaction_region(
     max_scroll_steps: int = 40,
     item_selector: str | None = None,
     identity_attrs: Sequence[str] | None = None,
-) -> InteractionRegion:
+) -> InteractionRegion | None:
     """Capture the smallest documented interaction region for a marker action.
 
     ``scope`` is a Playwright ``Page`` or ``Frame``.  The selectors deliberately
@@ -429,7 +462,7 @@ def capture_marker_interaction_region(
     auditable DOM evidence instead of silently losing the region. For the
     ``series`` region type, ``item_selector`` / ``identity_attrs`` are forwarded
     to :func:`capture_series_interaction_region` to support per-viewer row
-    structures (hardcoded defaults otherwise).
+    structures (hardcoded defaults otherwise). root 真·无匹配时返回 None。
     """
     region_type, candidates = _MARKER_REGION_CANDIDATES.get(marker_label, ("generic", ("body",)))
     # Metadata panels are click-opened scroll containers whose HTML differs per
@@ -526,6 +559,8 @@ def capture_marker_panel_region(
     if rect["width"] > 0 and rect["height"] > 0 and result["html"].count("<") > 2000:
         return None
     root = capture_locator_snapshot(root_locator, "page_viewport_css")
+    if root is None:
+        return None  # root 瞬变无匹配：面板捕获返回 None（调用方已能容忍）
     # The panel root is rendered verbatim as a scrollable region (complete
     # outerHTML). Around it the page may still show sibling interactive
     # controls (WL/WW inputs, confirm button, canvas, series toolbar) that the
@@ -547,6 +582,8 @@ def capture_marker_panel_region(
             snapshot = capture_locator_snapshot(locator, "region_content_css")
         except Exception:
             continue
+        if snapshot is None:
+            continue  # 兄弟控件瞬变无匹配：跳过，避免 None 泄漏进 RegionMember
         members.append(RegionMember(f"{document_id}_metadata_sibling_{index:03d}", snapshot.tag_name, snapshot))
     return InteractionRegion(
         f"{document_id}_metadata",
