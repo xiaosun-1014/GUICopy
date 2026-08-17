@@ -64,6 +64,8 @@ zs 的序列列表（`#HLeftThumnail li.ui-draggable`）在 iframe viewer 内，
 > **已知剩余**：真机只采到 `1*1`（布局浮层打开时点击 2*2/3*3 等后 canvas 指纹未变化 → 被降级跳过），build 侧渲染 `1*1` 可点 + 其余 `aria-disabled`（不假装可点）。若要做全部布局可点，需在采样时对「点击后 canvas 指纹不变」的选项放宽判定（如确认切换到多视图布局时画布是否真不变），或接受当前 1*1 可点。
 >
 > **已知补充（2026-08-17 提交 7c10783）**：**早期状态（s_001，布局 marker 之前）的 layout region 浮层未展开**——布局选项成员（`layout_1_1` 等）rect 全 0，渲染成 (0,0,0,0) 挤在左上角不可点（即使 `__REPLICA_LAYOUTS__` 已注入）。修复：`_propagate_layout_variants_across_documents` 在传 variants 的同时，对「无可推断且 rect 非 0 的布局选项成员」的 layout region，用同一 document 后续状态（浮层完整展开，如 s_002）的 region 深拷贝替换（判定用 `_infer_layout_id` + rect>0，避免 40×40 切换按钮本体掩盖折叠浮层）。验证：s_001 viewer 布局按钮落到真实坐标（1*1 在 x=31,y=510），点击切背景不导航、序列后续可点跳分支。
+>
+> **已知补充（2026-08-18 提交 6ec5f54）**：**布局背景曾切成 68×68 序列缩略图**——点 1×1 后 replica-bg 变成「X 光缩略照占满屏」。根因：Dapeng 页面有 38 个 68×68 序列缩略 canvas，`_canvas_png_or_none`（按面积取最大 canvas）选到缩略图而非主影像画布。修复：布局背景改截 **viewer html 根整页**（`_html_root_png_or_none`，1888×880）；`_sample_all_layout_variants` 背景截图优先 viewer html 根、变化检测用背景 hash；`_sample_layout_background` 稳定性判定用「截图 ≥50px OR 有可见 canvas」不依赖单一 canvas；`_capture` 的 `viewer_scope` 从 `_find_viewer_frame`（headed 回放能看到真 viewer 帧）取，整个布局采样块包 try/except（**布局采样异常曾导致 after 快照丢失、布局 marker 组消失的 Z1 复发**）。验证 run `20260818T003000Z-layout-bg2`：1*1 变体 1888×880、点布局切整页图不导航、序列热区后续可切、series 4/4 captured。
 > **How to check**：`test_nested_frame_series_uses_scroll_harvest`（scrollTop 恢复 `4` 断言）是既有失败（干净基线也挂 `0 != 4`），与 R 系列无关，未修。
 
 ## 已跑通的中山产物
