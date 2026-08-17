@@ -57,7 +57,11 @@ zs 的序列列表（`#HLeftThumnail li.ui-draggable`）在 iframe viewer 内，
 
 **重录验收（run `20260817T200555Z-layout-fix`）**：`discovered=4 / 3 captured + 1 partial / 0 failed / reached_end`；**无 `missing_target_evidence`**（a_002_001 target 落盘）；headless 全链路：主 viewer 3 热区 → 点序列跳分支 → 分支内层 viewer iframe 4 热区可再切 → 两步 Meta。序列数量守恒（不新增假分支）。
 
-> ⚠ **布局变体采样（增强项）未采到**：`_sample_all_layout_variants` 按 `page.locator("#cellStyle")` 找布局容器，但真实 Dapeng viewer 布局浮层的 root 可能是 `body`（layout marker 的 after 快照把 region 挂到外层 `d_p_000_root`，628 个成员、无 cellStyle id），导致 `layout_root=None` → 变体空 → build 侧布局按钮 **disabled**（不假装可点，符合计划降级语义）。**真正的布局浮层（16 成员：`layout_1_1`/`layout_1_2`/`layout_2_1`/`layout_2_2`/`layout_1_3`/`layout_2_3`/`layout_3_3`/`triangle_layout` 等精确 rect）实际记录在 s_004（序列选择 marker 的 after 快照）的 viewer document `d_p_001_f_001` 里**。若要做布局可点，需改在「有精确 layout region 的 doc」上采样各布局背景（Dapeng 布局按钮是工具栏内联组而非独立浮层，见 `_tmp_probe_layout*` 探索；计划 §步骤6 的「布局切完 1.5s 稳定」可复用 `skills/zscloud-film-capture/references/known-issues.md:376-388`）。
+> ✅ **布局变体采样已闭环（2026-08-17 补充修复 1877f72）**：re-review 发现并修复 3 个缺陷后，真实重录（run `20260817T214500Z-layout-fullfix`）采到 **`1*1` 变体并注入 `__REPLICA_LAYOUTS__`，点 1*1 真实切换背景（不导航）、序列热区随后仍可切**。三缺陷：
+> 1. **frame 作用域**（缺陷 A）：`page.locator("#cellStyle")` 跨 frame 查不到——布局浮层在 viewer iframe 内；改用 `_find_viewer_frame(page)`（持有 canvas 的 Frame，有 `.evaluate/.locator`）作为采样上下文。
+> 2. **title 推断**（缺陷 F）：Dapeng 布局 button 文本为空、规格在 `title`（`title="2*2 Shift+4"`）；改用 `get_attribute("title")`/`aria-label` 优先、`innerText` 兜底。
+> 3. **relpath rebase**（缺陷 G）：`layout_variants` 的 phase 级资产（`snapshots/a_001_001/after/assets/by-hash/...`）需在 `_load_snapshot_state`/`_load_branch_topology` rebase 到 capture 相对，否则 build 复制时找不到资产、`__REPLICA_LAYOUTS__` 不注入。
+> **已知剩余**：真机只采到 `1*1`（布局浮层打开时点击 2*2/3*3 等后 canvas 指纹未变化 → 被降级跳过），build 侧渲染 `1*1` 可点 + 其余 `aria-disabled`（不假装可点）。若要做全部布局可点，需在采样时对「点击后 canvas 指纹不变」的选项放宽判定（如确认切换到多视图布局时画布是否真不变），或接受当前 1*1 可点。
 > **How to check**：`test_nested_frame_series_uses_scroll_harvest`（scrollTop 恢复 `4` 断言）是既有失败（干净基线也挂 `0 != 4`），与 R 系列无关，未修。
 
 ## 已跑通的中山产物
