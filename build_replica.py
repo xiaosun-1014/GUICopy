@@ -584,7 +584,7 @@ def _render_document(
         "两者上一状态不同时出现，不冲突。 */"
         ".overlay>[data-replica-layout]{z-index:3;cursor:pointer;border-radius:3px}"
         ".overlay>[data-replica-layout]:hover{outline:2px solid rgba(120,170,255,.5);outline-offset:-2px}"
-        ".overlay>[data-replica-layout][aria-disabled=\"true\"]{cursor:not-allowed;opacity:.45;filter:grayscale(.6);pointer-events:none}"
+        ".overlay>[data-replica-layout][aria-disabled=\"true\"]{cursor:not-allowed;filter:grayscale(.6);pointer-events:none}"
         "/* Tall-list mode: only the series panel scrolls; its rows scroll as"
         "rendered DOM content (no moving background image), matching the real FT"
         "panel where scrolling moves the list entries, not the panel chrome. */"
@@ -1244,7 +1244,13 @@ def _augment_meta_two_step(
             [tags_doc],
             [ReplicaTransition(
                 f"t_tags_{branch.branch_id}", f"series:{branch.branch_id}:tags",
-                btags_id, branch.metadata_state_id, "page", "page", "same_page",
+                btags_id, branch.metadata_state_id, "page",
+                # The branch metadata popup lives inside the viewer's own page
+                # (zscloud = page1), never the main shell page. Hard-coding "page"
+                # sent Tags -> the top-level shell (empty iframe-less index.html).
+                # Follow the viewer's active page var (main viewers = "page",
+                # popup viewers = "page1") so Tags opens the real metadata panel.
+                viewer_state.active_page_var, "same_page",
             )],
             copy.copy(viewer_state.evidence),
         )
