@@ -804,6 +804,88 @@ class ReplicaRuntimeTests(unittest.TestCase):
                 self.assertEqual(page.locator(".replica-metadata").count(), 1)
                 browser.close()
 
+    def test_popup_branch_tags_two_step_lands_on_metadata_popup_page(self):
+        # Bug B runtime regression (popup-typed branch viewer): the branch Tags
+        # step must open the metadata *popup* page (page1, with iframe tree +
+        # metadata panel + close), never the top-level main shell page.
+        from test.test_replica_runtime import _write_assets as _w
+
+        def popup_doc(document_id, asset, page_id, page_var, family, parent, targets=None, regions=None):
+            return ReplicaDocument(
+                document_id, page_id, page_var, family, parent, None, None, None,
+                {"width": 300, "height": 200}, 1, "css", 0, 0, asset, document_id, 3,
+                targets=targets or [], regions=regions or [],
+            )
+
+        meta_panel = InteractionRegion(
+            "r_mx", "metadata", "d_m1",
+            DomNodeSnapshot("div", "Metadata panel", {"id": "mpanel", "class": "tagsBox"},
+                            Rect(0, 0, 300, 200, "page_viewport_css"),
+                            '<div id="mpanel" class="tagsBox"><div>x-meta</div></div>', {}),
+            [], None,
+        )
+        x_more = ActionTarget(
+            "series:bx:meta_open", "m_x", "click", "locator", {}, None,
+            DomNodeSnapshot("a", "更多", {"data-testid": "more-x"}, Rect(250, 0, 40, 40, "page_viewport_css"),
+                            '<a data-testid="more-x">更多</a>', {}),
+            None, None, None, "execute", None, "d_v1", None,
+        )
+        shell = popup_doc("d_shell", "assets/va.png", "p_main", "page", "main", None)
+        root1 = popup_doc("d_r1", "assets/vb.png", "p_popup", "page1", "popup", None)
+        child = popup_doc("d_v1", "assets/vb.png", "p_popup", "page1", "viewer", "d_r1", targets=[x_more])
+        meta_child = popup_doc("d_m1", "assets/mb.png", "p_popup", "page1", "viewer", "d_r1", regions=[meta_panel])
+        popup_page = ReplicaPage("p_popup", "page1", "popup", "p_main", "viewer", "d_r1", True, False)
+        states = [
+            ReplicaState("s_vx", 0, "", "page1",
+                         [ReplicaPage("p_main", "page", "main", None, None, "d_shell", True, False), popup_page],
+                         [shell, root1, child],
+                         [ReplicaTransition("t_bx", "series:bx:meta_open", "s_vx", "s_mx", "page1", "page1", "same_page")],
+                         StateEvidence(False, False, False, False, 0, 0, 0, 0, "viewer")),
+            ReplicaState("s_mx", 1, "", "page1",
+                         [ReplicaPage("p_main", "page", "main", None, None, "d_shell", True, False), popup_page],
+                         [shell, root1, meta_child],
+                         [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "metadata")),
+        ]
+        branches = [SeriesBranch("bx", "X", "Series X", 0, "d_hub", "mx", None, "click", "s_vx", "s_mx", "s_vx", "captured", None)]
+        flow = ReplicaFlow(1, "meta-two-step-popup", "recorded.py", "hash", "now", {"width": 300, "height": 200},
+                           BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_vx", states, [],
+                           series_branches=branches)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _w(root)
+            output = root / "replica"
+            build_replica(flow, root, output)
+            with ReplicaServer(output) as server, sync_playwright() as playwright:
+                browser = playwright.chromium.launch()
+                page = browser.new_page(viewport={"width": 300, "height": 200})
+                host = server.url.replace("/index.html", "")
+                # The viewer popup page is where the 更多 target lives, inside its
+                # child viewer iframe document.
+                page.goto(f"{host}/pages/p_popup/index.html", wait_until="load", timeout=30000)
+                page.frame_locator('iframe').locator('[data-replica-action="series:bx:meta_open"]').click()
+                page.wait_for_url("**/states/btags_bx/index.html")
+                # btags renders the viewer document as its active entry (no iframe
+                # tree) with the visible Tags row on top.
+                tags = page.locator('[data-replica-action="series:bx:tags"]')
+                self.assertEqual(tags.count(), 1)
+                tags.click()
+                page.wait_for_url("**/states/s_mx/pages/p_popup/index.html")
+                self.assertIn("/pages/p_popup/index.html", page.url)
+                # The metadata panel lives inside the popup iframe tree. zscloud
+                # renders the panel in the child document and the close affordance
+                # as the branch-return fallback on the page entry (either
+                # data-replica-panel-close inline or data-replica-back fallback).
+                frame = page.frame_locator('iframe')
+                self.assertEqual(frame.locator(".replica-metadata").count(), 1)
+                self.assertEqual(
+                    frame.locator("[data-replica-panel-close]").count()
+                    + page.locator("[data-replica-back]").count(),
+                    1,
+                )
+                # The main shell is NOT where we landed (no iframe-less empty page).
+                self.assertNotIn("/states/s_mx/index.html", page.url)
+                browser.close()
+
     def test_series_list_full_panel_scrolls_in_panel_and_stays_clickable(self):
         from PIL import Image
 

@@ -808,6 +808,91 @@ class BuildReplicaTests(unittest.TestCase):
             vb2 = (out2 / "states" / "s_vb" / "index.html").read_text(encoding="utf-8")
             self.assertNotIn("btags_", vb2)
 
+    def test_btags_tags_jumps_to_bmeta_popup_page_following_viewer_active_page_var(self):
+        # Bug B regression (build-level): the synthetic btags -> bmeta Tags
+        # transition must target the branch metadata *popup* page (the viewer's
+        # own active page var, page1), not the top-level main shell ("page") that
+        # renders an empty iframe-less index.html. A popup-typed branch viewer
+        # means its metadata panel lives inside the same page1 iframe tree as the
+        # viewer; "same_page" navigation must land on that page's entry document,
+        # whose child document carries the metadata panel and its close button.
+        from test.test_replica_runtime import _write_assets
+
+        def popup_doc(document_id, asset, page_id, page_var, family, parent, targets=None, regions=None):
+            return ReplicaDocument(
+                document_id, page_id, page_var, family, parent, None, None, None,
+                {"width": 300, "height": 200}, 1, "css", 0, 0, asset, document_id, 3,
+                targets=targets or [], regions=regions or [],
+            )
+
+        meta_panel = InteractionRegion(
+            "r_mx", "metadata", "d_m1",
+            DomNodeSnapshot("div", "Metadata panel", {"id": "mpanel", "class": "tagsBox"},
+                            Rect(0, 0, 300, 200, "page_viewport_css"),
+                            '<div id="mpanel" class="tagsBox"><div>x-meta</div></div>', {}),
+            [], None,
+        )
+        x_more = ActionTarget(
+            "series:bx:meta_open", "m_x", "click", "locator", {}, None,
+            DomNodeSnapshot("a", "更多", {"data-testid": "more-x"}, Rect(250, 0, 40, 40, "page_viewport_css"),
+                            '<a data-testid="more-x">更多</a>', {}),
+            None, None, None, "execute", None, "d_v1", None,
+        )
+        # zscloud real shape: page1 = popup page owning a root entry document,
+        # plus a child iframe document holding the viewer/meta content.
+        shell = popup_doc("d_shell", "assets/va.png", "p_main", "page", "main", None)
+        root1 = popup_doc("d_r1", "assets/vb.png", "p_popup", "page1", "popup", None)
+        child = popup_doc("d_v1", "assets/vb.png", "p_popup", "page1", "viewer", "d_r1", targets=[x_more])
+        meta_child = popup_doc("d_m1", "assets/mb.png", "p_popup", "page1", "viewer", "d_r1", regions=[meta_panel])
+        popup_page = ReplicaPage("p_popup", "page1", "popup", "p_main", "viewer", "d_r1", True, False)
+        states = [
+            ReplicaState("s_vx", 0, "", "page1",
+                         [ReplicaPage("p_main", "page", "main", None, None, "d_shell", True, False), popup_page],
+                         [shell, root1, child],
+                         [ReplicaTransition("t_bx", "series:bx:meta_open", "s_vx", "s_mx", "page1", "page1", "same_page")],
+                         StateEvidence(False, False, False, False, 0, 0, 0, 0, "viewer")),
+            ReplicaState("s_mx", 1, "", "page1",
+                         [ReplicaPage("p_main", "page", "main", None, None, "d_shell", True, False), popup_page],
+                         [shell, root1, meta_child],
+                         [], StateEvidence(False, False, False, False, 0, 0, 0, 0, "metadata")),
+        ]
+        branches = [SeriesBranch("bx", "X", "Series X", 0, "d_hub", "mx", None, "click", "s_vx", "s_mx", "s_vx", "captured", None)]
+        flow = ReplicaFlow(1, "meta-two-step-popup", "recorded.py", "hash", "now", {"width": 300, "height": 200},
+                           BootstrapPlan(1, 1, True, {}), [], CaptureTimingProfile(), "s_vx", states, [],
+                           series_branches=branches)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_assets(root)
+            output = root / "replica"
+            build_replica(flow, root, output)
+
+            # The viewer child document (iframe) is where the 更多 (meta_open)
+            # target lives; it re-points through the synthesized btags state.
+            vb_child = (output / "documents" / "d_v1" / "index.html").read_text(encoding="utf-8")
+            self.assertIn("../../states/btags_bx/index.html", vb_child)
+            btags = (output / "states" / "btags_bx" / "index.html").read_text(encoding="utf-8")
+            # Tags transition must target the branch metadata *popup* page (page1),
+            # not the main shell page that would render an empty iframe-less index.
+            self.assertIn('data-replica-action="series:bx:tags"', btags)
+            self.assertIn(
+                '"url": "../s_mx/pages/p_popup/index.html"',
+                btags,
+            )
+            # The metadata popup page entry is a real page whose child document
+            # renders the metadata panel live inside the iframe tree.
+            meta_page = (output / "states" / "s_mx" / "pages" / "p_popup" / "index.html").read_text(encoding="utf-8")
+            self.assertIn('<iframe', meta_page)
+            self.assertIn("d_m1/index.html", meta_page)
+            meta_child_html = (output / "states" / "s_mx" / "documents" / "d_m1" / "index.html").read_text(encoding="utf-8")
+            self.assertIn('class="replica-metadata"', meta_child_html)
+            self.assertIn("mpanel", meta_child_html)
+            self.assertIn("[data-replica-panel-close]", meta_child_html)
+            # The shell index is NOT what the Tags transition points at.
+            self.assertNotIn(
+                '"url": "../s_mx/index.html"',
+                btags,
+            )
+
     def test_builder_fails_when_required_screenshot_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
