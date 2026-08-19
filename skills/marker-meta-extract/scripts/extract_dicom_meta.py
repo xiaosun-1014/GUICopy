@@ -63,12 +63,55 @@ class MiniYaml:
             return int(raw)
         if re.match(r"^-?\d+\.\d+$", raw):
             return float(raw)
+        # Inline flow lists used by the viewer registry (for example ``[]``
+        # and ``["id"]``).  Split only at top-level commas so quoted values
+        # and nested flow values remain intact.
+        if raw.startswith("[") and raw.endswith("]"):
+            inner = raw[1:-1].strip()
+            if not inner:
+                return []
+            return [MiniYaml._parse_value(item) for item in MiniYaml._split_flow_items(inner)]
         # 引号字符串
         if (raw.startswith('"') and raw.endswith('"')) or \
            (raw.startswith("'") and raw.endswith("'")):
             return raw[1:-1]
         # 裸字符串
         return raw
+
+    @staticmethod
+    def _split_flow_items(raw: str) -> List[str]:
+        """Split a small YAML flow sequence at top-level commas."""
+        items: List[str] = []
+        current: List[str] = []
+        quote: Optional[str] = None
+        escaped = False
+        depth = 0
+        for ch in raw:
+            if quote is not None:
+                current.append(ch)
+                if escaped:
+                    escaped = False
+                elif ch == "\\" and quote == '"':
+                    escaped = True
+                elif ch == quote:
+                    quote = None
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+                current.append(ch)
+            elif ch in "[{":
+                depth += 1
+                current.append(ch)
+            elif ch in "]}":
+                depth = max(0, depth - 1)
+                current.append(ch)
+            elif ch == "," and depth == 0:
+                items.append("".join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        items.append("".join(current).strip())
+        return items
 
     @staticmethod
     def parse(text: str) -> Dict[str, Any]:
@@ -151,8 +194,17 @@ class MiniYaml:
                 rebuilt = [(cur_indent, item_content)]
                 j = i + 1
                 while j < len(lines) and lines[j][0] > indent:
-                    rebuilt.append(lines[j])
                     j += 1
+                if j > i + 1:
+                    # Continuation keys are indented farther than the list
+                    # item.  Derive that amount from this item instead of
+                    # assuming a particular YAML indentation style.  Deeper
+                    # nested mappings retain their relative indentation.
+                    continuation_base = min(lines[k][0] for k in range(i + 1, j))
+                    dedent = max(0, continuation_base - cur_indent)
+                    for k in range(i + 1, j):
+                        continuation_indent, continuation_content = lines[k]
+                        rebuilt.append((continuation_indent - dedent, continuation_content))
                 child_dict, _ = MiniYaml._parse_dict(rebuilt, 0, cur_indent)
                 result.append(child_dict)
                 i = j
@@ -290,10 +342,111 @@ def _python_literal(s: str) -> str:
     return json.dumps(s, ensure_ascii=False)
 
 
+def _locator_expression(target: str, recipe: Any) -> str:
+    """Return a Playwright locator expression from an ``open_steps`` recipe.
+
+    ``open_steps`` is intentionally data-driven.  A recipe may be a plain CSS
+    selector, or a small mapping describing one of the accessible Playwright
+    locator methods.  Supporting both forms keeps the shared viewer registry
+    readable while preserving compatibility with future viewers.
+    """
+    if isinstance(recipe, str):
+        return f"{target}.locator({_python_literal(recipe)})"
+    if not isinstance(recipe, dict):
+        raise ValueError("open_steps locator recipe must be a string or mapping")
+
+    method = str(recipe.get("method") or recipe.get("kind") or "locator").lower()
+    if method in {"locator", "css", "selector"}:
+        selector = recipe.get("selector")
+        if selector is None:
+            selector = recipe.get("value")
+        if not isinstance(selector, str) or not selector:
+            raise ValueError("locator recipe requires a non-empty selector")
+        return f"{target}.locator({_python_literal(selector)})"
+    if method in {"get_by_title", "title"}:
+        value = recipe.get("value", recipe.get("name"))
+        if not isinstance(value, str) or not value:
+            raise ValueError("get_by_title recipe requires a non-empty value")
+        return f"{target}.get_by_title({_python_literal(value)})"
+    if method in {"get_by_text", "text"}:
+        value = recipe.get("value", recipe.get("text", recipe.get("name")))
+        if not isinstance(value, str) or not value:
+            raise ValueError("get_by_text recipe requires a non-empty value")
+        return f"{target}.get_by_text({_python_literal(value)})"
+    if method in {"get_by_role", "role"}:
+        role = recipe.get("role")
+        name = recipe.get("name", recipe.get("value"))
+        if not isinstance(role, str) or not role:
+            raise ValueError("get_by_role recipe requires a non-empty role")
+        if not isinstance(name, str) or not name:
+            raise ValueError("get_by_role recipe requires a non-empty name")
+        exact = recipe.get("exact")
+        exact_arg = f", exact={bool(exact)!r}" if exact is not None else ""
+        return (
+            f"{target}.get_by_role({_python_literal(role)}, "
+            f"name={_python_literal(name)}{exact_arg})"
+        )
+    raise ValueError(f"unsupported open_steps locator method: {method}")
+
+
+def _step_recipe(step: Any, key: str) -> Any:
+    """Read a click/expect recipe, accepting concise compatibility aliases."""
+    if not isinstance(step, dict):
+        raise ValueError("each open_steps item must be a mapping")
+    recipe = step.get(key)
+    if recipe is not None:
+        return recipe
+    if key == "click":
+        recipe = step.get("locator")
+        if recipe is None:
+            recipe = step.get("selector")
+        if recipe is not None:
+            return recipe
+        if step.get("method") or step.get("kind"):
+            return step
+    if key == "expect_visible":
+        recipe = step.get("wait_for")
+        if recipe is not None:
+            return recipe
+    raise ValueError(f"open_steps item requires {key}")
+
+
+def _open_steps_code(
+    frame_var: str,
+    open_steps: List[Any],
+    wait_timeout_ms: int = 10000,
+) -> List[str]:
+    """Generate a strict, fail-fast multi-step panel-open sequence.
+
+    Every step resolves a fresh locator, waits for it to become visible (the
+    subsequent click supplies Playwright's actionable check), clicks it, then
+    resolves a fresh expectation locator and waits for that locator to become
+    visible.  There is deliberately no catch/fallback here: a failed step must
+    fail the marker rather than being mistaken for a successfully opened panel.
+    """
+    result: List[str] = []
+    for index, step in enumerate(open_steps):
+        click_recipe = _step_recipe(step, "click")
+        expect_recipe = _step_recipe(step, "expect_visible")
+        click_var = f"_meta_open_step_{index}"
+        expect_var = f"_meta_open_expect_{index}"
+        result.append(f"{click_var} = {_locator_expression(frame_var, click_recipe)}")
+        result.append(
+            f'{click_var}.wait_for(state="visible", timeout={wait_timeout_ms})'
+        )
+        result.append(f'{click_var}.click(timeout={wait_timeout_ms})')
+        result.append(f"{expect_var} = {_locator_expression(frame_var, expect_recipe)}")
+        result.append(
+            f'{expect_var}.wait_for(state="visible", timeout={wait_timeout_ms})'
+        )
+    return result
+
+
 def generate_replacement_code(ctx: MarkerContext, viewer: ViewerConfig) -> str:
     """生成替换 marker 块的完整代码。"""
     page = ctx.page_var
     iframe = infer_iframe_selector(viewer, ctx.existing_locators)
+    open_steps = viewer.meta_panel.get("open_steps", []) or []
     button_names = viewer.meta_panel.get("open_button_names", []) or []
     panel_selectors = viewer.meta_panel.get("panel_container_selectors", []) or []
     tag_format = viewer.meta_panel.get("tag_row_format", "flex_div")
@@ -309,7 +462,12 @@ def generate_replacement_code(ctx: MarkerContext, viewer: ViewerConfig) -> str:
     # 打开面板
     if iframe:
         lines.append(f"{frame_var} = {page}.locator({_python_literal(iframe)}).content_frame")
-    if button_names:
+    if open_steps:
+        # A configured sequence is authoritative.  Do not catch a failed
+        # step or fall through to button-name aliases: the next state may not
+        # have been reached and extraction must not report a false success.
+        lines.extend(_open_steps_code(frame_var, open_steps))
+    elif button_names:
         # 多按钮依次尝试：找到能点的就停，全失败就跳过（面板可能已开）
         lines.append("opened = False")
         lines.append("for _btn_name in [")

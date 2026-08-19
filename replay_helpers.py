@@ -42,14 +42,92 @@ def series_key_slug(series_key: str, salt: str = "") -> str:
     return digest[:12]
 
 
-# Keys that carry high-confidence credential material in URL query strings.
+# Exact, unambiguous query keys that carry credential material. Any ``key``
+# whose normalized form contains a CREDENTIAL_FAMILY token (e.g. ``sessionId``,
+# ``tokenType``) is also treated as sensitive; this explicit set only catches
+# keys that would otherwise be missed by family matching (``code``/``key`` are
+# too generic to family-match safely, while ``username`` etc. are EMR identity
+# fields with no generic family token).
 KNOWN_QUERY_SECRET_KEYS = {
-    "token", "access_token", "refresh_token", "auth", "authtoken",
-    "apikey", "api_key", "key", "sig", "password", "passwd", "code",
-    "id_token", "session", "cookie",
+    # family-matched credentials (kept here for explicit documentation / tests)
+    "token", "session", "auth", "refresh_token", "access_token", "authtoken",
+    "id_token", "password", "passwd", "cookie", "sig", "apikey", "api_key",
+    # exact-match identity / route keys (safe to remove; not generic words)
+    "code", "key", "secret", "tokentype", "tokenid", "sessionid",
+    "refreshtoken", "accesstoken", "idtoken", "signatureid",
+    "signature", "sig",
+    "username", "userid", "user_id", "uniqueid", "unique_id",
+    "studyuid", "study_uid", "patientid", "patient_id",
+    "locationcode", "location_code", "vnaaddress", "vna_address",
+    "webvieweraddress", "webviewer_address", "authorization",
 }
 
+# Substring families whose presence marks a normalized key as credential
+# material. ``tokenid`` / ``sessionid`` etc. match via their family token, so
+# they need no explicit entry; this is deliberately separate from the exact set
+# so a generic word like ``key`` never family-matches ordinary keys.
+#
+# Family matching is deliberately *prefix-anchored with a bounded suffix
+# vocabulary*: a family token only fires when the normalized key **starts with**
+# the token and the remainder is a known credential indicator ('id', 'value',
+# 'type', 'name', 'key', 'expiry', 'expires', 'ttl', 'nonce', 'secret', or
+# empty). This prevents ordinary business fields that merely *contain* a family
+# substring ('authorname' contains 'auth', 'tokenamount' contains 'token',
+# 'sessionname' contains 'session', 'cookiecount' contains 'cookie') from being
+# misclassified as credentials and stripped from otherwise-safe URLs.
+_FAMILY_TOKENS = ("token", "session", "auth", "secret", "password",
+                  "passwd", "credential", "cookie")
+_FAMILY_INDICATORS = (
+    "", "id", "value", "val", "type", "name", "key", "expiry",
+    "expires", "ttl", "nonce", "secret", "token", "header", "bearer",
+)
+
+
+def _family_hits(normalized: str) -> bool:
+    for token in _FAMILY_TOKENS:
+        # Token must anchor the key as a prefix; the remainder is then checked
+        # against a bounded indicator vocabulary. This excludes ordinary fields
+        # that merely contain the family later in the word (``authorname``
+        # contains ``auth``, ``tokenamount`` contains ``token``).
+        if not normalized.startswith(token):
+            continue
+        suffix = normalized[len(token):]
+        if suffix == "" or suffix in _FAMILY_INDICATORS:
+            return True
+    return False
+
 _TEXT_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+
+
+def _normalize_query_key(key: str) -> str:
+    """Lowercase and strip non-alphanumeric separators from a query key.
+
+    ``sessionId`` -> ``sessionid``; ``vna_address`` -> ``vnaaddress``;
+    ``access-token`` -> ``accesstoken``. Normalization lets a single family
+    check cover size/case and separator variants.
+    """
+    return re.sub(r"[^a-z0-9]", "", key.lower())
+
+
+def _is_sensitive_query_key(key: str) -> bool:
+    """Return True when a URL query key carries credential material.
+
+    The single, shared classification used by both the post-capture scrubber
+    and the privacy scanner so the two can never drift apart. A key is
+    sensitive when either:
+    * its exact normalized form is in :data:`KNOWN_QUERY_SECRET_KEYS`, or
+    * its normalized form contains a credential family token
+      (``token``/``session``/``auth``/…).
+
+    Example coverage: ``sessionId``, ``tokenType``, ``authToken``, ``sig``,
+    ``code``, ``username``, ``uniqueid``, ``vna_address``, ``webvieweraddress``.
+    """
+    normalized = _normalize_query_key(key)
+    if normalized in KNOWN_QUERY_SECRET_KEYS:
+        return True
+    if "apikey" in normalized or "apikey" == normalized:
+        return True
+    return _family_hits(normalized)
 
 
 def strip_known_query_secrets(text: str) -> str:
@@ -67,19 +145,19 @@ def strip_known_query_secrets(text: str) -> str:
         fragment_path, separator, fragment_query = parsed.fragment.partition("?")
         fragment_pairs = parse_qsl(fragment_query, keep_blank_values=True) if separator else []
         if not any(
-            key.lower() in KNOWN_QUERY_SECRET_KEYS
+            _is_sensitive_query_key(key)
             for key, _ in (*query_pairs, *fragment_pairs)
         ):
             return candidate
         safe_query = urlencode([
             (key, value)
             for key, value in query_pairs
-            if key.lower() not in KNOWN_QUERY_SECRET_KEYS
+            if not _is_sensitive_query_key(key)
         ])
         safe_fragment_query = urlencode([
             (key, value)
             for key, value in fragment_pairs
-            if key.lower() not in KNOWN_QUERY_SECRET_KEYS
+            if not _is_sensitive_query_key(key)
         ])
         safe_fragment = fragment_path
         if separator and safe_fragment_query:
@@ -90,17 +168,18 @@ def strip_known_query_secrets(text: str) -> str:
 
 
 def _known_source_query_value(sample: str) -> str | None:
-    """Return the first known secret key found in a URL query string.
+    """Return the first sensitive query key found in a URL query string.
 
     Used by :func:`scan_text_for_secrets` so a captured URL like
     ``https://app.test/?access_token=abc`` is recognized without embedding the
-    actual value anywhere downstream.
+    actual value anywhere downstream. Shares :func:`_is_sensitive_query_key`
+    with the post-capture scrubber so scanner and scrubber can never drift.
     """
     marker = "?"
     if marker not in sample:
         return None
     for key, _ in parse_qsl(sample.split(marker, 1)[1], keep_blank_values=True):
-        if key.lower() in KNOWN_QUERY_SECRET_KEYS:
+        if _is_sensitive_query_key(key):
             return key
     return None
 

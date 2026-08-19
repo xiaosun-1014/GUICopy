@@ -34,6 +34,23 @@ class ReplicaActionParserTests(unittest.TestCase):
         self.assertEqual(action.locator.frame_chain[0].selector, '[id="2d-iframe"]')
         self.assertEqual(action.locator.locator_kind, "text")
 
+    def test_popup_result_assignment_supports_parentheses_and_annassign(self):
+        for assignment in (
+            "page1 = (popup_info.value)",
+            "page1: object = popup_info.value",
+        ):
+            with self.subTest(assignment=assignment):
+                source = f'''def run(page):
+    # [MARKER: 报告截图]
+    with page.expect_popup() as popup_info:
+        page.get_by_role("button", name="Open").click()
+    {assignment}
+'''
+                popup = parse_action_plan(source).popup_expectations[0]
+                self.assertEqual(popup.result_page_var, "page1")
+                self.assertEqual(popup.result_assignment_line, 5)
+                self.assertEqual(popup.result_assignment_end_line, 5)
+
     def test_cxhospital_nested_frames_and_ordinals_are_parsed(self):
         plan = self._parse("cxhospital")
 
@@ -157,6 +174,17 @@ page.get_by_role("button", name="确定").click()
             ["#iframe", 'iframe[name="imageFrame"]'],
         )
         self.assertEqual(recipe.locator_kind, "role")
+
+    def test_filter_locator_recipe_keeps_complete_source_expression(self):
+        source = '''# [MARKER: Meta 信息工具]
+page.get_by_role("link").filter(has_text="Tags").click()
+'''
+
+        action = parse_action_plan(source).marker_groups[0].actions[0]
+
+        self.assertIn(".filter", action.locator.source_expression)
+        self.assertIn("has_text", action.locator.source_expression)
+        self.assertNotEqual(action.locator.source_expression, "page.get_by_role('link')")
 
     def test_parse_locator_expression_rejects_action_call(self):
         with self.assertRaisesRegex(LocatorEditError, "receiver"):

@@ -397,21 +397,38 @@ def _click_by_text(fl, name: str) -> bool:
 
 **必须执行点击**：VL 返回坐标后必须调用 `page.mouse.dblclick`，不能只返回名字。
 
+**必须满足的落盘/调用约束**：
+- 回退截图固定为 `SCRIPT_DIR / "series_select_fallback.jpeg"`，JPEG quality=95；禁止 cwd 相对路径。
+- `vl_script` 必须从项目内 `skills/vl-config/scripts/call_vl.py` 确定性解析并检查存在；禁止依赖未定义的 global。
+- 必须实际执行 `subprocess.run(... --task series_extract --image ...)`；不能只截图或 print 后返回。
+
 ```python
 def _vl_fallback(page1, fl):
-    path = "series_select_fallback.jpeg"
+    # 所有产物必须相对 completed 脚本自身目录，不能依赖进程 cwd。
+    from pathlib import Path
+    SCRIPT_DIR = globals().get("SCRIPT_DIR", Path(__file__).resolve().parent)
+    path = SCRIPT_DIR / "series_select_fallback.jpeg"
     try:
-        fl.locator("body").screenshot(path=path)
+        fl.locator("body").screenshot(
+            path=str(path), type="jpeg", quality=95,
+        )
     except Exception:
-        page1.screenshot(path=path, full_page=True)
+        page1.screenshot(
+            path=str(path), type="jpeg", quality=95, full_page=True,
+        )
     print(f"[序列选择] 截图已保存: {path}")
 
     # 调用 VL 获取坐标
     import subprocess, json
+    project_root = SCRIPT_DIR.parent.parent
+    vl_script = project_root / "skills" / "vl-config" / "scripts" / "call_vl.py"
+    if not vl_script.exists():
+        return None
     result = subprocess.run(
         [sys.executable, str(vl_script), "--task", "series_extract",
-         "--image", path],
-        capture_output=True, text=True, timeout=30,
+         "--image", str(path)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30,
     )
     if result.returncode == 0:
         vl_data = json.loads(result.stdout)

@@ -148,6 +148,17 @@ class ExpansionPreflightTests(unittest.TestCase):
         self.assertTrue(result.ok, result.errors)
         self.assertFalse(result.errors)
 
+    def test_series_selection_warns_when_expansion_is_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            enabled = _expansion_config(root)
+            config = PipelineConfig(
+                **{**enabled.__dict__, "expand_all_series": False}
+            )
+            result = run_preflight(config)
+        self.assertTrue(result.ok, result.errors)
+        self.assertIn("series_expansion_not_requested", result.warnings)
+
     def test_complete_template_passes_expansion_preflight(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = run_preflight(_expansion_config(Path(tmp)))

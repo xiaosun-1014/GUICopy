@@ -490,6 +490,48 @@ def validate_artifacts(
 # ---------------------------------------------------------------------------
 
 _MAX_TEXT_BYTES = 5 * 1024 * 1024
+# Structured scan cap: a single manifest field value larger than this is
+# unlikely to be a URL and could be a large embedded payload; values above the
+# cap are skipped rather than regex-scanned (avoids pathological worst cases).
+_MAX_JSON_SCAN_VALUE = 512 * 1024
+
+
+def _scan_structured_manifest(path: Path, rel_label: str) -> list[str]:
+    """Scan a possibly-large ``manifest.json`` for credential patterns.
+
+    The generic text path is capped at ``_MAX_TEXT_BYTES`` precisely because a
+    huge manifest cannot be scanned as one blob efficiently or safely. Instead
+    we parse the JSON once and walk every string value, scanning each value that
+    looks like a URL (or carries an embedded URL) with the shared privacy
+    scanner. This closes the blind spot where a >5MB manifest's embedded viewer
+    URLs were never validated.
+
+    Returns rule names keyed on the *path* the hit lives in (``rel_label``),
+    matching the text path's ``relpath:rule`` contract. Never echoes the secret.
+    """
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        # Unparseable JSON falls back to the generic text scan (if small) or is
+        # skipped; we never fabricate a hit from a malformed payload.
+        return []
+    hits: list[str] = []
+    stack = [payload]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            stack.extend(node.values())
+        elif isinstance(node, (list, tuple)):
+            stack.extend(node)
+        elif isinstance(node, str):
+            if len(node) > _MAX_JSON_SCAN_VALUE:
+                continue
+            if not (node.startswith("http://") or node.startswith("https://")):
+                continue
+            for rule in scan_text_for_secrets(node):
+                hits.append(f"{rel_label}:{rule}")
+    return hits
 
 
 def validate_privacy(run_root: Path) -> ValidationResult:
@@ -497,9 +539,12 @@ def validate_privacy(run_root: Path) -> ValidationResult:
 
     Files named ``storage_state*.json`` always error (``storage_state_artifact``).
     Remaining files are scanned as text only when they look textual and are
-    ``<= 5MB``. Any credential pattern produces a bare ``secret_pattern`` error;
-    the safe ``file:rule`` detail is kept in ``metrics["secret_hits"]`` and the
-    matched secret itself is never echoed.
+    ``<= 5MB``; a run's ``capture/manifest.json`` is additionally scanned
+    **structurally** regardless of size (see :func:`_scan_structured_manifest`),
+    so oversize manifests can no longer hide credential-bearing viewer URLs.
+    Any credential pattern produces a bare ``secret_pattern`` error; the safe
+    ``file:rule`` detail is kept in ``metrics["secret_hits"]`` and the matched
+    secret itself is never echoed.
     """
     errors: list[str] = []
     warnings: list[str] = []
@@ -517,9 +562,15 @@ def validate_privacy(run_root: Path) -> ValidationResult:
             size = path.stat().st_size
         except OSError:
             continue
-        if size == 0 or size > _MAX_TEXT_BYTES:
+        if size == 0:
             continue
         if _looks_binary(path):
+            continue
+        # Oversize manifests bypass the generic text cap via the structured path.
+        if size > _MAX_TEXT_BYTES:
+            if path.name == "manifest.json" and path.suffix == ".json":
+                rel_label = str(path.relative_to(run_root)).replace("\\", "/")
+                secret_hits.extend(_scan_structured_manifest(path, rel_label))
             continue
         scanned_files += 1
         try:

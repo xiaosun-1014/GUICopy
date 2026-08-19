@@ -72,6 +72,14 @@ class ExpansionHookInjectionTests(unittest.TestCase):
         self.assertEqual(final_open.locator.locator_args["_filter"], {"has_text": "Tags"})
         self.assertEqual(template.metadata_close.action_id, "a_001_003")
 
+    def test_multi_step_metadata_instrumentation_preserves_filtered_tags_locator(self):
+        instrumented = instrument_marked_actions(MULTI_STEP_METADATA_SOURCE)
+
+        self.assertIn(
+            "lambda: page.get_by_role('link').filter(has_text='Tags')",
+            instrumented,
+        )
+
     def test_expansion_hook_imported_only_when_enabled(self):
         instrumented = instrument_marked_actions(EXPANSION_SOURCE, expansion_config=EXPANSION_CONFIG)
         self.assertIn("capture_hook_expand_series", instrumented)

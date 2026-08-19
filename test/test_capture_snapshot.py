@@ -84,6 +84,53 @@ class CaptureSnapshotTests(unittest.TestCase):
         self.assertEqual({member.dom.tag_name for member in region.members}, {"button", "input", "select", "canvas"})
         self.assertIn("data-testid", next(member.dom.attributes for member in region.members if member.dom.tag_name == "button"))
 
+    def test_capture_interaction_region_does_not_duplicate_styled_containers(self):
+        markup = "<main id='root'>" + "".join(
+            f"<div class='layer'>layer-{index}</div>" for index in range(250)
+        ) + "<a class='tool' href='#'>Open</a><button>Apply</button></main>"
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page()
+            page.set_content(markup)
+            region = capture_interaction_region(page.locator("#root"), "generic", "d_main")
+            browser.close()
+
+        self.assertEqual([member.dom.tag_name for member in region.members], ["a", "button"])
+
+    def test_interaction_region_degrades_members_to_empty_on_batch_failure(self):
+        """M1: a single evaluate_all failure must not drop the whole region."""
+        import io as _io
+        from unittest.mock import patch
+
+        from capture_snapshot import _capture_locator_snapshots
+        from replica_models import DomNodeSnapshot, Rect
+
+        root_locator = SimpleNamespace(locator=lambda selector: SimpleNamespace())
+        root_dom = DomNodeSnapshot(
+            tag_name="section",
+            text="Report",
+            attributes={"id": "report"},
+            rect=Rect(0, 0, 100, 50, "region_content_css"),
+            outer_html='<section id="report">Report</section>',
+            computed_style={"display": "block"},
+        )
+        stderr = _io.StringIO()
+        with patch("sys.stderr", stderr), patch(
+            "capture_snapshot.capture_locator_snapshot", return_value=root_dom
+        ), patch(
+            "capture_snapshot._capture_locator_snapshots",
+            side_effect=RuntimeError("boom"),
+        ):
+            region = capture_interaction_region(root_locator, "report", "d_main")
+
+        self.assertIsNotNone(region, "region root must survive a batch member failure")
+        self.assertEqual(region.region_type, "report")
+        self.assertEqual(region.document_id, "d_main")
+        self.assertIs(region.root, root_dom, "region root must be preserved intact")
+        self.assertIn("degraded", stderr.getvalue())
+        # Batch members degrade to zero (plain section root is not a member).
+        self.assertEqual(region.members, [])
+
     def test_marker_regions_prefer_their_semantic_root_over_the_full_page(self):
         markup = '''<main id="report">Report</main>
         <section class="layout-toolbar" id="layout">Layout</section>
@@ -150,6 +197,7 @@ class CaptureSnapshotTests(unittest.TestCase):
         self.assertIn("Study Information", region.root.outer_html)
         # The panel root resolved to tagsBox (id matches [id*='tags']).
         self.assertIn('id="tagsBox"', region.root.outer_html)
+        self.assertEqual([member.dom.attributes.get("id") for member in region.members], ["btn-tags"])
 
     def test_metadata_panel_rejects_tags_icon_and_patient_summary(self):
         markup = """

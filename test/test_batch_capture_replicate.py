@@ -20,6 +20,24 @@ from rewrite_script import parse_action_plan
 
 
 class BatchCaptureReplicateTests(unittest.TestCase):
+    def test_report_popup_target_reloads_once_for_configured_spa(self):
+        page = Mock()
+        target = Mock()
+        target.wait_for.side_effect = [TimeoutError("not mounted"), None]
+        with patch.object(replica_batch, "_viewer_config_for", return_value={
+            "replay": {
+                "reload_on_missing_report_target": True,
+                "reload_settle_ms": 2000,
+            }
+        }):
+            replica_batch.wait_for_pre_action_state(
+                page, "报告截图", locator_factory=lambda: target,
+            )
+        page.reload.assert_called_once_with(wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout.assert_called_once_with(2000)
+        self.assertEqual(target.wait_for.call_count, 2)
+        target.click.assert_called_once_with(trial=True, timeout=30000)
+
     def test_popup_entry_skips_a_small_shell_for_the_next_complete_state(self):
         transition = SimpleNamespace(mode="popup", to_state_id="s_001")
         frame = lambda size: SimpleNamespace(parent_document_id="root", screenshot_size_bytes=size)
@@ -87,7 +105,55 @@ class BatchCaptureReplicateTests(unittest.TestCase):
 
         ast.parse(instrumented)
         self.assertIn('capture_hook_before("a_000_001", page, lambda:', instrumented)
-        self.assertIn('capture_hook_after("a_000_001", page, lambda:', instrumented)
+        assignment = instrumented.index("page1 = popup_info.value")
+        after = instrumented.index('capture_hook_after("a_000_001"')
+        self.assertGreater(after, assignment)
+        self.assertIn("_capture_popup_after_a_000_001", instrumented)
+
+    def test_popup_after_hook_follows_ast_assignment_variants(self):
+        assignments = (
+            "page1 = popup_info.value",
+            "page1 = (popup_info.value)",
+            "page1: object = popup_info.value",
+            "page1 = (\n        popup_info.value\n    )",
+        )
+        for assignment in assignments:
+            with self.subTest(assignment=assignment):
+                source = f'''from playwright.sync_api import sync_playwright
+
+def run(page):
+    # [MARKER: 报告截图]
+    with page.expect_popup() as popup_info:
+        page.get_by_role("button", name="Open").click()
+    {assignment}
+'''
+
+                plan = parse_action_plan(source)
+                expectation = plan.popup_expectations[0]
+                self.assertEqual(expectation.info_var, "popup_info")
+                self.assertEqual(expectation.result_page_var, "page1")
+                self.assertIsNotNone(expectation.result_assignment_line)
+                self.assertIsNotNone(expectation.result_assignment_end_line)
+
+                instrumented = instrument_marked_actions(source)
+                ast.parse(instrumented)
+                assignment_index = instrumented.index("popup_info.value")
+                after_index = instrumented.index('capture_hook_after("a_000_001"')
+                self.assertGreater(after_index, assignment_index)
+                # The deferred hook must not be emitted in the expect_popup
+                # body, where it would still observe the opener page.
+                popup_body_end = instrumented.index("    page1", instrumented.index("with page.expect_popup"))
+                self.assertGreater(after_index, popup_body_end)
+
+    def test_report_popup_wait_does_not_succeed_without_a_popup(self):
+        page = Mock()
+        page.context.pages = [page]
+
+        self.assertFalse(
+            replica_batch._wait_for_report_popup_state(
+                page, timeout_s=0.02, stable_s=0.01,
+            )
+        )
 
     def test_interactive_instrumentation_uses_headed_browser_and_hook_gate(self):
         source = '''from playwright.sync_api import sync_playwright
@@ -127,6 +193,64 @@ run()
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"event": "action_failed"', result.stdout)
+
+    def test_unavailable_window_level_action_is_skipped_before_snapshot(self):
+        source = '''from playwright.sync_api import sync_playwright
+
+def run():
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        page.set_content('<button id="ok">OK</button>')
+        # [MARKER: 窗宽窗位 WL/WW]
+        page.locator("#missing-wl").fill("0")
+        # [MARKER: 报告截图]
+        page.locator("#ok").click()
+        browser.close()
+
+run()
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / "recorded.py"
+            script.write_text(source, encoding="utf-8")
+            result = run_live_capture(script, root / "capture")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('"event": "action_skipped"', result.stdout)
+            self.assertIn('"reason": "locator_unavailable"', result.stdout)
+            self.assertFalse((root / "capture" / "snapshots" / "a_000_001").exists())
+            self.assertTrue((root / "capture" / "snapshots" / "a_001_001").exists())
+
+    def test_hidden_layout_option_is_skipped_before_snapshot(self):
+        source = '''from playwright.sync_api import sync_playwright
+
+def run():
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        page.set_content('<button id="layout-menu">Layout</button><button id="hidden-layout" style="display:none">1*1</button><button id="ok">OK</button>')
+        # [MARKER: 序列布局切换]
+        page.locator("#layout-menu").click()
+        page.locator("#hidden-layout").click()
+        # [MARKER: 报告截图]
+        page.locator("#ok").click()
+        browser.close()
+
+run()
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / "recorded.py"
+            script.write_text(source, encoding="utf-8")
+            result = run_live_capture(script, root / "capture")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('"event": "action_skipped"', result.stdout)
+            self.assertIn('"marker": "序列布局切换"', result.stdout)
+            self.assertTrue((root / "capture" / "snapshots" / "a_000_001").exists())
+            self.assertFalse((root / "capture" / "snapshots" / "a_000_002").exists())
+            self.assertTrue((root / "capture" / "snapshots" / "a_001_001").exists())
 
     def test_build_skips_failed_marked_actions_with_no_snapshot_pair(self):
         source = '''from playwright.sync_api import sync_playwright
@@ -1446,6 +1570,76 @@ class StepTwoLayoutCaptureTests(unittest.TestCase):
             self.assertIn("2*2", variants, "title 推断出的变体应采到")
             rel = variants.get("2*2")
             self.assertTrue(rel and (Path(tmp) / rel).exists(), f"by-hash 资产未落盘: {rel}")
+
+    def test_layout_sampler_reopens_menu_between_options_and_leaves_it_open(self):
+        """Real layout popups close after each choice; sampling must reopen them."""
+        from replica_models import ReplicaDocument
+        from PIL import Image as _PILImage
+
+        state = {"open": True, "selected": -1, "toggle_clicks": 0}
+        images = []
+        for color in ((10, 20, 30), (40, 50, 60), (70, 80, 90)):
+            buffer = io.BytesIO()
+            _PILImage.new("RGB", (200, 200), color).save(buffer, "JPEG", quality=95)
+            images.append(buffer.getvalue())
+
+        class Option:
+            def __init__(self, index):
+                self.index = index
+
+            def is_visible(self):
+                return state["open"]
+
+            def get_attribute(self, name):
+                return f"{self.index + 1}*{self.index + 1}" if name == "title" else None
+
+            def inner_text(self):
+                return ""
+
+            def text_content(self):
+                return ""
+
+            def click(self, trial=False):
+                if not trial:
+                    state["selected"] = self.index
+                    state["open"] = False
+
+        members = SimpleNamespace(count=lambda: 2, nth=lambda index: Option(index))
+        root = SimpleNamespace(
+            is_visible=lambda: state["open"],
+            locator=lambda selector: members,
+        )
+
+        def toggle_click():
+            state["toggle_clicks"] += 1
+            state["open"] = True
+
+        toggle = SimpleNamespace(click=toggle_click)
+        page = Mock()
+        page.wait_for_timeout = Mock()
+        page.evaluate = Mock(return_value=1)
+        document = ReplicaDocument(
+            document_id="d_main", page_id="p_000", page_var="page", page_kind="main",
+            parent_document_id=None, frame_selector=None, frame_id=None, frame_name=None,
+            viewport={"width": 800, "height": 600}, device_scale_factor=1.0,
+            screenshot_scale="css", scroll_x=0.0, scroll_y=0.0,
+            screenshot_asset_relpath="assets/d_main.jpeg", screenshot_sha256="h",
+            screenshot_size_bytes=1,
+        )
+
+        def shot(_page):
+            return images[state["selected"] + 1]
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "batch_capture_replicate._canvas_png_or_none", side_effect=shot
+        ):
+            variants, _default = replica_batch._sample_all_layout_variants(
+                page, root, document, Path(tmp), layout_toggle=toggle,
+            )
+
+        self.assertEqual(set(variants), {"1*1", "2*2"})
+        self.assertTrue(state["open"])
+        self.assertGreaterEqual(state["toggle_clicks"], 2)
 
 
 if __name__ == "__main__":

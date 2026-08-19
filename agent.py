@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -69,6 +70,9 @@ MARKER_MAP = {
 MARKER_RE = re.compile(
     r"^(?P<indent>[ \t]*)# \[MARKER: (?P<name>[^\]]+?)(?: @ (?P<ts>\d{8}_\d{6}))?\]"
 )
+GOTO_URL_RE = re.compile(
+    r"\bpage\d*\.goto\(\s*(?P<quote>['\"])(?P<url>.*?)(?P=quote)"
+)
 
 # 这些 marker 的后续 Playwright 动作是人工“示教”代码。Skill 生成通用实现后，
 # 示教动作必须随 marker 一起被替换，否则会在动态逻辑后再次执行硬编码操作。
@@ -115,6 +119,7 @@ def _find_marker_end(lines: List[str], start: int, name: str) -> int:
 def parse_markers(script: str) -> List[Dict]:
     lines = script.split("\n")
     markers = []
+    goto_urls = [m.group("url") for m in GOTO_URL_RE.finditer(script)]
     i = 0
     while i < len(lines):
         m = MARKER_RE.match(lines[i])
@@ -129,6 +134,7 @@ def parse_markers(script: str) -> List[Dict]:
                 "raw": "\n".join(lines[i:j]),
                 "context_before": lines[max(0, i - 8):i],
                 "context_after": lines[j:min(len(lines), j + 20)],
+                "goto_urls": goto_urls,
             })
             i = j
         else:
@@ -270,6 +276,35 @@ def extract_code_block(response: str) -> str:
     return response.strip()
 
 
+_META_GENERATOR_MODULE = None
+
+
+def _load_meta_generator_module():
+    """Load the shared Meta script generator once for deterministic markers."""
+    global _META_GENERATOR_MODULE
+    if _META_GENERATOR_MODULE is not None:
+        return _META_GENERATOR_MODULE
+
+    script_path = (
+        SKILLS_DIR
+        / "marker-meta-extract"
+        / "scripts"
+        / "extract_dicom_meta.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_agent_meta_extract_generator", script_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载 Meta 生成器: {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    # The generator declares dataclasses. Register it before execution so the
+    # dataclass decorator can resolve the module while it is being loaded.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    _META_GENERATOR_MODULE = module
+    return module
+
+
 def _generate_deterministic_meta(marker: Dict) -> str:
     """用录制动作打开/关闭面板，并调用共享 Meta 提取模块。"""
     action_lines = [
@@ -305,6 +340,15 @@ def _generate_deterministic_meta(marker: Dict) -> str:
             selector = raw_selector.strip("'\"")
         if isinstance(selector, str) and selector not in iframe_selectors:
             iframe_selectors.append(selector)
+
+    meta_generator = _load_meta_generator_module()
+    viewers = meta_generator.load_viewers(SKILLS_DIR / "_shared" / "viewers.yaml")
+    viewer = meta_generator.match_viewer(viewers, marker.get("goto_urls", []))
+    open_steps = viewer.meta_panel.get("open_steps", []) or []
+    if open_steps:
+        # Reuse the standalone generator so deterministic agent output follows
+        # the same configured step order, locators, and visibility waits.
+        open_actions = meta_generator._open_steps_code(page_var, open_steps)
 
     iframe_repr = repr(iframe_selectors) if iframe_selectors else "None"
     block = [

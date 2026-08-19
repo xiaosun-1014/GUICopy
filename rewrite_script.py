@@ -134,7 +134,12 @@ def _literal_arguments(argument_text: str) -> tuple[list[Any], dict[str, Any]]:
 
 
 def _locator_from_expression(expression: ast.AST, page_var: str) -> LocatorRecipe | None:
-    source = ast.unparse(expression)
+    # Keep the complete receiver for replay/instrumentation.  The parser below
+    # temporarily strips ``filter``/ordinal suffixes to recover the structural
+    # locator fields, but that normalized prefix is not a valid replacement for
+    # the recorded locator itself (notably for FTImage's ``Tags`` filter).
+    source_expression = ast.unparse(expression)
+    source = source_expression
     frame_chain = []
     for match in re.finditer(r"\.locator\((?P<args>[^)]*)\)\.content_frame", source):
         args, _ = _literal_arguments(match.group("args"))
@@ -173,13 +178,60 @@ def _locator_from_expression(expression: ast.AST, page_var: str) -> LocatorRecip
     locator_args: dict[str, object] = {"args": args, **kwargs}
     if filter_kwargs:
         locator_args["_filter"] = filter_kwargs
-    return LocatorRecipe(source, page_var, frame_chain, kind, locator_args, ordinal_op, ordinal_value)
+    return LocatorRecipe(source_expression, page_var, frame_chain, kind, locator_args, ordinal_op, ordinal_value)
 
 
 def _page_var(expression: ast.AST) -> str:
     source = ast.unparse(expression)
     match = re.match(r"(page\d*|page)\b", source)
     return match.group(1) if match else "page"
+
+
+def _assignment_target_names(statement: ast.Assign | ast.AnnAssign) -> list[str]:
+    """Return simple name targets from an assignment statement."""
+    targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+    names: list[str] = []
+    for target in targets:
+        for node in ast.walk(target):
+            if isinstance(node, ast.Name):
+                names.append(node.id)
+    return names
+
+
+def _popup_result_assignment(
+    tree: ast.AST,
+    popup_node: ast.With,
+    info_var: str,
+) -> tuple[str, int | None, int | None]:
+    """Find the first post-``expect_popup`` binding of ``info_var.value``.
+
+    AST matching intentionally ignores source spelling, so parenthesized
+    expressions and annotated assignments are handled identically to a plain
+    ``page1 = popup_info.value``.  Requiring the assignment to start after the
+    complete ``with`` statement prevents a nested assignment from moving the
+    deferred after-hook back inside the popup context.
+    """
+    popup_end_line = popup_node.end_lineno or popup_node.lineno
+    candidates = sorted(
+        (
+            statement
+            for statement in ast.walk(tree)
+            if isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and statement.lineno > popup_end_line
+            and isinstance(getattr(statement, "value", None), ast.Attribute)
+            and statement.value.attr == "value"
+            and isinstance(statement.value.value, ast.Name)
+            and statement.value.value.id == info_var
+        ),
+        key=lambda statement: (statement.lineno, statement.col_offset),
+    )
+    if not candidates:
+        return "", None, None
+    statement = candidates[0]
+    names = _assignment_target_names(statement)
+    if not names:
+        return "", None, None
+    return names[0], statement.lineno, statement.end_lineno or statement.lineno
 
 
 def _literal_value(expression: ast.AST) -> object:
@@ -329,18 +381,27 @@ def parse_action_plan(
         if not isinstance(item.optional_vars, ast.Name):
             continue
         info_var = item.optional_vars.id
-        result_var = next(
-            (
-                statement.targets[0].id
-                for statement in ast.walk(tree)
-                if isinstance(statement, ast.Assign)
-                and isinstance(statement.targets[0], ast.Name)
-                and ast.unparse(statement.value) == f"{info_var}.value"
-            ),
-            "",
+        result_var, result_assignment_line, result_assignment_end_line = _popup_result_assignment(
+            tree, node, info_var
         )
-        body_ids = [actions_by_line[call.lineno] for call in ast.walk(node) if isinstance(call, ast.Call) and call.lineno in actions_by_line]
-        expectations.append(PopupExpectation(node.lineno, _page_var(popup_call.func.value), info_var, result_var, body_ids))
+        body_ids: list[str] = []
+        for call in ast.walk(node):
+            if not isinstance(call, ast.Call) or call.lineno not in actions_by_line:
+                continue
+            action_id = actions_by_line[call.lineno]
+            if action_id not in body_ids:
+                body_ids.append(action_id)
+        expectations.append(
+            PopupExpectation(
+                node.lineno,
+                _page_var(popup_call.func.value),
+                info_var,
+                result_var,
+                body_ids,
+                result_assignment_line,
+                result_assignment_end_line,
+            )
+        )
     return ActionPlan(bootstrap, groups, expectations, source, locator_source_spans)
 
 

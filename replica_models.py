@@ -99,6 +99,11 @@ class PopupExpectation:
     info_var: str
     result_page_var: str
     body_action_ids: list[str]
+    # Source line metadata for the assignment that binds ``info_var.value``.
+    # These are optional so manifests written before this metadata existed
+    # remain readable.
+    result_assignment_line: int | None = None
+    result_assignment_end_line: int | None = None
 
 
 @dataclass

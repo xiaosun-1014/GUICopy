@@ -103,6 +103,20 @@ viewers:
       item_selector: "a:has(span.total)"            # 序列行 = A > div.desc > span.total
       identity_attrs: []                            # 无稳定属性 → 文本 fallback
     meta_panel:
+      # FTImage opens metadata through a two-step menu.  Each step is
+      # generated and waited independently; do not collapse this into the
+      # fallback button-name list below.
+      open_steps:
+        - method: "get_by_title"
+          value: "更多"
+          expect_visible:
+            method: "locator"
+            selector: "#moreBox a.tool.tool-tags[data-tool='tags']"
+        - method: "locator"
+          selector: "#moreBox a.tool.tool-tags[data-tool='tags']"
+          expect_visible:
+            method: "locator"
+            selector: "#tagsBox"
       open_button_names:
         - "更多"
         - "Tags"
@@ -126,6 +140,16 @@ viewers:
         - "DICOM信息 F2"
       close_button_selectors:
         - ".ui-dialog-titlebar-close"
+    fixed_actions:
+      # Dapeng 没有联影 RAF 的 #popTagText_WL / #popTagText_WW 控件。
+      # Adapter 仍保留录制动作；live replica replay 据此快速、可审计地降级。
+      window_level:
+        supported: false
+    replay:
+      # 分享页是 SPA；偶发首轮脚本/数据没有挂载，#app 为空且查看影像按钮缺失。
+      # live capture 在报告 marker 的 popup trigger 前允许一次受控 reload。
+      reload_on_missing_report_target: true
+      reload_settle_ms: 2000
     # 注：viewer 在第二层 iframe（/viewer/.../Viewer/Index）；序列激活 = dblclick
 
   # --------------------------------------------------------------------------

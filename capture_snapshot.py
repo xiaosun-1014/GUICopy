@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import hashlib
 import re
+import sys
 import time
 from pathlib import Path
 from collections.abc import Callable, Mapping, Sequence
@@ -19,12 +20,6 @@ from replica_models import DiffMetrics, DomNodeSnapshot, InteractionRegion, Rect
 def _load_grayscale(png_bytes: bytes) -> Image.Image:
     with Image.open(io.BytesIO(png_bytes)) as source:
         return source.convert("L").filter(ImageFilter.GaussianBlur(radius=1))
-
-
-def _write_visual_jpeg(png_bytes: bytes, destination: Path) -> None:
-    """Persist a compact visual artifact while retaining PNG bytes for state diffing."""
-    with Image.open(io.BytesIO(png_bytes)) as image:
-        image.convert("RGB").save(destination, format="JPEG", quality=95, optimize=True)
 
 
 def _mask_rect(image: Image.Image, rect: Mapping[str, float]) -> tuple[int, int, int, int]:
@@ -173,6 +168,92 @@ def capture_locator_snapshot(locator: Any, coordinate_space: str = "page_viewpor
     return dom_snapshot_from_payload(payload, coordinate_space)
 
 
+_INTERACTIVE_DESCENDANT_SELECTOR = (
+    "a, button, input, select, textarea, canvas, [role], [data-testid], "
+    "[contenteditable='true'], [tabindex]"
+)
+
+
+def _capture_locator_snapshots(
+    locator: Any,
+    coordinate_space: str = "region_content_css",
+) -> list[DomNodeSnapshot]:
+    """Capture a locator collection with one browser round-trip.
+
+    Viewer documents can contain thousands of styled nodes. Calling
+    ``count``/``nth``/``evaluate`` once per node made metadata snapshots take
+    several minutes on Dapeng. ``evaluate_all`` returns the same payload shape
+    in one call and keeps the Python-side sanitizer as the single persistence
+    boundary.
+    """
+    payloads = locator.evaluate_all(
+        """elements => elements.map(element => {
+            const rect = element.getBoundingClientRect();
+            const style = getComputedStyle(element);
+            const attributes = Object.fromEntries(
+                Array.from(element.attributes, attribute => [attribute.name, attribute.value])
+            );
+            if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+                attributes.value = element.value;
+            }
+            return {
+                tag_name: element.tagName.toLowerCase(),
+                text: (element.innerText || element.textContent || '').trim(),
+                attributes,
+                rect: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
+                outer_html: element.outerHTML,
+                computed_style: {
+                    display: style.display,
+                    visibility: style.visibility,
+                    position: style.position,
+                    font: style.font,
+                    color: style.color,
+                    backgroundColor: style.backgroundColor,
+                },
+            };
+        })"""
+    )
+    return [dom_snapshot_from_payload(payload, coordinate_space) for payload in payloads]
+
+
+def _capture_panel_sibling_snapshots(
+    panel_locator: Any,
+    coordinate_space: str = "region_content_css",
+) -> list[DomNodeSnapshot]:
+    """Capture interactive controls outside a metadata panel in one call."""
+    payloads = panel_locator.evaluate(
+        """(panel, selector) => Array.from(panel.ownerDocument.querySelectorAll(selector))
+            .filter(element => !panel.contains(element) && !element.contains(panel))
+            .map(element => {
+                const rect = element.getBoundingClientRect();
+                const style = getComputedStyle(element);
+                const attributes = Object.fromEntries(
+                    Array.from(element.attributes, attribute => [attribute.name, attribute.value])
+                );
+                if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+                    attributes.value = element.value;
+                }
+                return {
+                    tag_name: element.tagName.toLowerCase(),
+                    text: (element.innerText || element.textContent || '').trim(),
+                    attributes,
+                    rect: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
+                    outer_html: element.outerHTML,
+                    computed_style: {
+                        display: style.display,
+                        visibility: style.visibility,
+                        position: style.position,
+                        font: style.font,
+                        color: style.color,
+                        backgroundColor: style.backgroundColor,
+                    },
+                };
+            })""",
+        _INTERACTIVE_DESCENDANT_SELECTOR,
+    )
+    return [dom_snapshot_from_payload(payload, coordinate_space) for payload in payloads]
+
+
 def capture_selector_closure(locator: Any, action_id: str) -> SelectorClosure | None:
     """Preserve minimal structural evidence needed to audit an offline locator.
 
@@ -200,19 +281,27 @@ def capture_interaction_region(root_locator: Any, region_type: str, document_id:
     """Capture a region root and all native/ARIA controls required for offline replay.
 
     root 无匹配（capture_locator_snapshot 返回 None）时返回 None，调用方跳过该 region。
+    批量成员快照（evaluate_all）失败时**降级为保留 root、清空成员**，而不是把整个
+    region 丢掉——单次 evaluate_all 异常不应覆盖已成功捕获的 region root
+    （M1：原逐元素实现的语义是「单成员失败只跳过该成员」）。降级会记录结构化
+    warning 到 stderr，供调用方排查。
     """
     root = capture_locator_snapshot(root_locator)
     if root is None:
         return None  # 真·无匹配：调用方不 append 该 region
-    controls = root_locator.locator("button, input, select, textarea, canvas, [role], [data-testid], [id], [class]")
+    controls = root_locator.locator(_INTERACTIVE_DESCENDANT_SELECTOR)
     members = []
     if root.tag_name in {"button", "input", "select", "textarea", "canvas"} or "role" in root.attributes or "data-testid" in root.attributes:
         members.append(RegionMember(f"{document_id}_{region_type}_root", root.tag_name, root))
-    for index in range(controls.count()):
-        locator = controls.nth(index)
-        snapshot = capture_locator_snapshot(locator, "region_content_css")
-        if snapshot is None:
-            continue  # 单成员无匹配：跳过该成员，不让 None 泄漏进 RegionMember
+    try:
+        snapshots = _capture_locator_snapshots(controls)
+    except Exception as exc:  # noqa: BLE001 - degrade, never drop the region root
+        sys.stderr.write(
+            f"region members degraded: {document_id}/{region_type} -> "
+            f"{type(exc).__name__}: {exc}\n"
+        )
+        snapshots = []
+    for index, snapshot in enumerate(snapshots):
         members.append(RegionMember(f"{document_id}_{region_type}_{index:03d}", snapshot.tag_name, snapshot))
     return InteractionRegion(f"{document_id}_{region_type}", region_type, document_id, root, members, None)
 
@@ -567,23 +656,11 @@ def capture_marker_panel_region(
     # offline replay must keep reachable — collect them as members, excluding
     # anything already inside the panel root so it is not duplicated.
     members: list[RegionMember] = []
-    raw_root_html = result.get("html", "")
-    controls = scope.locator("button, input, select, textarea, canvas, [role], [data-testid], [id], [class]")
-    for index in range(controls.count()):
-        locator = controls.nth(index)
-        try:
-            raw_html = locator.evaluate("element => element.outerHTML") or ""
-            if not raw_html:
-                continue
-            if raw_root_html and (
-                raw_html in raw_root_html or raw_root_html in raw_html
-            ):
-                continue
-            snapshot = capture_locator_snapshot(locator, "region_content_css")
-        except Exception:
-            continue
-        if snapshot is None:
-            continue  # 兄弟控件瞬变无匹配：跳过，避免 None 泄漏进 RegionMember
+    try:
+        sibling_snapshots = _capture_panel_sibling_snapshots(root_locator)
+    except Exception:
+        sibling_snapshots = []
+    for index, snapshot in enumerate(sibling_snapshots):
         members.append(RegionMember(f"{document_id}_metadata_sibling_{index:03d}", snapshot.tag_name, snapshot))
     return InteractionRegion(
         f"{document_id}_metadata",
@@ -618,7 +695,7 @@ def capture_page_topology(
     named_pages: Sequence[tuple[str, Any]],
     asset_root: Path,
 ) -> tuple[list[ReplicaPage], list[ReplicaDocument]]:
-    """Capture page/popup and nested frame documents as CSS-scale PNG assets."""
+    """Capture page/popup and nested frame documents as CSS-scale JPEG assets."""
     asset_root = Path(asset_root)
     asset_dir = asset_root / "assets"
     asset_dir.mkdir(parents=True, exist_ok=True)
@@ -631,10 +708,9 @@ def capture_page_topology(
         page_id = f"p_{page_index:03d}"
         page_ids[page] = page_id
         entry_document_id = f"d_{page_id}_root"
-        screenshot = page.screenshot(type="png", scale="css")
-        relative_asset = Path("assets") / f"{entry_document_id}.png"
+        screenshot = page.screenshot(type="jpeg", quality=95, scale="css")
+        relative_asset = Path("assets") / f"{entry_document_id}.jpeg"
         (asset_root / relative_asset).write_bytes(screenshot)
-        _write_visual_jpeg(screenshot, asset_root / relative_asset.with_suffix(".jpeg"))
         viewport = page.viewport_size or {"width": 0, "height": 0}
         pages.append(ReplicaPage(page_id, page_var, "main" if page_index == 0 else "popup", None, None, entry_document_id, page == named_pages[0][1], page.is_closed()))
         root_document = ReplicaDocument(
@@ -654,11 +730,10 @@ def capture_page_topology(
             box = frame_element.bounding_box()
             if not box:
                 continue
-            screenshot = frame.locator("html").screenshot(type="png")
+            screenshot = frame.locator("html").screenshot(type="jpeg", quality=95)
             document_id = f"d_{page_id}_f_{frame_index:03d}"
-            relative_asset = Path("assets") / f"{document_id}.png"
+            relative_asset = Path("assets") / f"{document_id}.jpeg"
             (asset_root / relative_asset).write_bytes(screenshot)
-            _write_visual_jpeg(screenshot, asset_root / relative_asset.with_suffix(".jpeg"))
             viewport_data = frame.evaluate("() => ({width: innerWidth, height: innerHeight, scrollX, scrollY})")
             documents.append(ReplicaDocument(
                 document_id, page_id, page_var, "popup" if page_index else "main", parent_id, _frame_selector(descriptor), descriptor.get("id"), descriptor.get("name"),

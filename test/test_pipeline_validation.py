@@ -256,6 +256,60 @@ class QuerySecretRedactionTests(unittest.TestCase):
         self.assertNotIn("secret", cleaned)
         self.assertEqual(cleaned.count("study=demo"), 3)
 
+    def test_oversize_manifest_is_scanned_structured_regardless_of_size(self):
+        """A >5MB manifest must not slip past the privacy validator. The generic
+        text path caps at 5MB, so an oversize manifest is scanned structurally
+        (parse + walk string values) and its embedded viewer URLs are flagged."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            (root / "capture").mkdir(parents=True)
+            # Duplicate a sensitive state enough times to exceed 5MB.
+            big_state = {
+                "source_url": (
+                    "https://viewer.example/Index?sessionId=WNSqTOKEN99"
+                    "&studyUid=1.2.826&screenid=2&role=doctor"
+                )
+            }
+            payload = json.dumps({"states": [big_state] * 60_000}).encode("utf-8")
+            self.assertGreater(len(payload), 5 * 1024 * 1024)
+            (root / "capture" / "manifest.json").write_bytes(payload)
+
+            result = validate_privacy(root)
+
+            self.assertEqual(result.status, "failed")
+            self.assertIn("secret_pattern", result.errors)
+            hits = result.metrics["secret_hits"]
+            self.assertTrue(
+                any("capture/manifest.json:known_source_query" in h for h in hits),
+                hits,
+            )
+            self.assertEqual(result.metrics["scanned_files"], 0)  # structured path
+
+    def test_oversize_manifest_clean_stays_clean(self):
+        """The structured scan must not fabricate hits on a clean oversize
+        manifest (only genuinely sensitive keys count; role/screenid stay)."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            (root / "capture").mkdir(parents=True)
+            state = {
+                "source_url": (
+                    "https://viewer.example/Index?screenid=2&role=doctor"
+                    "&syscode=3&appcode=1"
+                )
+            }
+            payload = json.dumps({"states": [state] * 60_000}).encode("utf-8")
+            self.assertGreater(len(payload), 5 * 1024 * 1024)
+            (root / "capture" / "manifest.json").write_bytes(payload)
+
+            result = validate_privacy(root)
+
+            self.assertEqual(result.status, "success")
+            self.assertEqual(result.metrics.get("secret_hits") or [], [])
+
 
 class SeriesBranchValidationTests(unittest.TestCase):
     def _validate(self, flow):

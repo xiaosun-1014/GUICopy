@@ -21,9 +21,8 @@ metadata:
 
 - 审查分支主题、提交、ledger 记录全在 `.superpowers/sdd/` 工作区，`review-{a}..{b}.diff` 即 review package。
 - 仓库解释器硬约束：测试/子进程一律 `D:/Anaconda/envs/codegen-marker/python.exe`，**禁止静默回退 `sys.executable`**（系统 Python 3.7 缺 PyQt6/playwright wheel）。
-- **测试环境污染**：`test_batch_capture_replicate` 在 headless 下 import 时挂起（导入 Playwright/浏览器），非代码引入。跑单测用：
+- **测试环境澄清（2026-08-18 修正）**：`test_batch_capture_replicate` **不是 import 挂起**——实测 import 0.49s，`chromium.launch()` 逐用例正常。它整组慢是因为 70 个用例里多个真实 Playwright 浏览器用例（每个 15-40s），整组 10+ 分钟。跑它给足 timeout（>`600s`）或按子集；不要被「headless import 挂起」的过时记忆误导。快速单测组仍用：
   `PYTHONIOENCODING=utf-8 D:/Anaconda/envs/codegen-marker/python.exe -m unittest test.test_orchestrator_events test.test_agent_marker_boundaries test.test_replica_gui -v`
-  （registry discover 含浏览器集成测试会挂。）
 
 ## 一次具体 triage 案例
 

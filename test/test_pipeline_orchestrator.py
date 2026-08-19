@@ -7,6 +7,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from pipeline_models import PipelineConfig, PipelineStatus, PipelineStage, StageResult
@@ -23,6 +24,7 @@ from pipeline_orchestrator import (
     resume_pipeline,
     run_capture,
     run_pipeline,
+    run_replica_build,
 )
 from pipeline_io import create_run_layout
 from pipeline_preflight import run_preflight
@@ -87,6 +89,117 @@ class PostCapturePrivacyTests(unittest.TestCase):
                 (layout.capture_dir / "recorded.py").read_bytes()
             ).hexdigest()
             self.assertEqual(payload["source_script_sha256"], expected)
+
+    def test_resume_replica_build_scrubs_legacy_query_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = create_run_layout(Path(tmp), "fixture", "run_legacy")
+            source = layout.capture_dir / "recorded.py"
+            source.write_text(
+                'page.goto("https://viewer.example/open?token=secret&study=demo")\n',
+                encoding="utf-8",
+            )
+            manifest = layout.capture_dir / "manifest.json"
+            manifest.write_text(json.dumps({
+                "source_script_relpath": "recorded.py",
+                "source_script_sha256": "stale",
+            }), encoding="utf-8")
+            controller = SimpleNamespace(
+                run_id="run_legacy",
+                operation="replica-build",
+                _issue=lambda event: None,
+            )
+            flow = SimpleNamespace(source_script_relpath="recorded.py")
+            entrypoint = layout.replica_dir / "index.html"
+
+            with (
+                patch("pipeline_orchestrator.read_manifest", return_value=flow),
+                patch("pipeline_orchestrator.build_from_manifest", return_value=entrypoint),
+            ):
+                result = run_replica_build(make_config(tmp), layout, controller)
+
+            self.assertEqual(result.status, SUCCESS)
+            self.assertGreater(result.metrics["query_secret_files_scrubbed"], 0)
+            self.assertNotIn("token=", source.read_text(encoding="utf-8"))
+            self.assertNotIn("secret", source.read_text(encoding="utf-8"))
+
+    def test_scrub_refreshes_run_internal_annotations_hash_with_empty_source_dir(self):
+        """Legacy runs have an empty ``source/`` (script lives in ``capture/``);
+        the hash-refresh must anchor on manifest.source_script_relpath, not on
+        "source_dir holds exactly one .py", and must refresh run-internal
+        ``source/*.json`` that already carry ``source_script_sha256``."""
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = create_run_layout(Path(tmp), "fixture", "run_empty_source")
+            # Legacy layout: no ``source/*.py``, script only under capture/.
+            source = layout.capture_dir / "recorded.py"
+            source.write_text(
+                'page.goto("https://viewer.example/open?token=secret&study=demo")\n',
+                encoding="utf-8",
+            )
+            manifest = layout.capture_dir / "manifest.json"
+            manifest.write_text(json.dumps({
+                "source_script_relpath": "recorded.py",
+                "source_script_sha256": "stale_manifest",
+            }), encoding="utf-8")
+            # Run-internal annotations copy with a stale hash that must refresh.
+            run_annotations = layout.source_dir / "replica_annotations.json"
+            run_annotations.write_text(json.dumps({
+                "source_script_sha256": "stale_annotations",
+            }), encoding="utf-8")
+
+            changed = _scrub_run_query_secrets_after_capture(layout)
+
+            self.assertGreaterEqual(changed, 2)
+            expected = hashlib.sha256(source.read_bytes()).hexdigest()
+            manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(manifest_payload["source_script_sha256"], expected)
+            annotations_payload = json.loads(run_annotations.read_text(encoding="utf-8"))
+            self.assertEqual(annotations_payload["source_script_sha256"], expected)
+
+    def test_resume_replica_build_fails_closed_when_scrub_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = create_run_layout(Path(tmp), "fixture", "run_legacy")
+            controller = SimpleNamespace(
+                run_id="run_legacy",
+                operation="replica-build",
+                _issue=lambda event: None,
+            )
+            with patch(
+                "pipeline_orchestrator._scrub_run_query_secrets_after_capture",
+                side_effect=OSError("denied"),
+            ):
+                result = run_replica_build(make_config(tmp), layout, controller)
+
+            self.assertEqual(result.status, FAILED)
+            self.assertEqual(result.error_category, "privacy_violation")
+            self.assertEqual(result.message, "resume_query_scrub_failed:OSError")
+
+    def test_full_replica_build_does_not_repeat_post_capture_scrub(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = create_run_layout(Path(tmp), "fixture", "run_full")
+            source = layout.capture_dir / "recorded.py"
+            source.write_text("# already scrubbed\n", encoding="utf-8")
+            manifest = layout.capture_dir / "manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            controller = SimpleNamespace(
+                run_id="run_full",
+                operation="full",
+                _issue=lambda event: None,
+            )
+            flow = SimpleNamespace(source_script_relpath="recorded.py")
+            entrypoint = layout.replica_dir / "index.html"
+
+            with (
+                patch(
+                    "pipeline_orchestrator._scrub_run_query_secrets_after_capture",
+                    side_effect=AssertionError("duplicate scrub"),
+                ),
+                patch("pipeline_orchestrator.read_manifest", return_value=flow),
+                patch("pipeline_orchestrator.build_from_manifest", return_value=entrypoint),
+            ):
+                result = run_replica_build(make_config(tmp), layout, controller)
+
+            self.assertEqual(result.status, SUCCESS)
+            self.assertEqual(result.metrics["query_secret_files_scrubbed"], 0)
 
 
 class StageOrderTests(unittest.TestCase):

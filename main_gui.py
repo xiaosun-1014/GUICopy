@@ -55,6 +55,7 @@ from PyQt6.QtWidgets import (
 )
 
 from agent import parse_markers
+from batch_capture_replicate import classify_recording_template
 from codegen_manager import CodegenManager
 from markers import DEFAULT_MARKERS, Marker, render
 from orchestrator_events import (
@@ -89,6 +90,7 @@ SERIES_EXPAND_DEFAULT = False
 SERIES_MAX_DEFAULT = 40
 SERIES_PER_TIMEOUT_DEFAULT = 20
 SERIES_TOTAL_TIMEOUT_DEFAULT = 900
+SERIES_NOT_REQUESTED_LABEL = "仅录制序列可交互/其他序列未捕获"
 # MVP capture modes: only first_stable_frame is implemented. Do NOT expose an
 # un-implemented "all frames" option as selectable.
 SERIES_CAPTURE_MODES = ("first_stable_frame",)
@@ -119,6 +121,15 @@ def normalize_ftimage_codegen(source: str) -> str:
     source = source.replace(
         'page.get_by_role("link", description="Tags", exact=True).click()',
         'page.locator("#moreBox a.tool.tool-tags").click()',
+    )
+    # Recent codegen emits a role locator followed by a text filter. Restrict
+    # this rewrite to the exact Tags receiver so unrelated filtered links keep
+    # their recorded semantics; the data-tool attribute is stable across the
+    # More popover's re-rendering.
+    source = re.sub(
+        r'''(?m)^(?P<indent>[ \t]*)page\.get_by_role\(\s*(["'])link\2\s*\)\.filter\(\s*has_text\s*=\s*(["'])Tags\3\s*\)\.click\(\s*\)\s*$''',
+        r'''\g<indent>page.locator("a.tool.tool-tags[data-tool='tags']").click()''',
+        source,
     )
     return source.replace(
         'page.get_by_role("link").filter(has_text=re.compile(r"^$")).click()',
@@ -500,6 +511,10 @@ class MainWindow(QMainWindow):
         self._marker_tracker = MarkerTracker()
         # Phase 8: series expansion progress (discovered/captured/partial/failed).
         self._series_tracker = SeriesTracker()
+        # Auto-opt into expansion once, when the editor first becomes a complete
+        # series template.  Keeping this latch separate from the checkbox means
+        # a user's later manual uncheck is never undone by textChanged.
+        self._series_template_auto_checked = False
 
         # ---- 数据模型：有序行列表 ----
         # 每项: {"type": "codegen"|"marker", "text": str}
@@ -838,7 +853,7 @@ class MainWindow(QMainWindow):
         self._pipeline_cancel_requested = False
         self._marker_tracker = MarkerTracker()
         self._series_tracker = SeriesTracker()
-        self.series_status_label.setText("")
+        self._sync_series_controls()
 
         process = QProcess(self)
         process.setProgram(interpreter)
@@ -1110,8 +1125,10 @@ class MainWindow(QMainWindow):
         ):
             control.setEnabled(enabled)
         if not enabled:
-            self.series_status_label.setText("")
+            self.series_status_label.setText(SERIES_NOT_REQUESTED_LABEL)
             self._series_tracker = SeriesTracker()
+        else:
+            self.series_status_label.setText("")
 
     def series_config_args(self) -> list[str]:
         """Return the CLI args for series expansion (empty when disabled).
@@ -1149,6 +1166,10 @@ class MainWindow(QMainWindow):
         self._show_status(f"离线复刻序列探索：{label}", 5000)
 
     def _on_clear(self) -> None:
+        # A clear starts a fresh recording/template cycle.  Reset the
+        # auto-check latch so a complete template entered after clearing can
+        # opt in again; the checkbox itself remains the user's current choice.
+        self._series_template_auto_checked = False
         self._display_items.clear()
         self._marker_anchors.clear()
         self._panel_initialized = False
@@ -1160,8 +1181,29 @@ class MainWindow(QMainWindow):
     def _on_text_changed(self) -> None:
         """Synchronize live source and debounce annotation parsing."""
         self._latest_code = self.code_view.toPlainText()
+        self._maybe_auto_enable_series_expansion()
         self._update_export_enabled()
         self._annotation_refresh_timer.start()
+
+    def _maybe_auto_enable_series_expansion(self) -> None:
+        """Auto-enable all-series exploration for the first complete template.
+
+        The static action plan is intentionally parsed without GUI annotations:
+        while the user is editing, annotations can be temporarily stale even
+        though the source already contains a valid series/open/close template.
+        """
+        if self._series_template_auto_checked:
+            return
+        try:
+            plan = parse_action_plan(self._latest_code)
+            complete = classify_recording_template(plan).complete
+        except (SyntaxError, ValueError):
+            return
+        if not complete:
+            return
+        self._series_template_auto_checked = True
+        if not self.expand_all_series_chk.isChecked():
+            self.expand_all_series_chk.setChecked(True)
 
     def _set_editor_source(self, source: str) -> None:
         """Atomically synchronize the editor and both line/marker data models."""

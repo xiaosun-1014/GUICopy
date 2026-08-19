@@ -99,6 +99,15 @@ def run_preflight(config: PipelineConfig) -> PreflightResult:
         config.storage_state is None or not config.storage_state.is_file()
     ):
         errors.append("storage_state_missing")
+    has_series_selection = any(
+        " ".join(str(name).split()).casefold() == "序列选择"
+        for name in marker_names
+    )
+    if has_series_selection and not config.expand_all_series:
+        # A recording can still be replayed for the series it explicitly
+        # selected, but the user should not mistake that for all-series
+        # coverage.  This is advisory only; it must not fail preflight.
+        warnings.append("series_expansion_not_requested")
     if config.expand_all_series and plan is not None:
         _validate_expansion_plan(plan, config, errors, warnings)
     config.output_root.mkdir(parents=True, exist_ok=True)

@@ -1,12 +1,25 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from process_runner import ManagedProcess
 from runtime_python import codegen_python_executable
 
 
 class ManagedProcessTests(unittest.TestCase):
+    def test_windows_taskkill_output_is_not_text_decoded(self):
+        runner = ManagedProcess(["unused"])
+        runner._process = SimpleNamespace(
+            pid=123,
+            poll=lambda: None,
+            wait=lambda timeout=None: 0,
+        )
+        with patch("process_runner.os.name", "nt"), patch("process_runner.subprocess.run") as run:
+            runner._terminate_tree()
+        self.assertFalse(run.call_args.kwargs["text"])
+
     def test_reads_stdout_and_stderr_without_deadlock(self):
         code = (
             "import sys\n"

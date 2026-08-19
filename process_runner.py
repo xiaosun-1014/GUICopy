@@ -237,7 +237,9 @@ class ManagedProcess:
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],
                 check=False,
                 capture_output=True,
-                text=True,
+                # taskkill uses the Windows console code page. Keep bytes so
+                # timeout cleanup cannot raise a secondary UTF-8 decode error.
+                text=False,
             )
         else:
             os.killpg(process.pid, signal.SIGTERM)

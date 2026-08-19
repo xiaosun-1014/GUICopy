@@ -325,6 +325,11 @@ class SeriesTracker:
             "captured": captured,
             "partial": partial,
             "failed": failed,
+            "count_conserved": bool(
+                self._active
+                and self._expansion_completed
+                and captured + partial + failed == discovered
+            ),
             "reached_end": bool(reached_end),
             "expansion_completed": self._expansion_completed,
             "warning": self._warning,

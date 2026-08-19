@@ -149,6 +149,33 @@ class SeriesCoverageReportTests(unittest.TestCase):
             self.assertEqual(coverage["discovered"], 0)
             self.assertEqual(coverage["branches"], [])
 
+    def test_report_warns_when_series_selection_did_not_request_expansion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "processed_fixture.py"
+            source.write_text(
+                '# [MARKER: 序列选择]\npage.locator("#series").click()\n',
+                encoding="utf-8",
+            )
+            config = PipelineConfig(
+                hospital="fixture",
+                source_script=source,
+                annotations_path=root / "annotations.json",
+                output_root=root,
+            )
+            layout = create_run_layout(root, "fixture", "run-sc-warning")
+            json_path, _ = write_pipeline_report(
+                layout,
+                config,
+                [StageResult(PipelineStage.REPLICA_VALIDATION, PipelineStatus.SUCCESS)],
+            )
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+        self.assertIn("series_expansion_not_requested", payload["warnings"])
+        self.assertEqual(
+            payload["series_coverage"]["warning"],
+            "series_expansion_not_requested",
+        )
+
     @staticmethod
     def _coverage_payload() -> dict:
         return {
@@ -185,6 +212,125 @@ class SeriesCoverageReportTests(unittest.TestCase):
             self.assertEqual(coverage["discovered"], 2)
             self.assertEqual(coverage["captured"], 1)
             self.assertEqual(coverage["partial"], 1)
+
+    def test_replica_build_recovers_series_coverage_from_capture_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = create_run_layout(Path(tmp), "fixture", "run-sc-resume")
+            manifest_dir = layout.capture_dir / "series_branches"
+            manifest_dir.mkdir(parents=True)
+            branches = [
+                {
+                    "branch_id": f"safe-{index}",
+                    "ordinal": index,
+                    "capture_status": "captured",
+                    "series_key_sha256": "secret-not-for-report",
+                    "metadata_captured": True,
+                }
+                for index in range(8)
+            ]
+            (manifest_dir / "series_capture_manifest.json").write_text(
+                json.dumps({
+                    "discovered_count": 8,
+                    "captured_count": 8,
+                    "partial_count": 0,
+                    "failed_count": 0,
+                    "skipped_count": 0,
+                    "count_conserved": True,
+                    "reached_end": True,
+                    "overall_ok": True,
+                    "warning": None,
+                    "branches": branches,
+                }),
+                encoding="utf-8",
+            )
+
+            json_path, _ = write_pipeline_report(
+                layout,
+                BRIEF_CONFIG,
+                [StageResult(PipelineStage.REPLICA_VALIDATION, PipelineStatus.SUCCESS)],
+            )
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            coverage = payload["series_coverage"]
+
+            self.assertEqual(coverage["status"], "complete")
+            self.assertEqual((coverage["discovered"], coverage["captured"]), (8, 8))
+            self.assertTrue(coverage["count_conserved"])
+            self.assertEqual(
+                set(coverage["branches"][0]),
+                {"branch_id", "ordinal", "status", "stage"},
+            )
+            self.assertNotIn("secret-not-for-report", json.dumps(payload))
+
+    def test_resume_recovers_skipped_branches_as_partial_with_conserved_counts(self):
+        """Skipped terminals (budget/duplicate tails) must fold into ``partial``
+        on the resume path, exactly as the live tracker folds them into the
+        ``series_capture_partial`` event stream. Public counts stay conserved and
+        branch status rows normalize to ``partial`` while ``stage`` retains the
+        original skip reason."""
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = create_run_layout(Path(tmp), "fixture", "run-sc-skips")
+            manifest_dir = layout.capture_dir / "series_branches"
+            manifest_dir.mkdir(parents=True)
+            branches = [
+                {
+                    "branch_id": f"safe-{index}",
+                    "ordinal": index,
+                    "capture_status": status,
+                    "fail_stage": stage,
+                }
+                for index, (status, stage) in enumerate([
+                    ("captured", ""),
+                    ("captured", ""),
+                    ("skipped_budget", "budget"),
+                    ("skipped_duplicate", "duplicate"),
+                    ("partial", "metadata_timeout"),
+                    ("failed", "transaction"),
+                ])
+            ]
+            (manifest_dir / "series_capture_manifest.json").write_text(
+                json.dumps({
+                    "discovered_count": 6,
+                    "captured_count": 2,
+                    "partial_count": 1,
+                    "failed_count": 1,
+                    "skipped_count": 2,
+                    "count_conserved": True,
+                    "reached_end": True,
+                    "overall_ok": False,
+                    "warning": "series_budget_exhausted",
+                    "branches": branches,
+                }),
+                encoding="utf-8",
+            )
+
+            json_path, _ = write_pipeline_report(
+                layout,
+                BRIEF_CONFIG,
+                [StageResult(PipelineStage.REPLICA_VALIDATION, PipelineStatus.SUCCESS)],
+            )
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            coverage = payload["series_coverage"]
+
+            # 2 captured + 1 native partial + 2 skipped = 3 partial, 1 failed.
+            self.assertEqual(coverage["captured"], 2)
+            self.assertEqual(coverage["partial"], 3)
+            self.assertEqual(coverage["failed"], 1)
+            # Conservation holds the same way the live tracker reports it
+            # (captured + partial + failed == discovered).
+            self.assertTrue(coverage["count_conserved"])
+            # Skipped terminals are never the public entry status `complete`.
+            self.assertEqual(coverage["status"], "partial")
+
+            by_branch = {b["branch_id"]: b for b in coverage["branches"]}
+            self.assertEqual(by_branch["safe-2"]["status"], "partial")
+            self.assertEqual(by_branch["safe-2"]["stage"], "budget")
+            self.assertEqual(by_branch["safe-3"]["status"], "partial")
+            self.assertEqual(by_branch["safe-3"]["stage"], "duplicate")
+            self.assertEqual(by_branch["safe-4"]["status"], "partial")
+            self.assertEqual(by_branch["safe-4"]["stage"], "metadata_timeout")
+            self.assertEqual(by_branch["safe-5"]["status"], "failed")
+            # Stage holds the original skip reason, never a bare "partial".
+            self.assertNotIn("skipped_", json.dumps(by_branch["safe-2"]))
 
     def test_report_coverage_branches_expose_only_safe_fields(self):
         with tempfile.TemporaryDirectory() as tmp:

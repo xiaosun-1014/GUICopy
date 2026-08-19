@@ -110,6 +110,19 @@ page.get_by_role("link").filter(has_text=re.compile(r"^$")).click()
         self.assertIn('page.locator("#tagsBox a.close").click()', normalized)
         self.assertNotIn('page.locator("a.tool.tool-tags").click()', normalized)
 
+    def test_ftimage_filtered_tags_action_uses_data_tool_selector(self):
+        source = '''page.goto("https://yyx.ftimage.cn/dimage/index.html")
+page.get_by_role('link').filter(has_text='Tags').click()
+'''
+
+        normalized = normalize_ftimage_codegen(source)
+
+        self.assertIn(
+            'page.locator("a.tool.tool-tags[data-tool=\'tags\']").click()',
+            normalized,
+        )
+        self.assertNotIn("filter(has_text='Tags')", normalized)
+
     def test_preserve_entry_url_replaces_only_first_page_navigation(self):
         source = '''page.goto("https://example.test/redirected")
 page.goto("https://example.test/user-navigation")
@@ -372,6 +385,56 @@ class SeriesExpansionGuiTests(unittest.TestCase):
         self.assertFalse(self.window.max_series_spin.isEnabled())
         self.assertFalse(self.window.per_series_timeout_spin.isEnabled())
         self.assertFalse(self.window.total_series_timeout_spin.isEnabled())
+        self.assertEqual(
+            self.window.series_status_label.text(),
+            "仅录制序列可交互/其他序列未捕获",
+        )
+
+    def test_complete_template_auto_enables_series_expansion_once(self):
+        source = '''page.goto("https://example.test")
+# [MARKER: 序列选择]
+page.locator("#series").click()
+# [MARKER: Meta 信息工具]
+page.locator("#meta-open").click()
+# [MARKER: Meta 信息工具]
+page.locator("#meta-close").click()
+'''
+        self.window.code_view.setPlainText(source)
+        self.assertTrue(self.window.expand_all_series_chk.isChecked())
+
+        # A user opt-out is sticky; a later textChanged for the same complete
+        # template must not silently opt back in.
+        self.window.expand_all_series_chk.setChecked(False)
+        self.window._on_text_changed()
+        self.assertFalse(self.window.expand_all_series_chk.isChecked())
+        self.assertEqual(
+            self.window.series_status_label.text(),
+            "仅录制序列可交互/其他序列未捕获",
+        )
+
+    def test_clear_resets_template_auto_check_and_user_override(self):
+        source = '''page.goto("https://example.test")
+# [MARKER: 序列选择]
+page.locator("#series").click()
+# [MARKER: Meta 信息工具]
+page.locator("#meta-open").click()
+# [MARKER: Meta 信息工具]
+page.locator("#meta-close").click()
+'''
+        self.window.code_view.setPlainText(source)
+        self.assertTrue(self.window.expand_all_series_chk.isChecked())
+
+        # The manual opt-out is sticky for this template until a clear starts
+        # a new recording cycle.
+        self.window.expand_all_series_chk.setChecked(False)
+        self.window._on_text_changed()
+        self.assertFalse(self.window.expand_all_series_chk.isChecked())
+
+        self.window._on_clear()
+        self.assertFalse(self.window._series_template_auto_checked)
+
+        self.window.code_view.setPlainText(source)
+        self.assertTrue(self.window.expand_all_series_chk.isChecked())
 
     def test_capture_mode_only_offers_implemented_first_stable_frame(self):
         self.assertEqual(self.window.viewer_capture_mode_combo.count(), 1)

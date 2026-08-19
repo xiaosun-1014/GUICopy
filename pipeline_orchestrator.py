@@ -184,24 +184,29 @@ def _scrub_run_query_secrets_after_capture(layout: RunLayout) -> int:
                     newline="\n",
                 )
                 changed += 1
-    source_files = sorted(layout.source_dir.glob("*.py"))
-    if len(source_files) == 1:
-        source_hash = sha256_file(source_files[0])
-        for annotations_path in sorted(layout.source_dir.glob("*.json")):
-            try:
-                annotations = json.loads(annotations_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if not isinstance(annotations, dict) or "source_script_sha256" not in annotations:
-                continue
-            if annotations.get("source_script_sha256") != source_hash:
-                annotations["source_script_sha256"] = source_hash
-                annotations_path.write_text(
-                    json.dumps(annotations, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                    newline="\n",
-                )
-                changed += 1
+            # The scrubbed source copy in the run root is the single durable
+            # origin for every run-internal ``source_script_sha256``. The old
+            # implementation only refreshed annotations when ``source_dir`` held
+            # exactly one ``.py``; that assumption fails for legacy runs whose
+            # ``source/`` is empty, silently leaving stale hashes. Anchor on the
+            # manifest's own ``source_script_relpath`` instead, and only touch
+            # run-internal ``source/*.json`` that already carry the field — never
+            # external ``out/{hospital}/*.json`` user annotations.
+            for annotations_path in sorted(layout.source_dir.glob("*.json")):
+                try:
+                    annotations = json.loads(annotations_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(annotations, dict) or "source_script_sha256" not in annotations:
+                    continue
+                if annotations.get("source_script_sha256") != current_hash:
+                    annotations["source_script_sha256"] = current_hash
+                    annotations_path.write_text(
+                        json.dumps(annotations, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                        newline="\n",
+                    )
+                    changed += 1
     return changed
 
 
@@ -451,6 +456,22 @@ def run_replica_build(
     """Build the local replica from an already-captured manifest (in-process)."""
     manifest_path = manifest_path or (layout.capture_dir / "manifest.json")
 
+    # Runs captured before post-capture query scrubbing was introduced can still
+    # contain credential-bearing URLs. Resume must migrate those artifacts before
+    # reading or rebuilding them; suppressing the privacy validator would leave
+    # the secret in the run tree.
+    scrubbed_files = 0
+    if getattr(controller, "operation", "replica-build") == "replica-build":
+        try:
+            scrubbed_files = _scrub_run_query_secrets_after_capture(layout)
+        except Exception as exc:  # noqa: BLE001 - unsafe artifacts must stop rebuild
+            return StageResult(
+                PipelineStage.REPLICA_BUILD,
+                PipelineStatus.FAILED,
+                "privacy_violation",
+                f"resume_query_scrub_failed:{type(exc).__name__}",
+            )
+
     def child_emit(event: dict) -> None:
         controller._issue(
             normalize_child_event(event, "building_replica", controller.run_id)
@@ -480,6 +501,7 @@ def run_replica_build(
         PipelineStage.REPLICA_BUILD,
         PipelineStatus.SUCCESS,
         artifacts={"entrypoint": str(entrypoint)},
+        metrics={"query_secret_files_scrubbed": scrubbed_files},
     )
 
 

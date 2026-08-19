@@ -31,6 +31,7 @@ class ReplicaTopologyTests(unittest.TestCase):
             self.assertEqual(inner.frame_selector, "#image-frame")
             self.assertEqual(inner.frame_name, "imageFrame")
             self.assertEqual(inner.parent_document_id, next(document.document_id for document in main_documents if document.frame_name == "viewerHost"))
+            self.assertEqual(Path(inner.screenshot_asset_relpath).suffix, ".jpeg")
             self.assertTrue((Path(tmp) / inner.screenshot_asset_relpath).exists())
             self.assertTrue((Path(tmp) / inner.screenshot_asset_relpath).with_suffix(".jpeg").exists())
             with Image.open(Path(tmp) / inner.screenshot_asset_relpath) as image:

@@ -46,7 +46,16 @@ def wait_for_pre_action_state(
             target.wait_for(state="visible", timeout=30000)
             target.click(trial=True, timeout=30000)
         except Exception:
-            pass
+            replay = _viewer_config_for(page).get("replay") or {}
+            if replay.get("reload_on_missing_report_target"):
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_timeout(int(replay.get("reload_settle_ms") or 0))
+                    target = locator_factory()
+                    target.wait_for(state="visible", timeout=30000)
+                    target.click(trial=True, timeout=30000)
+                except Exception:
+                    pass
     if marker_label != "序列选择":
         return
     try:
@@ -106,28 +115,58 @@ def _wait_for_report_popup_state(
     timeout_s: float = 30.0,
     stable_s: float = 1.0,
 ) -> bool:
-    """Wait for a newly opened viewer page to finish rendering its first image."""
-    try:
-        popup_pages = [candidate for candidate in page.context.pages if candidate is not page]
-    except Exception:
-        return False
-    if not popup_pages:
-        return True
+    """Wait for a newly opened viewer page to render a stable non-blank image.
+
+    Popup creation and viewer iframe mounting are both asynchronous.  Refresh
+    ``context.pages`` on every poll so a popup that appears after the first
+    iteration is observed, and never treat an absent popup as success.  The
+    readiness probe scans the popup main frame *and* child frames, then couples
+    viewer semantics with a non-uniform screenshot whose content stays stable
+    for the requested interval.
+    """
     deadline = time.monotonic() + timeout_s
     warmup_s = min(20.0, timeout_s / 3.0)
     viewer_seen_since: float | None = None
     stable_since: float | None = None
+    stable_signature: str | None = None
+
+    def pause() -> None:
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining <= 0:
+            return
+        milliseconds = min(250, max(1, int(remaining * 1000)))
+        try:
+            page.wait_for_timeout(milliseconds)
+        except Exception:
+            time.sleep(milliseconds / 1000.0)
+
     while time.monotonic() < deadline:
+        try:
+            context_pages = list(getattr(page.context, "pages", []) or [])
+        except Exception:
+            context_pages = []
+        popup_pages = [candidate for candidate in context_pages if candidate is not page]
+        if not popup_pages:
+            viewer_seen_since = None
+            stable_since = None
+            stable_signature = None
+            pause()
+            continue
+
         dom_ready = False
         ready_frame = None
+        ready_popup = None
         for popup in popup_pages:
             try:
-                frames = popup.frames[1:]
+                # ``frames`` includes the popup's main document.  Some viewers
+                # render directly there while others mount the actual canvas in
+                # one or more child iframes.
+                frames = list(popup.frames)
             except Exception:
                 continue
             for frame in frames:
                 try:
-                    dom_ready = bool(frame.evaluate(
+                    readiness = frame.evaluate(
                         """() => {
                             const visibleArea = element => {
                                 const style = getComputedStyle(element);
@@ -139,18 +178,33 @@ def _wait_for_report_popup_state(
                                 .some(element => visibleArea(element) >= 1000);
                             const imageReady = Array.from(document.querySelectorAll('img, video'))
                                 .some(element => visibleArea(element) >= 10000);
-                            return document.readyState !== 'loading'
-                                && (canvasReady || imageReady);
+                            const viewerReady = Array.from(document.querySelectorAll(
+                                'iframe, canvas, img, video, [data-viewer], [id*="viewer" i], '
+                                + '[class*="viewer" i], [class*="cornerstone" i]'
+                            )).some(element => visibleArea(element) >= 1000);
+                            return {
+                                ready: document.readyState !== 'loading'
+                                    && viewerReady && (canvasReady || imageReady),
+                                viewerReady,
+                                rendered: canvasReady || imageReady,
+                            };
                         }"""
-                    ))
+                    )
+                    dom_ready = bool(
+                        readiness.get("ready")
+                        if isinstance(readiness, dict)
+                        else readiness
+                    )
                 except Exception:
                     dom_ready = False
                 if dom_ready:
                     ready_frame = frame
+                    ready_popup = popup
                     break
             if dom_ready:
                 break
         ready = False
+        sample_signature: str | None = None
         if dom_ready and ready_frame is not None:
             viewer_seen_since = viewer_seen_since or time.monotonic()
             try:
@@ -165,26 +219,38 @@ def _wait_for_report_popup_state(
                         largest = candidate
                         largest_area = area
                 target = largest if largest is not None else ready_frame.locator("html")
-                screenshot = target.screenshot(type="png")
+                screenshot = target.screenshot(type="jpeg", quality=95)
                 with Image.open(io.BytesIO(screenshot)) as image:
                     grayscale = image.convert("L").resize((160, 90))
                     ready = ImageStat.Stat(grayscale).stddev[0] >= 2.0
+                    if ready:
+                        frame_url = str(getattr(ready_frame, "url", "") or "")
+                        popup_url = str(getattr(ready_popup, "url", "") or "")
+                        sample_signature = hashlib.sha256(
+                            f"{popup_url}|{frame_url}".encode("utf-8")
+                            + grayscale.tobytes()
+                        ).hexdigest()
             except Exception:
                 ready = False
         else:
             viewer_seen_since = None
+            stable_since = None
+            stable_signature = None
         now = time.monotonic()
         warmed_up = (
             viewer_seen_since is not None
             and now - viewer_seen_since >= warmup_s
         )
-        if ready and warmed_up:
-            stable_since = stable_since or now
-            if now - stable_since >= stable_s:
+        if ready and warmed_up and sample_signature is not None:
+            if sample_signature != stable_signature:
+                stable_signature = sample_signature
+                stable_since = now
+            elif stable_since is not None and now - stable_since >= stable_s:
                 return True
         else:
             stable_since = None
-        page.wait_for_timeout(250)
+            stable_signature = None
+        pause()
     return False
 
 
@@ -192,18 +258,19 @@ def ensure_post_action_state(
     page: object,
     marker_label: str,
     locator_factory: object | None = None,
-    timeout_s: float = 10.0,
+    timeout_s: float | None = None,
     stable_s: float = 1.0,
 ) -> None:
     """Retry a series transition once when the recorded dblclick did not change UI state."""
     if marker_label == "报告截图":
         if not _wait_for_report_popup_state(
             page,
-            timeout_s=max(timeout_s, 60.0),
+            timeout_s=60.0 if timeout_s is None else timeout_s,
             stable_s=stable_s,
         ):
             raise TimeoutError("viewer popup did not render non-blank content")
         return
+    effective_timeout_s = 10.0 if timeout_s is None else timeout_s
     if marker_label == "Meta 信息工具":
         if not callable(locator_factory):
             return
@@ -212,7 +279,7 @@ def ensure_post_action_state(
                 return
         except Exception:
             return
-        if wait_for_metadata_panel_state(page, locator_factory, timeout_s, stable_s):
+        if wait_for_metadata_panel_state(page, locator_factory, effective_timeout_s, stable_s):
             return
         # The panel never stabilized (or its container is not matched by the
         # candidate selectors). Do NOT raise here: raising would abort the
@@ -222,11 +289,11 @@ def ensure_post_action_state(
         # empty / unrendered panel state, which is no worse than the legacy
         # behavior that never waited for metadata at all.
         return
-    if wait_for_post_action_state(page, marker_label, timeout_s, stable_s):
+    if wait_for_post_action_state(page, marker_label, effective_timeout_s, stable_s):
         return
     if marker_label == "序列选择" and callable(locator_factory):
         locator_factory().dblclick()
-        if wait_for_post_action_state(page, marker_label, timeout_s, stable_s):
+        if wait_for_post_action_state(page, marker_label, effective_timeout_s, stable_s):
             return
     raise TimeoutError(f"post-action state did not stabilize for marker: {marker_label}")
 
@@ -375,9 +442,36 @@ def _emit_series_event(event: dict[str, object]) -> None:
 _SERIES_VIEWERS_YAML = Path(__file__).resolve().parents[0] / "skills" / "_shared" / "viewers.yaml"
 
 
+def _viewer_config_for(page: object) -> dict[str, object]:
+    """Return the viewer registry entry matching this page or its popup context.
+
+    Popup viewers may expose the hospital URL on either the opener or popup, so
+    both the active page and sibling context pages participate in matching. Any
+    registry/read failure degrades to ``{}``.
+    """
+    try:
+        urls = [str(getattr(page, "url", "") or "")]
+        context = getattr(page, "context", None)
+        for candidate in list(getattr(context, "pages", []) or []):
+            candidate_url = str(getattr(candidate, "url", "") or "")
+            if candidate_url and candidate_url not in urls:
+                urls.append(candidate_url)
+        with open(_SERIES_VIEWERS_YAML, "r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+        viewers = (data or {}).get("viewers") or {}
+        for _name, viewer in viewers.items():
+            if not isinstance(viewer, dict):
+                continue
+            patterns = viewer.get("url_patterns") or []
+            if any(pattern and str(pattern) in url for pattern in patterns for url in urls):
+                return viewer
+    except Exception:
+        return {}
+    return {}
+
+
 def _series_viewer_config_for(page: object) -> dict[str, object]:
-    """Match a live ``page`` URL against skills/_shared/viewers.yaml and return
-    the per-viewer series-discovery configuration.
+    """Return the matched viewer's series-discovery configuration.
 
     Returns ``{'item_container_selector','item_selector','identity_attrs'}``
     (only the keys present in the matched viewer's ``sequence_select``) so the
@@ -388,28 +482,13 @@ def _series_viewer_config_for(page: object) -> dict[str, object]:
     unreadable page URL) also yields ``{}`` so a broken config can never abort
     capture.
     """
-    try:
-        url = getattr(page, "url", None)
-        if not url:
-            return {}
-        viewers_path = _SERIES_VIEWERS_YAML
-        with open(viewers_path, "r", encoding="utf-8") as handle:
-            data = yaml.safe_load(handle)
-        viewers = (data or {}).get("viewers") or {}
-        for _name, viewer in viewers.items():
-            if not isinstance(viewer, dict):
-                continue
-            patterns = viewer.get("url_patterns") or []
-            if any(pattern and str(pattern) in str(url) for pattern in patterns):
-                sequence_select = viewer.get("sequence_select") or {}
-                cfg: dict[str, object] = {}
-                for key in ("item_container_selector", "item_selector", "identity_attrs"):
-                    if key in sequence_select and sequence_select.get(key) is not None:
-                        cfg[key] = sequence_select[key]
-                return cfg
-    except Exception:
-        return {}
-    return {}
+    viewer = _viewer_config_for(page)
+    sequence_select = viewer.get("sequence_select") or {}
+    cfg: dict[str, object] = {}
+    for key in ("item_container_selector", "item_selector", "identity_attrs"):
+        if key in sequence_select and sequence_select.get(key) is not None:
+            cfg[key] = sequence_select[key]
+    return cfg
 
 
 def _capture_series_list_full(
@@ -428,6 +507,7 @@ def _capture_series_list_full(
     ``(asset_relpath_relative_to_capture_root, content_height)``, or
     ``(None, 0)`` when the container does not overflow its window.
     """
+    metrics: dict[str, object] | None = None
     try:
         metrics = root_locator.evaluate(
             "el => ({top: el.scrollTop, clientH: el.clientHeight, scrollH: el.scrollHeight})"
@@ -446,12 +526,7 @@ def _capture_series_list_full(
         for index in range(steps):
             root_locator.evaluate("el => el.scrollTop = %d" % (index * client_h))
             page.wait_for_timeout(120)
-            tiles.append(root_locator.screenshot(type="png"))
-        root_locator.evaluate("""el => {
-            el.scrollTop = 0;
-            const s = document.getElementById('__replica_noscrollbar');
-            if (s) s.remove();
-        }""")
+            tiles.append(root_locator.screenshot(type="jpeg", quality=95))
         widths = {Image.open(io.BytesIO(tile)).size[0] for tile in tiles}
         width = max(widths) if widths else 0
         canvas = Image.new("RGB", (width, int(metrics["scrollH"])), (3, 6, 9))
@@ -468,6 +543,19 @@ def _capture_series_list_full(
         return rel, int(metrics["scrollH"])
     except Exception:
         return None, 0
+    finally:
+        if metrics is not None:
+            try:
+                root_locator.evaluate(
+                    """(el, originalTop) => {
+                        el.scrollTop = originalTop;
+                        const s = document.getElementById('__replica_noscrollbar');
+                        if (s) s.remove();
+                    }""",
+                    metrics["top"],
+                )
+            except Exception:
+                pass
 
 
 def _series_scope_root(target_locator: object, container_selector: str | None = None) -> object:
@@ -532,7 +620,7 @@ def _canvas_hash_or_none(page: object) -> int | None:
 
 
 def _canvas_png_or_none(page: object) -> bytes | None:
-    """Return the largest visible canvas PNG (or None), for visual stability sampling.
+    """Return the largest visible canvas JPEG (or None), for stability sampling.
 
     ⚠ Dapeng viewer 的页面里有 38 个 68×68 序列缩略图 canvas ——「最大 canvas」
     会截到缩略图而非主影像。这是视觉稳定性采样用（点击后画布是否变化），
@@ -561,13 +649,13 @@ def _canvas_png_or_none(page: object) -> bytes | None:
     if best is None:
         best = page.locator("canvas").nth(0)
     try:
-        return best.screenshot(type="png")
+        return best.screenshot(type="jpeg", quality=95)
     except Exception:
         return None
 
 
 def _html_root_png_or_none(scope: object) -> bytes | None:
-    """Return a full-page PNG of the viewer scope's ``<html>`` root (or None).
+    """Return a full-page JPEG of the viewer scope's ``<html>`` root (or None).
 
     布局变体背景用这个而不是单个 canvas：Dapeng 的主影像画布是 div 背景 /
     svg 容器，不是大 canvas；截 html 根得到整个 1×1/2×2 布局的完整画面
@@ -578,13 +666,13 @@ def _html_root_png_or_none(scope: object) -> bytes | None:
         html_root = scope.locator("html")
         if html_root.count() == 0:
             return None
-        return html_root.first.screenshot(type="png", animations="disabled")
+        return html_root.first.screenshot(type="jpeg", quality=95, animations="disabled")
     except Exception:
         return None
 
 
 def _save_png_by_hash(png_bytes: bytes, capture_root: Path, document_id: str, variant_id: str) -> str | None:
-    """Persist a layout background PNG under ``assets/by-hash/<sha256>.jpeg``.
+    """Persist layout image bytes under ``assets/by-hash/<sha256>.jpeg``.
 
     返回相对 ``capture_root`` 的 relpath；失败返回 None。复用 capture_page_topology 的
     by-hash 落盘语义：JPEG + SHA-256 命名，重复内容只存一份。
@@ -614,7 +702,7 @@ def _sample_layout_background(
     """Sample one layout variant's stable viewer background, saving by-hash.
 
     轮询等待画布稳定：``canvas.width > 0``（画布已重建）是前置条件；满足后连续两次
-    PNG（像素级）不可变即稳定。上限 ``stability_timeout_s``，超时返回 None（该变体失败，
+    JPEG（像素级）不可变即稳定。上限 ``stability_timeout_s``，超时返回 None（该变体失败，
     不入 ``layout_variants``，绝不阻断整个 marker 组）。
     """
     deadline = time.monotonic() + stability_timeout_s
@@ -666,6 +754,7 @@ def _sample_all_layout_variants(
     capture_root: Path,
     log: Callable[[str], None] = lambda message: sys.stderr.write(message + "\n"),
     viewer_scope: object | None = None,
+    layout_toggle: object | None = None,
 ) -> tuple[dict[str, str], str]:
     """(步骤 2) 连点采样所有可见布局选项的背景帧，回填 ``layout_variants``。
 
@@ -703,9 +792,33 @@ def _sample_all_layout_variants(
     except Exception as exc:
         log(f"layout capture error: {type(exc).__name__}: {exc}")
         return variants, raw_default
+    def ensure_menu_open() -> bool:
+        visible_check = getattr(layout_root, "is_visible", None)
+        if not callable(visible_check):
+            return True
+        try:
+            if visible_check():
+                return True
+        except Exception:
+            pass
+        if layout_toggle is None:
+            return False
+        try:
+            layout_toggle.click()
+            page.wait_for_timeout(100)
+            return bool(visible_check())
+        except Exception:
+            return False
+
     captured: list[str] = []
     for index in range(count):
+        # Layout popups normally close after one option is chosen. Reopen and
+        # re-resolve the collection so every option can be sampled and so the
+        # sampler does not invalidate the next recorded layout action.
+        if not ensure_menu_open():
+            continue
         try:
+            members = layout_root.locator("button, a, [role='button'], [role='menuitem'], li, [class*='cell']")
             option = members.nth(index)
         except Exception:
             continue
@@ -747,6 +860,9 @@ def _sample_all_layout_variants(
         variants[variant_id] = sampled
         if variant_id not in captured:
             captured.append(variant_id)
+    # Sampling runs after the recorded menu-open action. Leave the menu open so
+    # the following recorded option click still sees the state it expects.
+    ensure_menu_open()
     if captured and not raw_default:
         raw_default = captured[0]
     if not variants:
@@ -854,7 +970,7 @@ def _viewer_current_series_label(viewer_frame: object) -> str | None:
 def _capture_viewer_small_screenshot(frame: object) -> bytes | None:
     """Return a compact PNG of the viewer frame for non-blank readiness checks."""
     try:
-        return frame.locator("html").screenshot(type="png")
+        return frame.locator("html").screenshot(type="jpeg", quality=95)
     except Exception:
         return None
 
@@ -1081,6 +1197,7 @@ class LiveCaptureSession:
                         page,
                         layout_root, target_document, capture_root,
                         viewer_scope=viewer_scope,
+                        layout_toggle=target_locator,
                     )
                     if variants:
                         target_document.layout_variants = variants
@@ -2523,6 +2640,52 @@ def capture_hook_failed(action_id: str, error: BaseException) -> None:
     print(json.dumps({"event": "action_failed", "action_id": action_id, "error": type(error).__name__}), flush=True)
 
 
+def capture_hook_should_execute(
+    action_id: str,
+    page: object,
+    locator_factory: object | None = None,
+    marker_label: str = "",
+) -> bool:
+    """Fast-gate fixed recorded actions that the live viewer cannot support.
+
+    Adapter generation deliberately preserves WL/WW actions. Replica capture,
+    however, must not spend its global budget taking repeated before snapshots
+    and waiting on controls that the matched viewer explicitly lacks. Layout
+    popups may also close while the after-hook samples variants; a missing or
+    hidden recorded option is skipped so later independent markers still run.
+    Probe errors execute the original action normally.
+    """
+    if marker_label not in {"序列布局切换", "窗宽窗位 WL/WW"}:
+        return True
+    if marker_label == "序列布局切换" and action_id.endswith("_001"):
+        # The first action opens the menu. It must retain the normal
+        # wait-for-pre-action path because Dapeng's toolbar is SPA-rendered and
+        # can legitimately be absent during this fast preflight probe.
+        return True
+    viewer = _viewer_config_for(page)
+    fixed_actions = viewer.get("fixed_actions") or {}
+    window_level = fixed_actions.get("window_level") or {}
+    reason = ""
+    if marker_label == "窗宽窗位 WL/WW" and window_level.get("supported") is False:
+        reason = "viewer_unsupported"
+    elif callable(locator_factory):
+        try:
+            locator = locator_factory()
+            if locator.count() == 0 or not locator.first.is_visible():
+                reason = "locator_unavailable"
+        except Exception:
+            return True
+    if not reason:
+        return True
+    print(json.dumps({
+        "event": "action_skipped",
+        "action_id": action_id,
+        "marker": marker_label,
+        "reason": reason,
+    }, ensure_ascii=False), flush=True)
+    return False
+
+
 def _session_from_environment() -> LiveCaptureSession | None:
     output = os.environ.get("REPLICA_CAPTURE_OUTPUT")
     if not output:
@@ -2561,35 +2724,94 @@ def instrument_marked_actions(source: str, use_storage_state: bool = False, inte
             line = action.action_args.get("_source_line")
             if isinstance(line, int):
                 actions.setdefault(line, []).append((action.action_id, action.locator.page_var if action.locator else "page", action.locator.source_expression if action.locator else None, group.marker_label))
+
+    # A popup trigger runs inside ``expect_popup`` but its viewer page is not
+    # bound until the following ``info.value`` assignment.  Deferring the
+    # trigger's after-hook until that assignment keeps the capture tied to the
+    # rendered popup instead of recording the still-empty opener state.
+    popup_after: dict[str, tuple[str, str, str]] = {}
+    popup_init_by_line: dict[int, list[str]] = {}
+    popup_after_by_line: dict[int, list[tuple[str, str, str, str]]] = {}
+    for expectation in plan.popup_expectations:
+        # ``parse_action_plan`` resolves this through AST metadata.  Do not
+        # re-parse source spelling here: annotations and parenthesized values
+        # are valid Python and multiline assignments need the statement's end
+        # line so the hook cannot be emitted inside the assignment.
+        assignment_line = expectation.result_assignment_end_line or expectation.result_assignment_line
+        for action_id in expectation.body_action_ids:
+            action = next(
+                (candidate for group in plan.marker_groups for candidate in group.actions if candidate.action_id == action_id),
+                None,
+            )
+            if action is None:
+                continue
+            flag = f"_capture_popup_after_{action_id}"
+            page_var = action.locator.page_var if action.locator else expectation.source_page_var
+            locator_source = action.locator.source_expression if action.locator else ""
+            popup_after[action_id] = (flag, page_var, locator_source)
+            popup_init_by_line.setdefault(expectation.context_line, []).append(flag)
+            if assignment_line is not None:
+                popup_after_by_line.setdefault(assignment_line, []).append(
+                    (action_id, page_var, locator_source, action.marker_id)
+                )
     if use_storage_state:
         source = source.replace("browser.new_context()", "browser.new_context(storage_state=os.environ['REPLICA_STORAGE_STATE'])")
     if interactive_auth:
         source = source.replace("chromium.launch()", "chromium.launch(headless=False)")
         source = source.replace("chromium.launch(headless=True)", "chromium.launch(headless=False)")
     source_lines = source.splitlines()
-    hook_import = "capture_hook_after, capture_hook_before, capture_hook_expand_series, capture_hook_failed" if expand else "capture_hook_after, capture_hook_before, capture_hook_failed"
+    hook_import = "capture_hook_after, capture_hook_before, capture_hook_expand_series, capture_hook_failed, capture_hook_should_execute" if expand else "capture_hook_after, capture_hook_before, capture_hook_failed, capture_hook_should_execute"
     output = ["import os" if use_storage_state else "", f"from batch_capture_replicate import {hook_import}"]
     for index, line in enumerate(source_lines, start=1):
         indent = line[: len(line) - len(line.lstrip())]
+        for flag in popup_init_by_line.get(index, []):
+            output.append(f"{indent}{flag} = False")
         line_actions = actions.get(index, [])
+        guarded_fixed_action = any(
+            marker_label in {"序列布局切换", "窗宽窗位 WL/WW"}
+            for _, _, _, marker_label in line_actions
+        )
+        action_indent = indent
+        if guarded_fixed_action:
+            action_id, page_var, locator_source, marker_label = line_actions[0]
+            factory = f", lambda: {locator_source}" if locator_source else ""
+            output.append(
+                f'{indent}if capture_hook_should_execute("{action_id}", {page_var}{factory}, {marker_label!r}):'
+            )
+            action_indent += "    "
         for action_id, page_var, locator_source, marker_label in line_actions:
             factory = f", lambda: {locator_source}" if locator_source else ""
-            output.append(f'{indent}capture_hook_before("{action_id}", {page_var}{factory}, {marker_label!r})')
+            output.append(f'{action_indent}capture_hook_before("{action_id}", {page_var}{factory}, {marker_label!r})')
         if not line_actions:
             output.append(line)
+            deferred_after = popup_after_by_line.get(index, [])
+            for action_id, page_var, locator_source, _marker_id in deferred_after:
+                flag = popup_after[action_id][0]
+                marker_label = next(
+                    group.marker_label
+                    for group in plan.marker_groups
+                    if any(action.action_id == action_id for action in group.actions)
+                )
+                factory = f", lambda: {locator_source}" if locator_source else ""
+                output.append(f"{indent}if {flag}:")
+                output.append(f'{indent}    capture_hook_after("{action_id}", {page_var}{factory}, {marker_label!r})')
             continue
-        output.append(f"{indent}try:")
-        output.append(f"{indent}    {line.lstrip()}")
-        output.append(f"{indent}except Exception as error:")
+        output.append(f"{action_indent}try:")
+        output.append(f"{action_indent}    {line.lstrip()}")
+        output.append(f"{action_indent}except Exception as error:")
         for action_id, _, _, _ in line_actions:
-            output.append(f'{indent}    capture_hook_failed("{action_id}", error)')
-        output.append(f"{indent}else:")
+            output.append(f'{action_indent}    capture_hook_failed("{action_id}", error)')
+        output.append(f"{action_indent}else:")
         for action_id, page_var, locator_source, marker_label in line_actions:
             factory = f", lambda: {locator_source}" if locator_source else ""
-            output.append(f'{indent}    capture_hook_after("{action_id}", {page_var}{factory}, {marker_label!r})')
+            deferred = popup_after.get(action_id)
+            if deferred is not None:
+                output.append(f"{action_indent}    {deferred[0]} = True")
+            else:
+                output.append(f'{action_indent}    capture_hook_after("{action_id}", {page_var}{factory}, {marker_label!r})')
             if expand and action_id == close_action_id:
                 series_factory = f"lambda: {series_src}" if series_src else "None"
-                output.append(f"{indent}    capture_hook_expand_series({page_var}, {series_factory}, {series_action_id!r}, {close_action_id!r})")
+                output.append(f"{action_indent}    capture_hook_expand_series({page_var}, {series_factory}, {series_action_id!r}, {close_action_id!r})")
     instrumented = "\n".join(line for line in output if line) + "\n"
     ast.parse(instrumented)
     return instrumented

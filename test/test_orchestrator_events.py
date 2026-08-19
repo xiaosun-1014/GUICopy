@@ -339,6 +339,7 @@ class TestSeriesTracker(unittest.TestCase):
             tracker.note(event)
         self.assertEqual(tracker.coverage()["status"], "complete")
         self.assertTrue(tracker.coverage()["reached_end"])
+        self.assertTrue(tracker.coverage()["count_conserved"])
 
     def test_coverage_partial_on_any_branch_partial(self):
         tracker = self._run(self.STREAM)
@@ -395,6 +396,7 @@ class TestSeriesTracker(unittest.TestCase):
         cov = SeriesTracker().coverage()
         self.assertFalse(cov["enabled"])
         self.assertFalse(cov["reached_end"])
+        self.assertFalse(cov["count_conserved"])
 
 
 if __name__ == "__main__":

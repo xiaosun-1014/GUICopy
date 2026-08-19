@@ -86,16 +86,15 @@ seq_name, seq_frames = select_series(page)
         ).read_text(encoding="utf-8")
 
         markers = {marker["name"]: marker for marker in agent.parse_markers(script)}
+        self.assertEqual(set(markers), {"序列选择", "Meta 信息工具"})
 
         self.assertIn('name="x 10.0_lung 共 41张"', markers["序列选择"]["raw"])
         self.assertNotIn("[MARKER: Meta 信息工具", markers["序列选择"]["raw"])
 
-        self.assertIn('#moreBox a.tool.tool-tags', markers["Meta 信息工具"]["raw"])
+        self.assertIn('get_by_title("更多")', markers["Meta 信息工具"]["raw"])
+        self.assertIn('has_text="Tags"', markers["Meta 信息工具"]["raw"])
         self.assertIn('#tagsBox a.close', markers["Meta 信息工具"]["raw"])
         self.assertNotIn("[MARKER: 窗宽窗位 WL/WW", markers["Meta 信息工具"]["raw"])
-
-        self.assertIn('page.locator("canvas").click', markers["影像画布交互"]["raw"])
-        self.assertNotIn("context.close()", markers["影像画布交互"]["raw"])
 
     def test_sequence_skill_supports_canvas_in_main_document(self):
         skill = (

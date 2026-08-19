@@ -311,9 +311,8 @@ viewer 不稳定期（探索）                          viewer 稳定期（生�
 
 **注意事项**
 - 测试/子进程一律用 `D:/Anaconda/envs/codegen-marker/python.exe`，**禁止静默回退 `sys.executable`**（系统 Python 3.7 缺 PyQt6/playwright wheel）。
-- `test_batch_capture_replicate` 在 headless 下 import 时挂起（导入 Playwright/浏览器），非代码引入。单测用：
+- `test_batch_capture_replicate` **不是 import 挂起**（实测 import 0.49s；“headless import 挂起”是过时记忆）。它整组慢是因为 70 个用例里多个**真实 Playwright 浏览器用例**（每个 15-40s，含 `async`/`sync` browser launch、`wait_for` 30s 兜底），整组累计 10+ 分钟。需要跑它时给足 timeout（如 `>600s`）或按子集跑；`unittest discover` 全量跑会因含浏览器集成测试非常慢。常用快速单测组仍用：
   `PYTHONIOENCODING=utf-8 D:/Anaconda/envs/codegen-marker/python.exe -m unittest test.test_orchestrator_events test.test_agent_marker_boundaries test.test_replica_gui -v`
-  （`unittest discover` 会含浏览器集成测试导致挂起。）
 - **triage 倾向**：实现跨事件一致、spec 单点不一致时，倾向**改 spec 文本对齐稳定代码**而非改代码（例：agent_failed 字段实现统一用 `status`、spec §4.7 误写 `reason`，最终改 spec）。
 
 ## 如何运行
