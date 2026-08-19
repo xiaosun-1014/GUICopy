@@ -15,6 +15,7 @@
   - `multi-series-activation-selector-divergence.md` — review 发现激活路径 `_locate_series_row` 漏接配置 `item_selector` 导致 FTImage 批量激活全失败；教训：发现/激活选择器必须同源、fixture 若恰好被默认选择器命中会掩盖配置断链，要同时测发现+激活两条路径
   - `nonmultimodal-backend-subagent-read-image-api500.md` — 本机代理模型非多模态（DeepSeek-V4-Flash），子代理一 Read 截图/图片就 API 500 中断且恢复后再复发；教训：看图类验证改为主会话零读图 DOM 断言（elementFromPoint / getAttribute / wait_for_url），截图只 `.jpeg` 落盘不回读
   - `zscloud-dapeng-replica-adaptation.md` — 中山 zscloud 复刻适配：Dapeng viewer（无 `#popTagText_*`）/ 分享页 SPA popup 竞态 / build 层「入口 series region 提升」+「分支 series region 挂错 document 纠偏」（`_promote_series_regions_to_earliest_documents` / `_reroute_branch_series_regions_to_viewer_documents`）/ annotation 重建
+  - `report-popup-wait-regression.md` — 报告截图 popup 等待语义收紧为「必须有 popup」导致无 popup 场景回归（9e045c3 修复）；教训：**审阅等待/收紧语义必须对照既有测试断言**，「无 X」路径别被新代码覆盖，环境能跑浏览器就要跑浏览器套件
 - **本文件（CLAUDE.md）** — 项目核心上下文，整合所有记忆的要点
 
 不再使用系统级（AppData）记忆存储。如需添加或更新记忆，直接编辑 `memory/` 下的对应文件，并同步更新 CLAUDE.md 中的相关章节。
