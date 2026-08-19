@@ -767,9 +767,10 @@ def _render_document(
             else None
         )
         for member in region.members:
-            if member.dom.attributes.get("id") in rendered_element_ids:
+            is_series_member = region.region_type == "series"
+            if member.dom.attributes.get("id") in rendered_element_ids and not is_series_member:
                 continue
-            if any(f'id="{element_id}"' in member.dom.outer_html for element_id in rendered_element_ids):
+            if any(f'id="{element_id}"' in member.dom.outer_html for element_id in rendered_element_ids) and not is_series_member:
                 continue
             if metadata_panel_html_for_region is not None and member.dom.outer_html:
                 # Sibling controls around a metadata panel are captured as
@@ -781,7 +782,7 @@ def _render_document(
                 ):
                     continue
             member_key = (member.dom.outer_html, member.dom.rect.x, member.dom.rect.y, member.dom.rect.width, member.dom.rect.height)
-            if member_key in rendered_nodes:
+            if member_key in rendered_nodes and not is_series_member:
                 continue
             series_key = None
             disabled_route = False

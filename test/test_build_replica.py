@@ -701,6 +701,115 @@ class BuildReplicaTests(unittest.TestCase):
             self.assertIn(f'data-replica-series-key="{series_key_slug("B")}"', vb)
             self.assertIn('aria-disabled="true"', vb)
 
+    def test_series_route_survives_when_row_is_also_an_action_target(self):
+        # Regression: when a captured series row is itself the activation target
+        # (a recorded dblclick that enters the branch viewer), the targets pass
+        # renders it first and would occupy the shared dedup key. The series
+        # heat-map must still be emitted so the row routes to its branch viewer
+        # in offline replay (real contract fixtures capture exactly this shape).
+        from test.test_replica_runtime import _series_list_region, _series_members, _write_assets
+
+        page_model = ReplicaPage("p_main", "page", "main", None, None, "d_hub", True, False)
+        members = _series_members()
+        # "ma" (Series A) is both a series member AND the activation target.
+        row_a = members[0].dom
+        targets = [ActionTarget(
+            "a_000_001", "m_activate", "dblclick", "locator", {},
+            LocatorRecipe('page.locator("#ma")', "page", [], "css", {"args": ["#ma"]}, None, None),
+            row_a, None, None, None, "execute", None, "d_hub", None,
+        )]
+        hub = ReplicaDocument(
+            "d_hub", "p_main", "page", "main", None, None, None, None,
+            {"width": 300, "height": 200}, 1, "css", 0, 0,
+            "assets/hub.png", "hub", 3,
+            targets=targets,
+            regions=[_series_list_region("d_hub", members)],
+        )
+        viewer = ReplicaDocument(
+            "d_viewer", "p_main", "page", "main", None, None, None, None,
+            {"width": 300, "height": 200}, 1, "css", 0, 0,
+            "assets/va.png", "viewer", 6,
+            targets=[], regions=[_series_list_region("d_viewer", members)],
+        )
+        viewer_page_model = ReplicaPage("p_main", "page", "main", None, None, "d_viewer", True, False)
+        branches = [
+            SeriesBranch(
+                branch_id=f"b{i:03d}",
+                series_key=key,
+                label=f"Series {key}",
+                ordinal=i,
+                document_id="d_hub",
+                source_member_id=("ma", "mb", "mc")[i],
+                selector=None,
+                activation="dblclick",
+                viewer_state_id=f"s_v{key}",
+                metadata_state_id=f"s_m{key}",
+                return_state_id=None,
+                capture_status="captured",
+                warning=None,
+            )
+            for i, key in enumerate(("A", "B", "C"))
+        ]
+        flow = ReplicaFlow(
+            schema_version=2,
+            flow_id="regression-flow",
+            source_script_relpath="fixture.py",
+            source_script_sha256="x" * 64,
+            created_at="2026-08-19T00:00:00Z",
+            viewport={"width": 300, "height": 200},
+            bootstrap=BootstrapPlan(1, 2, False, {}),
+            popup_expectations=[],
+            timing_profile=CaptureTimingProfile(),
+            states=[
+                ReplicaState(
+                    state_id="s_hub",
+                    ordinal=0,
+                    source_url="http://fixture/hub",
+                    active_page_var="page",
+                    pages=[page_model],
+                    documents=[hub],
+                    transitions=[ReplicaTransition(
+                        transition_id="t1", action_id="a_000_001", from_state_id="s_hub",
+                        to_state_id="s_vA", source_page_var="page", target_page_var="page", mode="page",
+                    )],
+                    evidence=StateEvidence(
+                        topology_changed=True, url_changed=False, popup_changed=False,
+                        region_dom_changed=False, regional_changed_pixel_ratio=0.0,
+                        regional_mean_abs_diff=0.0, global_changed_pixel_ratio=0.0,
+                        dynamic_mask_count=0, decision_reason="state_after_action",
+                    ),
+                ),
+                ReplicaState(
+                    state_id="s_vA",
+                    ordinal=20,
+                    source_url="http://fixture/viewerA",
+                    active_page_var="page",
+                    pages=[viewer_page_model],
+                    documents=[viewer],
+                    transitions=[],
+                    evidence=StateEvidence(
+                        topology_changed=True, url_changed=False, popup_changed=False,
+                        region_dom_changed=False, regional_changed_pixel_ratio=0.0,
+                        regional_mean_abs_diff=0.0, global_changed_pixel_ratio=0.0,
+                        dynamic_mask_count=0, decision_reason="state_after_action",
+                    ),
+                ),
+            ],
+            entry_state_id="s_hub",
+            warnings=[],
+            series_branches=branches,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_assets(root)
+            build_replica(flow, root, root / "replica")
+            hub_html = (root / "replica" / "index.html").read_text(encoding="utf-8")
+            # The activation-target row must still expose its series route.
+            self.assertIn(f'data-replica-series-key="{series_key_slug("A")}"', hub_html)
+            # And the route map for A is intact (keyed by slug, never the raw key).
+            self.assertIn(f'"{series_key_slug("A")}": {{', hub_html)
+            self.assertNotIn('"A": {', hub_html)
+
     def test_series_list_scroll_overflow_marks_below_fold_rows(self):
         # A series list whose rows extend below the captured fold must get a
         # scrollable overlay (content height = list extent) and the below-fold
