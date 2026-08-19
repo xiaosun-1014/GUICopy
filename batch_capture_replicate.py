@@ -147,11 +147,14 @@ def _wait_for_report_popup_state(
             context_pages = []
         popup_pages = [candidate for candidate in context_pages if candidate is not page]
         if not popup_pages:
-            viewer_seen_since = None
-            stable_since = None
-            stable_signature = None
-            pause()
-            continue
+            # A ``报告截图`` marker is not required to open a viewer popup: the
+            # report may live on the current page itself.  Only *wait* when a
+            # popup actually exists but has not finished rendering — absent any
+            # popup means the report is on this page, so old behavior succeeded
+            # immediately and we keep that (the deferred after-hook fires only
+            # after the popup trigger's ``info.value`` assignment, so by this
+            # point a popup-driven capture always has its popup present).
+            return True
 
         dom_ready = False
         ready_frame = None

@@ -145,9 +145,27 @@ def run(page):
                 popup_body_end = instrumented.index("    page1", instrumented.index("with page.expect_popup"))
                 self.assertGreater(after_index, popup_body_end)
 
-    def test_report_popup_wait_does_not_succeed_without_a_popup(self):
+    def test_report_popup_wait_succeeds_without_a_popup(self):
+        # A report screenshot that does not open a viewer popup (report on the
+        # current page) must not block: old behavior returned True immediately
+        # when no popup existed, and the deferred after-hook fires only after a
+        # popup trigger has bound ``info.value`` — so the absence of a popup at
+        # after-time means there is nothing to wait for.
         page = Mock()
         page.context.pages = [page]
+
+        self.assertTrue(
+            replica_batch._wait_for_report_popup_state(
+                page, timeout_s=0.02, stable_s=0.01,
+            )
+        )
+
+    def test_report_popup_wait_blocks_until_popup_renders(self):
+        # With a popup present but not yet rendered, the wait must NOT succeed.
+        page = Mock()
+        other = Mock()
+        page.context.pages = [page, other]
+        other.frames = []  # no renderable frame yet
 
         self.assertFalse(
             replica_batch._wait_for_report_popup_state(
