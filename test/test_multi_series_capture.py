@@ -583,14 +583,24 @@ class SeriesContractEndToEndTests(unittest.TestCase):
                 ok = _click_series_and_wait(page, target.series_key)
                 self.assertTrue(ok, "navigating to target branch viewer failed")
                 viewer_url = page.url
-                # Click the branch's real Metadata trigger overlay.
+                # Click the branch's real Metadata trigger overlay. The real FT
+                # site opens metadata in two steps (更多 → Tags 中间态 → 面板);
+                # the replica mirrors it: meta_open lands on the btags
+                # intermediate URL, then Tags completes to the bmeta panel.
                 trigger = f'[data-replica-action="series:{branch.branch_id}:meta_open"]'
                 self.assertGreaterEqual(page.locator(trigger).count(), 1, "metadata trigger overlay missing")
                 page.locator(trigger).first.click()
                 try:
+                    page.wait_for_url(lambda url: "btags_" in url, timeout=8000)
+                except Exception:
+                    self.fail("metadata trigger did not open the Tags intermediate state")
+                tags_trigger = f'[data-replica-action="series:{branch.branch_id}:tags"]'
+                self.assertGreaterEqual(page.locator(tags_trigger).count(), 1, "Tags step trigger missing")
+                page.locator(tags_trigger).first.click()
+                try:
                     page.wait_for_url(lambda url: "bmeta_" in url, timeout=8000)
                 except Exception:
-                    self.fail("clicking metadata trigger did not open the branch metadata state")
+                    self.fail("Tags step did not open the branch metadata state")
                 # Complete, visible metadata panel with unique per-branch tag/value.
                 panel = page.locator(".replica-metadata")
                 self.assertGreaterEqual(panel.count(), 1, "metadata panel region not rendered")
